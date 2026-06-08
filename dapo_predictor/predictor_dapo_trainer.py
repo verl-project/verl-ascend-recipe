@@ -432,6 +432,7 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                     )
                     # repeat to align with repeated responses in rollout
                     new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    self._apply_predictor_order(new_batch, predictor_order)
                     new_batch = new_batch.union(gen_batch_output)
 
                     if self.config.algorithm.use_kl_in_reward:

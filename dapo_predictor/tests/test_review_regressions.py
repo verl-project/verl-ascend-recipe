@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+TRAINER = REPO_ROOT / "dapo_predictor" / "predictor_dapo_trainer.py"
 WORKER = REPO_ROOT / "dapo_predictor" / "predictor_worker.py"
 
 
@@ -20,6 +21,18 @@ def _function_source(path: Path, name: str) -> str:
 
 
 class PredictorReviewRegressionTests(unittest.TestCase):
+    def test_predictor_reorders_repeated_prompts_before_union_with_rollouts(self):
+        fit_source = _function_source(TRAINER, "fit")
+
+        repeat_pos = fit_source.index(
+            "new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)"
+        )
+        reorder_pos = fit_source.index("self._apply_predictor_order(new_batch, predictor_order)")
+        union_pos = fit_source.index("new_batch = new_batch.union(gen_batch_output)")
+
+        self.assertGreater(reorder_pos, repeat_pos)
+        self.assertLess(reorder_pos, union_pos)
+
     def test_predictor_worker_training_guards_small_response_length_and_uses_stable_shuffle(self):
         update_source = _function_source(WORKER, "update_predictor")
 
