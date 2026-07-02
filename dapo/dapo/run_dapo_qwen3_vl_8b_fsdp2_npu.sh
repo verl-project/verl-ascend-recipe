@@ -6,14 +6,19 @@ data_path=""
 model_path=""
 
 # 参数校验，不需要修改
-for para in $*
+for para in "$@"
 do
     if [[ $para == --data_path* ]];then
-        data_path=`echo ${para#*=}`
+        data_path="${para#*=}"
     elif [[ $para == --model_path* ]];then
-        model_path=`echo ${para#*=}`
+        model_path="${para#*=}"
     fi
 done
+
+if [[ -z "$data_path" || -z "$model_path" ]]; then
+    echo "Error: Both --data_path and --model_path must be provided."
+    exit 1
+fi
 
 ENGINE=vllm
 export VLLM_USE_V1=1
