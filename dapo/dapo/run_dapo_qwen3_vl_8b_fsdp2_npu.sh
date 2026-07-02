@@ -110,8 +110,8 @@ python3 -m recipe.dapo.main_dapo \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
-    data.train_files=$data_path/train.parquet \
-    data.val_files=$data_path/test.parquet \
+    data.train_files="$data_path/train.parquet" \
+    data.val_files="$data_path/test.parquet" \
     data.train_batch_size=$train_batch_size \
     data.gen_batch_size=$gen_batch_size \
     data.max_prompt_length=$max_prompt_length \
