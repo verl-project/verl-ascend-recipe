@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -xeuo pipefail
+
 # 数据集和模型路径,保持为空,不需要修改
 data_path=""
 model_path=""
