@@ -31,7 +31,6 @@ export USE_OPTIMIZED_MODEL=0
 # prompt&response length
 max_prompt_length=${max_prompt_length:=1024}
 max_response_length=${max_response_length:=2048}
-max_num_batched_tokens=8192
 
 # vllm related params
 free_cache_engine=True
