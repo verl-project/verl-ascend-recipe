@@ -120,7 +120,7 @@ python3 -m recipe.dapo.main_dapo \
     data.truncation='error' \
     data.image_key=images \
     data.shuffle=True \
-    actor_rollout_ref.model.path=$model_path \
+    actor_rollout_ref.model.path="$model_path" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=$use_remove_padding \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
