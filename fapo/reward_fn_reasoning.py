@@ -69,7 +69,7 @@ FAPO_GENRM_TEMPLATE = (
     "Please reason step by step, put your final answer (i.e., the index) in \\boxed{{}}."
 )
 GRM_SAMPLING_PARAMS = {
-    "max_new_tokens": 16384,
+    "max_new_tokens": 4096,
 }
 FLAWED_REWARD_PENALTY = 1.0
 
