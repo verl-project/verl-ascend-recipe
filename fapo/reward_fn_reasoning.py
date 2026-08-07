@@ -75,21 +75,46 @@ FLAWED_REWARD_PENALTY = 1.0
 
 
 async def generate_aiohttp(router_address: str, prompt_ids: list[int], sampling_params: dict):
+    """Ask the GRM router to continue ``prompt_ids`` and return the generated text.
+
+    Two server flavours answer this call and they do not share a wire format:
+
+    * SGLang serves a native ``/generate`` that takes ``input_ids`` and answers
+      with ``output_ids``.
+    * vLLM is served through ``vllm.entrypoints.openai.api_server``, which only
+      exposes the OpenAI-compatible routes. Posting to ``/generate`` there gets a
+      404, the reward silently degrades to the rule-based score, and the GRM
+      never runs.
+
+    ``/v1/completions`` is the portable choice: its ``prompt`` field accepts a
+    list of token ids, so the caller does not have to detokenize, and SGLang
+    serves the same route. The response carries text rather than ids, hence the
+    return type.
+    """
     payload = {
-        "input_ids": prompt_ids,
-        "sampling_params": sampling_params,
+        "prompt": prompt_ids,
+        "max_tokens": sampling_params.get("max_new_tokens", 16384),
+        "temperature": sampling_params.get("temperature", 0.0),
     }
-    url = f"http://{router_address}/generate"
+    # "model" is optional: the server resolves the served model itself, and the
+    # router fans out to a single-model worker anyway.
+    if sampling_params.get("model"):
+        payload["model"] = sampling_params["model"]
+    url = f"http://{router_address}/v1/completions"
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
     try:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         async with session.post(url, json=payload) as resp:
             output = await resp.text()
             try:
                 output = json.loads(output)
-                return output
             except Exception:
                 logger.error(f"Failed to parse JSON response: {output}")
-                return {}
+                return None
+            choices = output.get("choices") or []
+            if not choices:
+                logger.error(f"GRM response carried no choices: {output}")
+                return None
+            return choices[0].get("text")
     finally:
         await session.close()
 
@@ -132,16 +157,12 @@ async def compute_score_fapo(
     # "Object of type BatchEncoding is not JSON serializable".
     if not isinstance(grm_prompt_ids, list):
         grm_prompt_ids = grm_prompt_ids["input_ids"]
-    grm_outputs = await generate_aiohttp(
+    grm_response = await generate_aiohttp(
         router_address=reward_router_address,
         prompt_ids=grm_prompt_ids,
         sampling_params=GRM_SAMPLING_PARAMS,
     )
-    grm_response_ids = grm_outputs.get("output_ids", None)
-    if grm_response_ids is not None:
-        grm_response = await loop.run_in_executor(
-            None, lambda: reward_model_tokenizer.decode(grm_response_ids, skip_special_tokens=True)
-        )
+    if grm_response is not None:
         try:
             err_location = remove_boxed(last_boxed_only_string(grm_response))
             is_flawed_positive = int(err_location) != -1
