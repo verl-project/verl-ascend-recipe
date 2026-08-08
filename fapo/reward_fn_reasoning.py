@@ -163,9 +163,10 @@ async def compute_score_fapo(
         sampling_params=GRM_SAMPLING_PARAMS,
     )
     if grm_response is not None:
-        logger.info(
-            "FAPO_GRM_CALL sample=%s -> response_len=%d", extra_info.get("index"), len(grm_response)
-        )
+        # WARN, not INFO: this module pins its logger to WARN, so INFO never
+        # surfaces and a silent GRM fallback would be indistinguishable from
+        # "GRM never called" in the logs.
+        logger.warning("FAPO_GRM_CALL sample=%s -> response_len=%d", extra_info.get("index"), len(grm_response))
         try:
             err_location = remove_boxed(last_boxed_only_string(grm_response))
             is_flawed_positive = int(err_location) != -1
@@ -175,6 +176,6 @@ async def compute_score_fapo(
         if is_flawed_positive:
             reward_score -= FLAWED_REWARD_PENALTY
     else:
-        logger.info("FAPO_GRM_CALL sample=%s -> NO_RESPONSE", extra_info.get("index"))
+        logger.warning("FAPO_GRM_CALL sample=%s -> NO_RESPONSE", extra_info.get("index"))
 
     return {"score": reward_score, "acc": correct, "pred": pred, "is_flawed_positive": is_flawed_positive}
