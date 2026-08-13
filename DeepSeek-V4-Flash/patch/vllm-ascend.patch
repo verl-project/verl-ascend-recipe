@@ -1,17 +1,46 @@
+diff --git a/vllm_ascend/core/single_type_kv_cache_manager.py b/vllm_ascend/core/single_type_kv_cache_manager.py
+index bc184c913..5553bbca8 100644
+--- a/vllm_ascend/core/single_type_kv_cache_manager.py
++++ b/vllm_ascend/core/single_type_kv_cache_manager.py
+@@ -46,9 +46,9 @@ class CompressAttentionManager(FullAttentionManager):
+         # speculative decoding (MTP/EAGLE) with linear attention.
+         # assert isinstance(self.kv_cache_spec, (CompressAttentionSpec, C4IndexerSpec))
+ 
+-        num_tokens //= self.compress_ratio
+-        num_tokens_main_model //= self.compress_ratio
+-
++        num_tokens = cdiv(num_tokens, self.compress_ratio)
++        num_tokens_main_model = cdiv(num_tokens_main_model, self.compress_ratio)
++        
+         return super().get_num_blocks_to_allocate(
+             request_id,
+             num_tokens,
+@@ -141,9 +141,9 @@ class CompressAttentionManager(FullAttentionManager):
+         Returns:
+             The new allocated blocks.
+         """
+-        num_tokens //= self.compress_ratio
++        num_tokens = cdiv(num_tokens, self.compress_ratio)
+         ## TODO: check spec decode
+-        num_tokens_main_model //= self.compress_ratio
++        num_tokens_main_model = cdiv(num_tokens_main_model, self.compress_ratio)
+ 
+         req_blocks = self.req_to_blocks[request_id]
+         num_required_blocks = cdiv(num_tokens, self.block_size)
 diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
-index abcdef12..34567890 100644
+index f4b49da74..220120e9f 100644
 --- a/vllm_ascend/device/device_op.py
 +++ b/vllm_ascend/device/device_op.py
-@@ -768,7 +768,7 @@
+@@ -841,7 +841,7 @@ class BaseDeviceAdaptor:
      @staticmethod
      def dsa_kv_compress_scatter(cache, x, slot_mapping):
          """Scatter KV into cache. Non-A5: simple scatter of pre-quantized tensor."""
 -        torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, slot_mapping, x)
 +        torch_npu.npu_scatter_nd_update_(cache, slot_mapping, x)
-
+ 
      # ===== Indexer Quant + Scatter =====
-
-@@ -794,8 +794,8 @@
+ 
+@@ -867,8 +867,8 @@ class BaseDeviceAdaptor:
              kv_scale_out = kv_scale_out.unsqueeze(-1).to(torch.float16)
              if kv_scale_out.ndim < 4:
                  kv_scale_out = kv_scale_out.unsqueeze(-1)
@@ -19,28 +48,28 @@ index abcdef12..34567890 100644
 -            torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_out)
 +            torch_npu.npu_scatter_nd_update_(indexer_k_cache, slot_mapping, kv_out)
 +            torch_npu.npu_scatter_nd_update_(indexer_scale_cache, slot_mapping, kv_scale_out)
-
+ 
          return q, q_scale, kv_out, kv_scale_out
-
-@@ -808,7 +808,7 @@
+ 
+@@ -881,7 +881,7 @@ class BaseDeviceAdaptor:
              return None, None
          kv_out, kv_scale = torch_npu.npu_dynamic_quant(kv, dst_type=torch.int8)
          kv_scale = kv_scale.unsqueeze(-1)
 -        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_out)
 +        torch_npu.npu_scatter_nd_update_(indexer_k_cache, slot_mapping, kv_out)
          return kv_out, kv_scale
-
+ 
      @staticmethod
-@@ -818,7 +818,7 @@
+@@ -891,7 +891,7 @@ class BaseDeviceAdaptor:
          kv_scale = kv_scale.to(torch.float16)
          if kv_scale.ndim < 4:
              kv_scale = kv_scale.unsqueeze(-1)
 -        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale)
 +        torch_npu.npu_scatter_nd_update_(indexer_scale_cache, slot_mapping, kv_scale)
-
+ 
      @staticmethod
      def warmup_indexer_quant_scatter(hidden_states, slot_mapping):
-@@ -831,8 +831,8 @@
+@@ -904,8 +904,8 @@ class BaseDeviceAdaptor:
          dummy_shape = (1, 1, 1, kv_dummy.shape[-1])
          indexer_k_cache = torch.zeros(dummy_shape, dtype=kv_dummy.dtype, device=hidden_states.device)
          indexer_scale_cache = torch.zeros(dummy_shape, dtype=torch.float16, device=hidden_states.device)
@@ -48,16 +77,16 @@ index abcdef12..34567890 100644
 -        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_dummy)
 +        torch_npu.npu_scatter_nd_update_(indexer_k_cache, slot_mapping, kv_dummy)
 +        torch_npu.npu_scatter_nd_update_(indexer_scale_cache, slot_mapping, kv_scale_dummy)
-
+ 
      # ===== Lightning Indexer Dtype Prep =====
-
+ 
 diff --git a/vllm_ascend/models/deepseek_v4.py b/vllm_ascend/models/deepseek_v4.py
 old mode 100644
 new mode 100755
-index 231f07b8..22c159ae
+index b99fd94db..5c26b3eb6
 --- a/vllm_ascend/models/deepseek_v4.py
 +++ b/vllm_ascend/models/deepseek_v4.py
-@@ -799,6 +799,7 @@
+@@ -799,6 +799,7 @@ class DeepseekV4Attention(nn.Module):
              head_size=self.rope_head_dim,
              rotary_dim=self.rope_head_dim,
              max_position_embeddings=max_position_embeddings,
@@ -65,12 +94,118 @@ index 231f07b8..22c159ae
              is_neox_style=False,
              scaling_factor=config.rope_parameters["factor"],
              base=config.rope_parameters["rope_theta"],
-
+@@ -1389,14 +1390,18 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
+             if "sink" in name:
+                 if is_pp_missing_parameter(name, self):
+                     continue
+-                param = params_dict[name]
+-                if enable_dsa_cp():
+-                    param.data.copy_(loaded_weight)
+-                else:
+-                    # Handle attention sinks (distributed across ranks)
+-                    narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
+-                    param.data.copy_(narrow_weight)
+-                loaded_params.add(name)
++
++                try:
++                    param = params_dict[name]
++                    if enable_dsa_cp():
++                        param.data.copy_(loaded_weight)
++                    else:
++                        # Handle attention sinks (distributed across ranks)
++                        narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
++                        param.data.copy_(narrow_weight)
++                    loaded_params.add(name)
++                except Exception as e:
++                    print(f"skip load {name}: {e}")
+                 continue
+ 
+             is_fusion_moe_shared_experts_layer = rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
+@@ -1431,9 +1436,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
+                 if is_pp_missing_parameter(name, self):
+                     continue
+ 
+-                param = params_dict[name]
+-                weight_loader = param.weight_loader
+-                weight_loader(param, loaded_weight, shard_id)
++                try:
++                    param = params_dict[name]
++                    weight_loader = param.weight_loader
++                    weight_loader(param, loaded_weight, shard_id)
++                except Exception as e:
++                    print(f"skip in load {name}: {e}")
+                 break
+             else:
+                 is_expert_weight = False
+@@ -1494,25 +1502,28 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
+                         if is_pp_missing_parameter(name_mapped, self):
+                             continue
+ 
+-                        param = params_dict[name_mapped]
+-                        # We should ask the weight loader to return success or
+-                        # not here since otherwise we may skip experts with
+-                        # other available replicas.
+-                        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+-                        success = weight_loader(
+-                            param,
+-                            weight_to_load,
+-                            name_mapped,
+-                            shard_id=shard_id,
+-                            expert_id=expert_id,
+-                            return_success=True,
+-                        )
+-                        if success:
+-                            if not is_fusion_moe_shared_experts_layer:
+-                                name = name_mapped
+-                            else:
+-                                loaded_params.add(name_mapped)
+-                            break
++                        try:
++                            param = params_dict[name_mapped]
++                            # We should ask the weight loader to return success or
++                            # not here since otherwise we may skip experts with
++                            # other available replicas.
++                            weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
++                            success = weight_loader(
++                                param,
++                                weight_to_load,
++                                name_mapped,
++                                shard_id=shard_id,
++                                expert_id=expert_id,
++                                return_success=True,
++                            )
++                            if success:
++                                if not is_fusion_moe_shared_experts_layer:
++                                    name = name_mapped
++                                else:
++                                    loaded_params.add(name_mapped)
++                                break
++                        except Exception as e:
++                            print(f"skip in load {name}: {e}")
+                     else:
+                         if is_expert_weight:
+                             # We've checked that this is an expert weight
+@@ -1532,9 +1543,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
+                         if is_pp_missing_parameter(name, self):
+                             continue
+ 
+-                        param = params_dict[name]
+-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+-                        weight_loader(param, loaded_weight)
++                        try:
++                            param = params_dict[name]
++                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
++                            weight_loader(param, loaded_weight)
++                        except Exception as e:
++                            print(f"skip in load {name}: {e}")
+             if not is_fusion_moe_shared_experts_layer:
+                 loaded_params.add(name)
+ 
 diff --git a/vllm_ascend/ops/rope_dsv4.py b/vllm_ascend/ops/rope_dsv4.py
-index abcdef12..34567890 100644
+index 8727abf4d..aebc0b567 100644
 --- a/vllm_ascend/ops/rope_dsv4.py
 +++ b/vllm_ascend/ops/rope_dsv4.py
-@@ -148,6 +148,7 @@
+@@ -148,6 +148,7 @@ class ComplexExpRotaryEmbedding(nn.Module):
          head_size: int,
          rotary_dim: int,
          max_position_embeddings: int,
@@ -78,8 +213,8 @@ index abcdef12..34567890 100644
          base: int,
          scaling_factor: float,
          rope_groups: list[str] | None = None,
-@@ -173,7 +174,7 @@
-
+@@ -173,7 +174,7 @@ class ComplexExpRotaryEmbedding(nn.Module):
+ 
          if config_key not in _ROPE_STATE.full_rope_cache:
              inv_freq = self.precompute_freqs_cis(
 -                rotary_dim, max_position_embeddings, max_position_embeddings, base, scaling_factor, beta_fast, beta_slow
@@ -87,13 +222,172 @@ index abcdef12..34567890 100644
              )
              t = torch.arange(
                  max_position_embeddings * scaling_factor,
-@@ -256,6 +257,9 @@
+@@ -256,6 +257,9 @@ class ComplexExpRotaryEmbedding(nn.Module):
          inv_freq_extrapolation = 1.0 / pos_freqs
          inv_freq_interpolation = 1.0 / (factor * pos_freqs)
-
+ 
 +        if original_seq_len==0:
 +            return inv_freq_extrapolation
 +
          low, high = yarn_find_correction_range(
              beta_fast,
              beta_slow,
+diff --git a/vllm_ascend/patch/worker/__init__.py b/vllm_ascend/patch/worker/__init__.py
+index cbc13870b..a40b90a66 100644
+--- a/vllm_ascend/patch/worker/__init__.py
++++ b/vllm_ascend/patch/worker/__init__.py
+@@ -85,5 +85,5 @@ if _V2_MODEL_RUNNER_SUPPORTED:
+     import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
+ 
+ # only patch routed experts capture in main2main.
+-if _V2_MODEL_RUNNER_SUPPORTED:
+-    import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
++#if _V2_MODEL_RUNNER_SUPPORTED:
++import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
+diff --git a/vllm_ascend/worker/block_table.py b/vllm_ascend/worker/block_table.py
+index e458e382f..be7c4adf7 100644
+--- a/vllm_ascend/worker/block_table.py
++++ b/vllm_ascend/worker/block_table.py
+@@ -50,6 +50,7 @@ class BlockTable:
+         self.pin_memory = pin_memory
+         self.device = device
+         self.physical_block_size = block_size
++        self.compress_ratio = compress_ratio
+         self.is_mamba_group = (
+             kv_cache_group is not None
+             and hasattr(kv_cache_group, "kv_cache_spec")
+@@ -98,6 +99,15 @@ class BlockTable:
+             self.max_num_batched_tokens + 2 * self.pcp_world_size * self.max_num_reqs, dtype=torch.int32
+         )
+ 
++        # Track the raw (kv-manager view) block ids for compressed groups.
++        # ``self.block_table`` stores logical (kernel) block ids after
++        # hybrid-block expansion, while routed-experts slot reconstruction
++        # needs the un-expanded kv-manager block ids.
++        self.track_raw_block_ids = compress_ratio > 1
++        if self.track_raw_block_ids:
++            self.raw_block_ids = np.zeros((max_num_reqs, self.max_num_blocks_per_req), dtype=np.int32)
++            self.raw_num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
++
+         self.kernel_sizes = kernel_sizes
+         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+ 
+@@ -109,6 +119,11 @@ class BlockTable:
+         if not block_ids:
+             return
+         block_ids = np.array(block_ids)
++        if self.track_raw_block_ids:
++            raw_start = self.raw_num_blocks_per_row[row_idx]
++            num_raw = len(block_ids)
++            self.raw_block_ids[row_idx, raw_start : raw_start + num_raw] = block_ids
++            self.raw_num_blocks_per_row[row_idx] += num_raw
+         if self.use_hybrid_blocks:
+             block_ids = self._convert_physical_to_logical_blocks(block_ids)
+ 
+@@ -120,6 +135,8 @@ class BlockTable:
+ 
+     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+         self.num_blocks_per_row[row_idx] = 0
++        if self.track_raw_block_ids:
++            self.raw_num_blocks_per_row[row_idx] = 0
+         self.append_row(block_ids, row_idx)
+ 
+     def clear_row(self, row_idx: int) -> None:
+@@ -127,11 +144,20 @@ class BlockTable:
+         if num_blocks > 0:
+             self.block_table.np[row_idx, :num_blocks] = 0
+         self.num_blocks_per_row[row_idx] = 0
++        if self.track_raw_block_ids:
++            raw_blocks = self.raw_num_blocks_per_row[row_idx]
++            if raw_blocks > 0:
++                self.raw_block_ids[row_idx, :raw_blocks] = 0
++            self.raw_num_blocks_per_row[row_idx] = 0
+ 
+     def move_row(self, src: int, tgt: int) -> None:
+         num_blocks = self.num_blocks_per_row[src]
+         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
+         self.num_blocks_per_row[tgt] = num_blocks
++        if self.track_raw_block_ids:
++            raw_blocks = self.raw_num_blocks_per_row[src]
++            self.raw_block_ids[tgt, :raw_blocks] = self.raw_block_ids[src, :raw_blocks]
++            self.raw_num_blocks_per_row[tgt] = raw_blocks
+ 
+     def swap_row(self, src: int, tgt: int) -> None:
+         num_blocks_src = self.num_blocks_per_row[src]
+@@ -141,6 +167,13 @@ class BlockTable:
+ 
+         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
+ 
++        if self.track_raw_block_ids:
++            raw_src = self.raw_num_blocks_per_row[src]
++            raw_tgt = self.raw_num_blocks_per_row[tgt]
++            self.raw_num_blocks_per_row[src] = raw_tgt
++            self.raw_num_blocks_per_row[tgt] = raw_src
++            self.raw_block_ids[[src, tgt]] = self.raw_block_ids[[tgt, src]]
++
+     def compute_slot_mapping(
+         self,
+         num_reqs: int,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index c732a1d74..70817c51d 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -2155,6 +2155,31 @@ class NPUModelRunner(GPUModelRunner):
+                         out=dsa_positions_np,
+                     )
+ 
++                    # Routed experts: rebuild the per-logical-token
++                    # slot_mapping from kv-manager block ids. The compressed
++                    # (C4) group's attention slot_mapping is expressed on
++                    # compressed blocks and cannot index per-token routing
++                    # data. Slot layout (must match RoutedExpertsManager on
++                    # the scheduler side):
++                    #   slot = block_id * block_span + pos % block_span
++                    # with block_span = block_size * compress_ratio.
++                    if (self.model_config.enable_return_routed_experts
++                            and self.routed_experts_initialized):
++                        c4_block_table = self.input_batch.block_table[0]
++                        if c4_block_table.track_raw_block_ids:
++                            block_span = (c4_block_table.physical_block_size
++                                          * c4_block_table.compress_ratio)
++                            block_idx = np.clip(
++                                dsa_positions_np // block_span,
++                                0,
++                                c4_block_table.raw_block_ids.shape[1] - 1,
++                            )
++                            re_slot_mapping_np = (
++                                c4_block_table.raw_block_ids[req_indices, block_idx].astype(np.int64)
++                                * block_span + dsa_positions_np % block_span)
++                            self.routed_experts_slot_mapping_device[:total_num_scheduled_tokens].copy_(
++                                torch.from_numpy(re_slot_mapping_np))
++
+                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+ 
+@@ -3078,13 +3103,19 @@ class NPUModelRunner(GPUModelRunner):
+                 )
+             if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
+                 if self.routed_experts_initialized:
+-                    # snapshot slot_mapping into a private device
+-                    # buffer so the next ``_prepare_inputs`` does not
+-                    # overwrite it while D2H is still pending.
+-                    n = slot_mapping.shape[0]
+-                    self.routed_experts_slot_mapping_device[:n].copy_(
+-                        slot_mapping
+-                    )
++                    # For compressed groups the routed-experts slot_mapping
++                    # was already rebuilt from kv-manager block ids in
++                    # ``_prepare_inputs``; the attention slot_mapping here
++                    # is compressed-block based and must not overwrite it.
++                    if not (self.use_compress
++                            and blk_table.track_raw_block_ids):
++                        # snapshot slot_mapping into a private device
++                        # buffer so the next ``_prepare_inputs`` does not
++                        # overwrite it while D2H is still pending.
++                        n = slot_mapping.shape[0]
++                        self.routed_experts_slot_mapping_device[:n].copy_(
++                            slot_mapping
++                        )
+             return blk_table_tensor, slot_mapping
+ 
+         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)

@@ -30,8 +30,155 @@ index 26a96f457..f8cbc5fd4 100644
      if recv_next_shape_tensor is not None:
          recv_next_shape = recv_next_shape_tensor.tolist()
  
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index dafedfd17..8cc172886 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -1,7 +1,7 @@
+ # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ 
+ import math
+-from typing import List, Optional, Union
++from typing import List, Optional, Union, Tuple
+ 
+ import torch
+ 
+@@ -15,10 +15,12 @@ try:
+         fused_sort_chunks_by_index,
+         fused_sort_chunks_by_index_with_probs,
+         fused_unpermute,
++        fused_compute_score_for_moe_aux_loss,
+     )
+ 
+     HAVE_TE = True
+ except ImportError:
++    fused_compute_score_for_moe_aux_loss = None
+     HAVE_TE = False
+ 
+ 
+@@ -759,3 +761,119 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
+             tensor.record_stream(torch.cuda.current_stream())
+         tensor = cpu_tensor
+     return tensor
++
++
++def apply_router_token_dropping(
++    routing_probs: torch.Tensor,
++    routing_map: torch.Tensor,
++    router_topk: int,
++    capacity_factor: float,
++    drop_policy: str = "probs",
++    pad_to_capacity: bool = False,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Apply token dropping to top-k expert selection.
++
++    This function enforces expert capacity limits by dropping tokens that exceed
++    the capacity and optionally padding to capacity.
++
++    Args:
++        routing_probs (torch.Tensor): Tensor of shape [num_tokens, num_experts]
++            containing the routing probabilities for selected experts.
++        routing_map (torch.Tensor): Boolean tensor of shape [num_tokens, num_experts]
++            indicating which experts were selected for each token.
++        router_topk (int): Number of experts selected per token.
++        capacity_factor (float): The capacity factor of each expert.
++        drop_policy (str, optional): Policy to drop tokens - "probs" or "position".
++                                     Defaults to "probs".
++        pad_to_capacity (bool, optional): Whether to pad to capacity. Defaults to False.
++
++    Returns:
++        Tuple[torch.Tensor, torch.Tensor]:
++            - final_probs: Routing probabilities after applying capacity constraints
++            - final_map: Boolean mask after applying capacity constraints
++    """
++    assert routing_probs.ndim == 2 and routing_map.ndim == 2
++    num_tokens, num_experts = routing_probs.shape
++    # Calculate expert capacity
++    expert_capacity = get_capacity(
++        num_tokens=num_tokens * router_topk,
++        num_experts=num_experts,
++        capacity_factor=capacity_factor,
++    )
++
++    # Create capacity mask based on drop policy
++    if expert_capacity > num_tokens:
++        # No need to drop tokens if capacity exceeds the number of tokens
++        capacity_mask = torch.ones_like(routing_probs).bool()
++    else:
++        if drop_policy == "probs":
++            _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
++            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
++        elif drop_policy == "position":
++            _, capacity_indices = torch.topk(
++                routing_map.int(), k=expert_capacity, dim=0, sorted=False
++            )
++            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
++        else:
++            raise ValueError(f"Invalid drop_policy: {drop_policy}")
++
++    # Apply capacity constraints
++    if pad_to_capacity:
++        final_map = capacity_mask
++        final_probs = routing_probs * final_map
++    else:
++        # Get exceed mask and maskout exceeded probs and indices
++        final_map = torch.logical_and(routing_map, capacity_mask)
++        final_probs = routing_probs * final_map
++
++    return final_probs, final_map
++
++
++def compute_routing_scores_for_aux_loss(
++    logits: torch.Tensor,
++    topk: int,
++    score_function: str,
++    fused: bool = False,
++    padding_mask: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Compute routing scores based on the score function.
++
++    Args:
++        logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
++        topk (int): The number of top-k indices to compute.
++        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
++        fused (bool, optional): Whether to use the fused version. Defaults to False.
++        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
++                                               Shape in [num_tokens]. True for valid tokens,
++                                               False for padding tokens. Defaults to None.
++
++    Returns:
++        Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
++    """
++    if fused:
++        if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
++            raise ValueError(
++                "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
++            )
++        routing_map, scores = fused_compute_score_for_moe_aux_loss(
++            logits=logits, topk=topk, score_function=score_function
++        )
++    else:
++        if score_function == "softmax":
++            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
++        elif score_function == "sigmoid":
++            scores = torch.sigmoid(logits)
++            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
++        else:
++            raise ValueError(f"Invalid score_function: {score_function}")
++
++        _, top_indices = torch.topk(scores, k=topk, dim=1)
++        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
++
++    # Apply padding mask to scores if provided
++    if padding_mask is not None:
++        # Invert padding_mask and make True indicates valid tokens
++        valid_mask = (~padding_mask).unsqueeze(-1)
++        routing_map = routing_map * valid_mask
++        scores = scores * valid_mask
++    return routing_map, scores
+\ No newline at end of file
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 2b68a5a5f..e6cf2469b 100644
+index 2b68a5a5f..20d624610 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
 @@ -568,8 +568,8 @@ class TransformerConfig(ModelParallelConfig):
@@ -45,3 +192,11 @@ index 2b68a5a5f..e6cf2469b 100644
  
          if self.num_query_groups % self.tensor_model_parallel_size != 0:
              raise ValueError(
+@@ -1075,6 +1075,7 @@ class MLATransformerConfig(TransformerConfig):
+     The initialization function has an argument for each parameter, including those in
+     ModelParallelConfig. Included YaRN RoPE parameters that is fused in MLA.
+     """
++    enable_routing_replay: bool = False
+ 
+     multi_latent_attention: bool = True
+     """Whether to use Multi-Latent Attention."""

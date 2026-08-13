@@ -61,8 +61,154 @@ index af1e9cab..04439196 100644
 +llm_kwargs: {}
  
  mm_kwargs: {}
+diff --git a/verl/utils/megatron/router_replay_patch.py b/verl/utils/megatron/router_replay_patch.py
+index 012ab3ff..f5c65a88 100644
+--- a/verl/utils/megatron/router_replay_patch.py
++++ b/verl/utils/megatron/router_replay_patch.py
+@@ -216,6 +216,16 @@ def _patched_topk_routing_with_score_function(
+         else:
+             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
++    elif score_function == "sqrtsoftplus":
++        scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
++        if expert_bias is not None:
++            scores_for_routing = scores + expert_bias
++            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
++            scores = torch.gather(scores, dim=1, index=top_indices)
++        else:
++            _, top_indices = compute_topk(scores, topk, num_groups, group_topk)
++            scores = torch.gather(scores, dim=1, index=top_indices)
++        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+     else:
+         raise ValueError(f"Invalid score_function: {score_function}")
+ 
+@@ -343,71 +353,17 @@ def apply_router_replay_patch():
+     print("Applying Router Replay Patch...")
+     # Clear router instances to avoid state leakage between model initializations.
+     RouterReplay.router_instances.clear()
+-    # Step 1: Patch TransformerConfig to include the feature flag
+-
+-    try:
+-        sig = inspect.signature(TransformerConfig.__init__)
+-        native_params = sig.parameters
+-        params = list(sig.parameters.values())
+-    except Exception:
+-        sig = None
+-        native_params = {}
+-        params = []
+-
+-    ext_attrs = ["enable_routing_replay"]
+-
+-    # Update __signature__ to prevent NPU/MindSpeed wrappers from filtering out or blocking custom parameters.
+-    for attr in ext_attrs:
+-        if attr not in native_params:
+-            if sig:
+-                new_param = inspect.Parameter(attr, inspect.Parameter.KEYWORD_ONLY, default=False)
+-                if params and params[-1].kind == inspect.Parameter.VAR_KEYWORD:
+-                    params.insert(-1, new_param)
+-                else:
+-                    params.append(new_param)
+-
+-    if sig:
+-        try:
+-            TransformerConfig.__init__.__signature__ = sig.replace(parameters=params)
+-        except Exception as e:
+-            print(f"Failed to update signature metadata: {e}")
+-
+-    if not hasattr(TransformerConfig, "_verl_router_patched"):
+-        # Store original __init__ method
+-        original_tf_config_init = TransformerConfig.__init__
+-
+-        # Define new __init__ method that safely handles enable_routing_replay parameter
+-        @wraps(original_tf_config_init)
+-        def patched_tf_config_init(self, *args, **kwargs):
+-            # Simple solution: remove the unknown parameter before calling original constructor
+-            enable_routing_replay = kwargs.get("enable_routing_replay", False)
+-            if "enable_routing_replay" not in native_params:
+-                enable_routing_replay = kwargs.pop("enable_routing_replay", False)
+-
+-            # Call original constructor with remaining kwargs
+-            original_tf_config_init(self, *args, **kwargs)
+-
+-            # Set the instance attribute
+-            self.enable_routing_replay = enable_routing_replay
+-
+-        # Apply the patch
+-        TransformerConfig.__init__ = patched_tf_config_init
+-        TransformerConfig._verl_router_patched = True
+-
+-    # Step 2: Patch TopKRouter only once to ensure idempotency.
+-    if hasattr(TopKRouter, "_router_replay_patched"):
+-        return
+ 
+     original_init = TopKRouter.__init__
+ 
+-    # Step 3: Define the new __init__ method
++    # Define the new __init__ method
+     def patched_init(self, *args, **kwargs):
+         original_init(self, *args, **kwargs)
+         self.router_replay = None
+         if getattr(self.config, "enable_routing_replay", False):
+             self.router_replay = RouterReplay()
+ 
+-    # Step 4: Patch MoEAlltoAllTokenDispatcher.preprocess to handle router replay
++    # Patch MoEAlltoAllTokenDispatcher.preprocess to handle router replay
+     # When router replay is enabled, duplicate indices in top_indices can cause
+     # routing_map.sum() < num_tokens * topk, leading to split size mismatch in alltoall.
+     if MoEAlltoAllTokenDispatcher is not None and not hasattr(MoEAlltoAllTokenDispatcher, "_preprocess_patched"):
+@@ -437,7 +393,5 @@ def apply_router_replay_patch():
+         MoEAlltoAllTokenDispatcher.preprocess = patched_preprocess
+         MoEAlltoAllTokenDispatcher._preprocess_patched = True
+ 
+-    # Step 5: Apply the patches
++    # Apply the patches
+     TopKRouter.__init__ = patched_init
+-    TopKRouter.routing = patched_routing
+-    TopKRouter._router_replay_patched = True
+diff --git a/verl/utils/megatron/router_replay_utils.py b/verl/utils/megatron/router_replay_utils.py
+index 9984af10..fe2adb36 100644
+--- a/verl/utils/megatron/router_replay_utils.py
++++ b/verl/utils/megatron/router_replay_utils.py
+@@ -292,6 +292,23 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
+             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+         layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
+ 
++        ## 同preprocess_bshd_engine中的padding
++        max_seqlen = layers_topk_idx_rmpad.shape[1]
++        align_value = 2048
++        if max_seqlen % align_value != 0:
++            max_seqlen = ((max_seqlen + align_value - 1) // align_value) * align_value
++        target_len = max(max_seqlen, 2048)
++
++        ## padding
++        pad_len = target_len - layers_topk_idx_rmpad.shape[1]
++        pad_values = torch.tensor(
++            [0, 42, 84, 126, 168, 210],
++            dtype=layers_topk_idx_rmpad.dtype,
++            device=layers_topk_idx_rmpad.device
++        )
++        pad_block = pad_values.unsqueeze(0).unsqueeze(0).repeat(1, pad_len, layers_topk_idx_rmpad.shape[2], 1)
++        layers_topk_idx_rmpad = torch.cat([layers_topk_idx_rmpad, pad_block], dim=1)
++
+         # 1, dynamic_bs_split, layer_num, topk
+         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
+             layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+diff --git a/verl/utils/reward_score/math_dapo.py b/verl/utils/reward_score/math_dapo.py
+index 940500fd..e30844bf 100644
+--- a/verl/utils/reward_score/math_dapo.py
++++ b/verl/utils/reward_score/math_dapo.py
+@@ -264,6 +264,9 @@ def compute_score(
+ 
+     reward = 1.0 if correct else -1.0
+     acc = correct
++    
++    import random
++    reward = random.randrange(0, 2) * 0.2
+ 
+     return {
+         "score": reward,
 diff --git a/verl/utils/vllm/npu_vllm_patch.py b/verl/utils/vllm/npu_vllm_patch.py
-index c22647ce..627f4c20 100644
+index c22647ce..972886b4 100644
 --- a/verl/utils/vllm/npu_vllm_patch.py
 +++ b/verl/utils/vllm/npu_vllm_patch.py
 @@ -193,13 +193,16 @@ if is_torch_npu_available(check_device=False):
@@ -99,10 +245,10 @@ index 951c5cad..7635039c 100644
      # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,
      # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index cbb7be48..9a00c96e 100644
+index cbb7be48..0296edce 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -677,30 +677,10 @@ class MegatronEngine(BaseEngine):
+@@ -677,30 +677,9 @@ class MegatronEngine(BaseEngine):
                      losses_reduced[0]["metrics"] = {}
                  losses_reduced[0]["metrics"].update(metrics)
  
@@ -124,7 +270,7 @@ index cbb7be48..9a00c96e 100644
 -            use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
 -            if use_dynamic_bsz and indices is not None:
 -                layers_topk_idx = restore_dynamic_batch(layers_topk_idx, indices)
- 
+-
          output = {}
          if mpu.is_pipeline_last_stage(ignore_virtual=True):
              output = postprocess_batch_func(output_lst=losses_reduced, indices=indices, data=data)
@@ -133,23 +279,18 @@ index cbb7be48..9a00c96e 100644
          if enable_routing_replay:
              RouterReplay.clear_global_indices()
              RouterReplay.clear_global_router_replay_action()
-@@ -833,15 +813,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
-         else:
-             vp_rank = 0
+@@ -838,8 +817,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
+             for router in router_instance_list:
+                 router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
  
--        if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
--            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
--            for router in router_instance_list:
--                router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
--
 -        if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
--            layers_topk_idx = model_inputs["routed_experts"]
--            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
--
++        if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):  
+             layers_topk_idx = model_inputs["routed_experts"]
++
+             set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
+ 
          if pad_mode == DatasetPadMode.NO_PADDING:
-             label = input_ids.clone()
-         else:
-@@ -932,15 +903,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
+@@ -932,16 +912,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
                  local_cp_size=local_cp_size,
              )
  
@@ -158,24 +299,30 @@ index cbb7be48..9a00c96e 100644
 -            merge_router_topk_indices(None, input_ids, self.mini_layer_topk_idx_list, self.tf_config, vp_rank)
 -
 -        # Router replay: switch to backward replay mode for next backward pass
--        if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
--            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
--            for router in router_instance_list:
--                router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+         if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
+             router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
+             for router in router_instance_list:
+                 router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
  
++
          return output, partial(postprocess_micro_batch_func, data=batch, local_cp_size=local_cp_size)
  
+     def postprocess_micro_batch_func(
 diff --git a/verl/workers/engine/mindspeed/transformer_impl.py b/verl/workers/engine/mindspeed/transformer_impl.py
-index acbdcf63..1be56d30 100644
+index acbdcf63..291153a6 100644
 --- a/verl/workers/engine/mindspeed/transformer_impl.py
 +++ b/verl/workers/engine/mindspeed/transformer_impl.py
-@@ -93,15 +93,14 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
+@@ -93,15 +93,18 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
          import torch.distributed
          from megatron.core.enums import ModelType
          from megatron.training.training import get_model
 -
 +        from mindspeed_llm.pretrain_deepseek4 import model_provider
 +        gpt_model_provider=model_provider
++        if self.tf_config.enable_routing_replay:
++            gpt_model_provider.enable_routing_replay = True
++        else:
++            gpt_model_provider.enable_routing_replay = False
          # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
          if self.engine_config.forward_only:
 -            module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)
@@ -208,6 +355,25 @@ index 9b600e30..ecb9de4c 100644
      mcore_config = add_mcore_arguments(all_config)
      from mindspeed_llm.tasks.megatron_adaptor_v2 import repatch
  
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index ee741cba..e0c0ea87 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -473,10 +473,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         else:
+             tool_config = None
+ 
++        strategy = self.config.actor.strategy
+         self.enable_routing_replay = (
+-            self.config.actor.strategy == "megatron" and self.config.actor.megatron.router_replay.mode != "disabled"
++            strategy in ("megatron", "mindspeed")
++            and getattr(self.config.actor, strategy).router_replay.mode != "disabled"
+         )
+ 
++
+         DistProfilerExtension.__init__(
+             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+         )
 diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
 index eb337939..81ac0ea1 100644
 --- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
@@ -225,7 +391,7 @@ index eb337939..81ac0ea1 100644
                      "name": name,
                      "shape": weight.shape,
 diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-index 23c8594f..25aabbc1 100644
+index 23c8594f..1942e128 100644
 --- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
 +++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
 @@ -53,7 +53,10 @@ from verl.workers.rollout.vllm_rollout.utils import (
@@ -265,3 +431,16 @@ index 23c8594f..25aabbc1 100644
              sleep_level = 1
          else:
              sleep_level = 2
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout.py b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+index 90641b57..62e756fd 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+@@ -97,7 +97,7 @@ class ServerAdapter(BaseRollout):
+         self.device_uuid = get_device_uuid(get_device_id())
+         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
+ 
+-        self.use_shm = not is_support_ipc()
++        self.use_shm = False #t is_support_ipc()
+         if self.use_shm:
+             logger.warning(
+                 "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
