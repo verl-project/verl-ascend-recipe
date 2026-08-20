@@ -97,7 +97,21 @@ _To be filled after the scheduled 100-step run (≈7.7 h on 4 cards at the measu
 
 ### Unit test `tests/utils/test_fsdp_lora_merge.py` on NPU
 
-_To be filled (fsdp2 subset on 2 × 910B1)._
+`.github/workflows/npu_unit_tests.yml` currently excludes this file with `--ignore-glob="*test_fsdp_lora_merge*"`.
+On 2 × 910B1 (container mounting only those two cards, patched `get_npu_versions`) the fsdp2 subset passes:
+
+```
+pytest -v -s tests/utils/test_fsdp_lora_merge.py -k fsdp2
+test_merged_lora_context_qwen2[True-fsdp2-2]      PASSED
+test_merged_lora_context_qwen2[False-fsdp2-2]     PASSED
+test_merged_lora_context_gptoss[True-fsdp2-2]     PASSED
+test_merged_lora_context_gptoss[False-fsdp2-2]    PASSED
+test_collect_merged_lora_params[all-linear-fsdp2-2]   PASSED
+test_collect_merged_lora_params[lora_targets0-fsdp2-2] PASSED
+6 passed, 6 deselected in 199.34s
+```
+
+The FSDP1 (`strategy=fsdp`) half of the parametrization was not run here; the exclusion can at least be narrowed to it.
 
 ## NPU adaptation notes
 
