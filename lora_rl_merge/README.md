@@ -142,3 +142,4 @@ The FSDP1 (`strategy=fsdp`) half of the parametrization was not run here; the ex
 | `REQUIRED_VERL.txt` | validated verl commit, image and install line |
 | `patches/0001-get_npu_versions-first-visible-npu-id.patch` | verl fix for containers that mount a subset of NPUs |
 | `tools/parse_step_metrics.py` | per-step metrics table from the console log |
+| `ALGORITHM_TUNING_REPORT.md` | 算法适配调优文档（中文）：机制、环境、配置对照、实测、调参建议、排障 |
