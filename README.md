@@ -51,6 +51,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 
 | Recipe | `REQUIRED_VERL.txt` |
 | --- | --- |
+| opd | [`opd/REQUIRED_VERL.txt`](opd/REQUIRED_VERL.txt) |
 | dapo | [`recipe/dapo/REQUIRED_VERL.txt`](dapo/REQUIRED_VERL.txt) |
 | deepeyes | [`recipe/deepeyes/REQUIRED_VERL.txt`](deepeyes/REQUIRED_VERL.txt) |
 | flash_rl_ascend | [`recipe/flash_rl_ascend/REQUIRED_VERL.txt`](flash_rl_ascend/REQUIRED_VERL.txt) |
