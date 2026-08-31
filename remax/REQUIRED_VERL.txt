@@ -1,8 +1,0 @@
-# Qwen3-8B ReMax FSDP recipe validated against this verl commit.
-UPSTREAM=https://github.com/verl-project/verl.git
-MODE=pinned_commit
-COMMIT=5439c8e0ba17029bc4e647086a9b4cbe7ef21409
-PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@5439c8e0ba17029bc4e647086a9b4cbe7ef21409
-GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout 5439c8e0ba17029bc4e647086a9b4cbe7ef21409 && git submodule update --init --recursive recipe && pip install -e .
-RECIPE_FOLDER=remax
-NOTES=Validated with CANN 25.5.1, torch_npu 2.9.0.post2, vLLM 0.18, vLLM-Ascend 0.18.1.dev41, and transformers 5.3.0.dev0.
