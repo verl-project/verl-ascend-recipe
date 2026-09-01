@@ -1,7 +1,10 @@
-# Ascend Megatron + vLLM OPD; pin the reviewed source until verl PR #7333 is merged.
-UPSTREAM=https://github.com/egangu/verl.git
-MODE=pinned_commit
-COMMIT=94f869c00b85beb177276cbbb0124f366be28db6
-PIP_INSTALL=pip install verl@git+https://github.com/egangu/verl.git@94f869c00b85beb177276cbbb0124f366be28db6
-PATCH_BASE=1dda039b9c6311889a9c9a26040677e1254814f9
-NOTES=This public fork commit is the approved head of verl-project/verl#7333. Replace it with the upstream merge commit after that PR is merged.
+# Ascend Megatron + vLLM OPD on the official verl release branch.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_tag
+TAG=release/v0.8.0
+COMMIT=release/v0.8.0
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@release/v0.8.0
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout release/v0.8.0 && git submodule update --init --recursive recipe && git apply --unidiff-zero ../opd/patch/verl_opd_ascend.patch
+PATCH_BASE=release/v0.8.0
+RECIPE_FOLDER=opd
+NOTES=Use the git installation method so the bundled Ascend compatibility patch is applied before the editable install.

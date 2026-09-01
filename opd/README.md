@@ -6,10 +6,9 @@ English counterpart. The recipes reproduce the two OPD chains assigned in
 
 ## Required `verl` version
 
-See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt) for the exact reviewed source
-revision and a copy-pastable installation command. The current pin is the
-approved head of verl PR #7333 and should move to its upstream merge commit
-after that PR is merged.
+See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt) for the reviewed official release
+branch and installation commands. The recipe uses `release/v0.8.0` plus the
+bundled Ascend compatibility patch; it does not install from a personal fork.
 
 ---
 
@@ -42,8 +41,8 @@ rollout 1、seed 42、无 task reward、训练前验证和每五步验证。硬�
 - `patch/verl_opd_ascend.patch`：VeRL 核心兼容改动的独立 patch。
 
 核心改动已经提交到 [verl PR #7333](https://github.com/verl-project/verl/pull/7333)。
-在该 PR 合入前，版本文件固定其已审批的公开 fork head；合入后应把版本文件更新为
-正式 upstream merge commit。
+本配方以官方 `release/v0.8.0` 为基础，并在 editable install 前应用本目录携带的兼容
+patch，因此不依赖个人 fork。相关修复进入正式 release 后即可删除 patch。
 
 ### 3. 环境
 
@@ -92,9 +91,8 @@ PY
 cd verl
 ```
 
-版本文件当前安装 #7333 的公开、已审批 head，其中已经包含 compat patch。若要在
-`REQUIRED_VERL.txt` 的 `PATCH_BASE`（未包含修复的 upstream main）上独立审计
-patch，可执行：
+`--method git` 会检出官方 `release/v0.8.0`，应用兼容 patch，再执行 editable
+install。也可在同一 release 源码树中独立审计或手动应用 patch：
 
 ```bash
 git apply --check --unidiff-zero ../opd/patch/verl_opd_ascend.patch
@@ -222,7 +220,8 @@ Qwen3-VL 是一次 checkpoint-resume 链路，因此分为 1--20 和 21--100 两
 - 当前正式结果覆盖 TP/DP，不覆盖 PP/EP；
 - 四卡硬件降级与公开八卡配置的吞吐不能直接横向比较；
 - vLLM Ascend、CANN 和 triton-ascend 必须采用兼容组合；
-- #7333 合入前依赖公开 fork head，合入后应尽快更新为 upstream merge commit。
+- release 分支尚未包含的两处兼容修复由本目录 patch 提供；正式 release 纳入修复后
+  应删除该 patch。
 
 ---
 
@@ -247,11 +246,14 @@ the public GPU script line by line.
 
 ### Install and run
 
-Install the exact reviewed VeRL revision from the recipe repository root:
+Install the reviewed official VeRL release and bundled compatibility patch from
+the recipe repository root. Use the git method; a wheel-only install cannot
+apply the source patch:
 
 ```bash
 ./install_verl.sh --recipe opd --method git --dest ./verl
 cd verl
+git diff --check
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
