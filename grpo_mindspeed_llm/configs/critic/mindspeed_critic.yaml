@@ -1,0 +1,22 @@
+# defaults specify the default config from each component
+defaults:
+
+  - ../optim@optim: megatron
+
+  - ../engine@mindspeed:
+      - megatron
+      - mindspeed
+
+  - critic
+
+  - _self_
+
+_target_: backend.config.MindSpeedCriticConfig
+
+strategy: mindspeed
+
+nccl_timeout: 600
+
+load_weight: True
+
+data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
