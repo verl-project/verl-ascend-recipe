@@ -30,6 +30,7 @@ from verl.workers.rollout.fault_tolerance.exceptions import (
     AllServersFailed,
     BatchMostlyFailed,
     ServerUnavailable,
+    is_transient_fault,
 )
 
 # Prompt-level fault exceptions that L4 should absorb into the partial batch.
@@ -61,6 +62,9 @@ def filter_partial_batch(
     fault_count = 0
     for i, r in enumerate(results):
         if isinstance(r, _PROMPT_FAULT_TYPES):
+            fault_count += 1
+            continue
+        if is_transient_fault(r):
             fault_count += 1
             continue
         if isinstance(r, BaseException):

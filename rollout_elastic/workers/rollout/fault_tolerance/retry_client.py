@@ -32,6 +32,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tokenizer import normalize_token_ids
+from verl.workers.rollout.fault_tolerance.exceptions import is_transient_fault
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput
 
@@ -163,33 +164,44 @@ class RetryLLMServerClient(LLMServerClient):
             if progress_on:
                 sp_for_checkpoint = dict(original_sampling)
                 sp_for_checkpoint["max_tokens"] = self._resolve_original_max_tokens(original_sampling, original_prompt)
-                result = await VLLMProgressCheckPoint.create_or_resume(
-                    store=self._progress_store,
-                    run_id=self._run_id,
-                    recovery_id=recovery_id,
-                    prompt_token_ids=original_prompt,
-                    sampling_params=sp_for_checkpoint,
-                    model_weight_version=await self._weights_version(),
-                    flush_token_interval=self._flush_token_interval(),
-                    model_version_policy=self._model_version_policy(),
-                )
-                checkpoint = result.checkpoint
-                progress_ctx = ProgressContext(checkpoint=checkpoint)
-                prefix_for_call = checkpoint.resume_prefix_token_ids()
-                call_sampling = copy.deepcopy(original_sampling)
-                call_sampling["max_tokens"] = checkpoint.remaining_max_tokens()
-                logger.info(
-                    "[progress] run=%s, rid=%s, attempt=%d, outcome=%s, inherited_len=%d"
-                    "prefix_len=%d remaining_max_tokens=%d (%s)",
-                    self._run_id,
-                    recovery_id,
-                    result.attempt_id,
-                    result.outcome.name,
-                    result.inherited_prefix_len,
-                    len(prefix_for_call),
-                    checkpoint.remaining_max_tokens(),
-                    result.failure_detail or "-",
-                )
+                try:
+                    result = await VLLMProgressCheckPoint.create_or_resume(
+                        store=self._progress_store,
+                        run_id=self._run_id,
+                        recovery_id=recovery_id,
+                        prompt_token_ids=original_prompt,
+                        sampling_params=sp_for_checkpoint,
+                        model_weight_version=await self._weights_version(),
+                        flush_token_interval=self._flush_token_interval(),
+                        model_version_policy=self._model_version_policy(),
+                    )
+                except Exception as e:
+                    if not is_transient_fault(e):
+                        raise
+                    print(
+                        f"RetryLLMServerClient: progress store unavailable"
+                        f"({type(e).__name__}), degrading to fresh attempt"
+                        f"(run={self._run_id}, recovery_id={recovery_id})",
+                        flush=True,
+                    )
+                else:
+                    checkpoint = result.checkpoint
+                    progress_ctx = ProgressContext(checkpoint=checkpoint)
+                    prefix_for_call = checkpoint.resume_prefix_token_ids()
+                    call_sampling = copy.deepcopy(original_sampling)
+                    call_sampling["max_tokens"] = checkpoint.remaining_max_tokens()
+                    logger.info(
+                        "[progress] run=%s, rid=%s, attempt=%d, outcome=%s, inherited_len=%d"
+                        "prefix_len=%d remaining_max_tokens=%d (%s)",
+                        self._run_id,
+                        recovery_id,
+                        result.attempt_id,
+                        result.outcome.name,
+                        result.inherited_prefix_len,
+                        len(prefix_for_call),
+                        checkpoint.remaining_max_tokens(),
+                        result.failure_detail or "-",
+                    )
             try:
                 output, server_id = await self._generate_once(
                     request_id,

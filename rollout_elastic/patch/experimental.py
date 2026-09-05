@@ -415,8 +415,8 @@ async def _one_step_async_gen_next_batch(self, continuous_iterator):
     import torch
 
     from verl.protocol import DataProto
+    from verl.trainer.ppo.ray_trainer import compute_response_mask
     from verl.utils.debug import marked_timer
-    from verl.utils.model import compute_response_mask
 
     try:
         epoch, batch_dict = next(continuous_iterator)
@@ -569,6 +569,9 @@ async def _one_step_fit_step(self, batch_data_future, continuous_iterator):
 
     def pad_batch_to_size(batch, target_size):
         current_size = len(batch)
+        if current_size == 0:
+            print("Warning: empty batch returned from generation; skipping padding")
+            return batch
         if current_size == target_size:
             return batch
         elif current_size > target_size:

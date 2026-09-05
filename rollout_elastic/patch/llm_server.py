@@ -118,6 +118,12 @@ def mark_failed(self, server_id: str) -> None:
     _lb_core(self).mark_failed(server_id)
 
 
+@add(GlobalRequestLoadBalancer, "set_fault_tolerance")
+def set_fault_tolerance(self, enabled: bool) -> None:
+    """Enable or disable fault tolerance for the load balancer."""
+    _lb_core(self)._ft = bool(enabled)
+
+
 @patch(GlobalRequestLoadBalancer, "add_servers")
 def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
     """Add new servers to the server handles. Idempotent; resurrects dead ids."""
@@ -450,31 +456,51 @@ async def _fully_generate(
         checkpoint = None
         progress_ctx = None
         if progress_on:
-            from verl.workers.rollout.fault_tolerance import ProgressContext, VLLMProgressCheckPoint
-
-            result = await VLLMProgressCheckPoint.create_or_resume(
-                store=self._progress_store,
-                run_id=self._run_id,
-                recovery_id=recovery_id,
-                prompt_token_ids=original_prompt,
-                sampling_params=original_sampling,
-                model_weight_version=model_weight_version,
-                flush_token_interval=self._flush_token_interval(),
-                model_version_policy=self._model_version_policy(),
+            from verl.workers.rollout.fault_tolerance import (
+                ProgressContext,
+                VLLMProgressCheckPoint,
+                is_transient_fault,
             )
-            checkpoint = result.checkpoint
-            progress_ctx = ProgressContext(checkpoint=checkpoint)
-            prefix_for_call = checkpoint.resume_prefix_token_ids()
-            call_sampling = copy.deepcopy(original_sampling)
-            if limit_key is not None:
-                call_sampling[limit_key] = checkpoint.remaining_max_tokens()
-            if checkpoint.inherited_prefix_len > 0:
-                final_output = TokenOutput(
-                    token_ids=list(checkpoint.cumulative_token_ids),
-                    log_probs=list(checkpoint.cumulative_log_probs) if checkpoint.cumulative_log_probs else [],
-                    routed_experts=checkpoint.cumulative_routed_experts,
-                    num_preempted=checkpoint.num_preempted,
+
+            try:
+                result = await VLLMProgressCheckPoint.create_or_resume(
+                    store=self._progress_store,
+                    run_id=self._run_id,
+                    recovery_id=recovery_id,
+                    prompt_token_ids=original_prompt,
+                    sampling_params=original_sampling,
+                    model_weight_version=model_weight_version,
+                    flush_token_interval=self._flush_token_interval(),
+                    model_version_policy=self._model_version_policy(),
                 )
+            except Exception as e:
+                if not is_transient_fault(e):
+                    raise
+                print(
+                    f"FullyLLMServerClient: progress store unavailable"
+                    f"({type(e).__name__}), degrading to fresh attempt"
+                    f"(run={self._run_id}, recovery_id={recovery_id})",
+                    flush=True,
+                )
+                prefix_for_call = original_prompt
+                call_sampling = sampling_params
+            else:
+                checkpoint = result.checkpoint
+                progress_ctx = ProgressContext(checkpoint=checkpoint)
+                prefix_for_call = checkpoint.resume_prefix_token_ids()
+                call_sampling = copy.deepcopy(original_sampling)
+                if limit_key is not None:
+                    call_sampling[limit_key] = checkpoint.remaining_max_tokens()
+                # Seed final_output with inherited cumulative so that after fault reset
+                # (where final_output was cleared) the persisted tokens are not lost.
+                # On the abort path this is idempotent (cumulative == existing final_output).
+                if checkpoint.inherited_prefix_len > 0:
+                    final_output = TokenOutput(
+                        token_ids=list(checkpoint.cumulative_token_ids),
+                        log_probs=list(checkpoint.cumulative_log_probs) if checkpoint.cumulative_log_probs else [],
+                        routed_experts=checkpoint.cumulative_routed_experts,
+                        num_preempted=checkpoint.num_preempted,
+                    )
         else:
             progress_ctx = None
             prefix_for_call = original_prompt + final_output.token_ids
@@ -612,9 +638,19 @@ def _resolve_max_model_len(self) -> Optional[int]:
 @add(LLMServerManager, "_init_progress_store")
 async def _init_progress_store(self, progress_cfg) -> None:
     """Mode C: create and initialise the StoreActor. Called during FT assembly."""
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
     from verl.workers.rollout.fault_tolerance import RolloutProgressStoreActor
 
-    self._progress_store = RolloutProgressStoreActor.remote()
+    try:
+        node_id = ray.get_runtime_context().get_node_id()
+        scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
+    except Exception:
+        scheduling_strategy = None
+    options = {"max_restarts": 3, "max_task_retries": 3}
+    if scheduling_strategy is not None:
+        options["scheduling_strategy"] = scheduling_strategy
+    self._progress_store = RolloutProgressStoreActor.options(**options).remote()
     await self._progress_store.init.remote(progress_cfg)
 
 
@@ -628,8 +664,9 @@ async def _init_global_load_balancer(self) -> None:
     self.global_load_balancer = GlobalRequestLoadBalancer.remote(
         servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-        enable_fault_tolerance=ft_on,
     )
+    if ft_on:
+        await self.global_load_balancer.set_fault_tolerance.remote(True)
 
 
 @patch(LLMServerManager, "get_client")
