@@ -1,5 +1,5 @@
 diff --git a/mbridge/core/bridge.py b/mbridge/core/bridge.py
-index 031e922..cabf8f4 100644
+index 031e922..d353fe0 100644
 --- a/mbridge/core/bridge.py
 +++ b/mbridge/core/bridge.py
 @@ -171,7 +171,7 @@ class Bridge(ABC):
@@ -29,6 +29,24 @@ index 031e922..cabf8f4 100644
                      # split mcore weights across etp
                      if self.mpu.etp_rank == 0:
                          mcore_weights_tp_split = self._weight_split_across_tp(
+@@ -219,7 +219,7 @@ class Bridge(ABC):
+                         )
+                         mcore_weights_tp_split = list(mcore_weights_tp_split)
+                         mcore_weights_tp_split = [
+-                            t.to(param.device, dtype=param.dtype).contiguous()
++                            t.contiguous().to(param.device, dtype=param.dtype)
+                             for t in mcore_weights_tp_split
+                         ]
+                     else:
+@@ -238,7 +238,7 @@ class Bridge(ABC):
+                         )
+                         mcore_weights_tp_split = list(mcore_weights_tp_split)
+                         mcore_weights_tp_split = [
+-                            t.to(param.device, dtype=param.dtype).contiguous()
++                            t.detach().cpu().contiguous().to(dtype=param.dtype).to(device=param.device)
+                             for t in mcore_weights_tp_split
+                         ]
+                     else:
 @@ -351,6 +351,8 @@ class Bridge(ABC):
              if iter_pp_rank == self.mpu.pp_rank:
                  try:
