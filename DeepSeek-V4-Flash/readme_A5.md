@@ -14,9 +14,9 @@
 | torch\_npu             | 2.10.0.post4    | 
 | verl                   | 809f2d8         | 
 | vLLM                   | v0.27.1         | 
-| vLLM-Ascend            |  | 
-| MindSpeed-LLM          | 99f7fc1 (master)| 
-| MindSpeed              | 1becca8 (master)| 
+| vLLM-Ascend            | 343743a (master)| 
+| MindSpeed-LLM          | a83d51e (master)| 
+| MindSpeed              | 4fb7dc0 (master)| 
 | Megatron               | core_v0.12.1    | 
 
 
@@ -28,7 +28,7 @@
 conda create -n verl-npu python=3.11 -y
 conda activate verl-npu
 
-# 安装环境依赖
+# 获取环境依赖
 git clone https://github.com/verl-project/verl-ascend-recipe.git
 
 # 首先根据实际cann的安装路径source cann
@@ -62,7 +62,7 @@ ln -s ../mbridge/mbridge mbridge
 
 3. 减层（4层）配置生成
     
-    仅需修改模型权重路径下的 config.json 的 num_hidden_layers 对应数值改成4
+    仅需修改模型权重路径下的 config.json 的 num_hidden_layers 对应数值改成 4
 
 ### 启动训练
 

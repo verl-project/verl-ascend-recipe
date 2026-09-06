@@ -3,7 +3,6 @@ rm -rf /tmp/ray
 rm -rf kernel_meta
 rm -rf /root/.triton/cache/
 ulimit -n 65536
-rm -rf /etc/hccl_rootinfo.json
 set -x 
 
 

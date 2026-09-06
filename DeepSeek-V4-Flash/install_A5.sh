@@ -2,14 +2,14 @@
 set -ex
 
 echo "1. install vllm v0.27.1 from source"
-git clone --depth 1 --branch v0.27.1 https://github.com/vllm-project/vllm.git
-cd vllm && python use_existing_torch.py --prefix && pip install -r requirements/build/cuda.txt
-VLLM_TARGET_DEVICE=empty python -m pip install --no-build-isolation -e .
+git clone https://github.com/vllm-project/vllm.git
+cd vllm && git checkout v0.27.1
+VLLM_TARGET_DEVICE=empty pip install -v -e . 
 cd ..
 
 echo "2. install vllm-ascend from source"
 git clone https://github.com/vllm-project/vllm-ascend.git
-cd vllm-ascend && git checkout 343743af && install -r requirements.txt --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ --trusted-host triton-ascend.osinfra.cn
+cd vllm-ascend && git checkout 343743a && install -r requirements.txt --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ --trusted-host triton-ascend.osinfra.cn
 export COMPILE_CUSTOM_KERNELS=1
 pip install -v -e . --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ --trusted-host triton-ascend.osinfra.cn 
 cd ..
@@ -29,7 +29,7 @@ cd ..
 
 echo "5.install MindSpeed & MindSpeed-LLM & Megatron"
 git clone https://gitcode.com/ascend/MindSpeed.git
-cd MindSpeed
+cd MindSpeed && git checkout 4fb7dc0
 pip3 install -r requirements.txt 
 cd ..
 
@@ -39,7 +39,7 @@ git checkout core_v0.12.1
 cd ..
 
 git clone https://gitcode.com/ascend/MindSpeed-LLM.git 
-cd MindSpeed-LLM
+cd MindSpeed-LLM && git checkout a83d51e
 cp pretrain_deepseek4.py mindspeed_llm
 pip3 install -r requirements.txt
 cd ..
