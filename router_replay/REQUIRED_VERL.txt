@@ -1,0 +1,8 @@
+# Router Replay R3 - verl revision required by this recipe
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=rolling
+BRANCH=main
+VERL_COMMIT=3c62a15d1e9f99a95e763043023a693146648309
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@3c62a15d1e9f99a95e763043023a693146648309
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout 3c62a15d1e9f99a95e763043023a693146648309
+RECIPE_FOLDER=router_replay
