@@ -1,0 +1,30 @@
+diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
+--- a/verl/trainer/distillation/losses.py
++++ b/verl/trainer/distillation/losses.py
+@@ -397,1 +397,4 @@ def compute_distillation_loss_reverse_kl_estimator(
+     loss_config: DistillationLossConfig = distillation_config.distillation_loss
++    if loss_config.log_prob_min_clamp is not None:
++        student_log_probs = student_log_probs.clamp_min(loss_config.log_prob_min_clamp)
++        teacher_log_probs = teacher_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
+--- a/verl/utils/tensordict_utils.py
++++ b/verl/utils/tensordict_utils.py
+@@ -911,5 +911,13 @@ def maybe_fix_3d_position_ids(data: TensorDict):
+-    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
+-    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
+-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+-    if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
+-        data["position_ids"]._ragged_idx = 2
++    # TensorDict pickle/unpickle can rebuild VLM position IDs with the image/MRoPE
++    # axis as jagged: [batch, j4, sequence]. Merely overwriting _ragged_idx leaves
++    # the internal values/offsets inconsistent and later makes unbind split the
++    # sequence dimension with image-axis lengths. Rebuild the NestedTensor so the
++    # variable sequence dimension is genuinely jagged: [batch, 4, jsequence].
++    if "position_ids" not in data.keys():
++        return
++
++    position_ids = data["position_ids"]
++    if position_ids.dim() != 3 or not position_ids.is_nested or getattr(position_ids, "_ragged_idx", None) == 2:
++        return
++
++    data["position_ids"] = nested_tensor_from_tensor_list(list(position_ids.unbind()), ragged_idx=2)
