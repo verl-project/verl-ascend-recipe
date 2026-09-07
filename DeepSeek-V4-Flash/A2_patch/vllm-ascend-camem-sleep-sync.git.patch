@@ -1,0 +1,21 @@
+--- a/vllm_ascend/device_allocator/camem.py
++++ b/vllm_ascend/device_allocator/camem.py
+@@ -201,6 +201,18 @@
+             len(self.pointer_to_data),
+             offload_tags,
+         )
++        # Drain in-flight async kernels (DSA indexer InplacePartialRotaryMul)
++        # before unmap. generate() can return while RoPE is still on stream;
++        # unmap then empty_cache() DeviceSynchronize -> SMMU/MTE 507011.
++        # Opt-out: VERL_DSV4_CAMEM_SLEEP_NO_SYNC=1
++        if os.environ.get("VERL_DSV4_CAMEM_SLEEP_NO_SYNC", "0").lower() not in (
++            "1",
++            "true",
++            "yes",
++            "on",
++        ):
++            logger.info("[camem-sleep-sync] torch.npu.synchronize() before unmap")
++            torch.npu.synchronize()
+         for ptr, data in self.pointer_to_data.items():
+             if data.tag == CaMemAllocator.sleep_persistent_tag:
+                 # This memory is not offloaded or released during sleep.

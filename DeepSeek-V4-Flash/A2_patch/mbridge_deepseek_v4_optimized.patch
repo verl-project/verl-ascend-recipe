@@ -1,0 +1,1533 @@
+diff --git a/mbridge/__init__.py b/mbridge/__init__.py
+index 8fd27bb..4ed1107 100644
+--- a/mbridge/__init__.py
++++ b/mbridge/__init__.py
+@@ -18,7 +18,12 @@ from importlib.metadata import version as _pkg_version
+ try:
+     __version__ = _pkg_version(__name__)
+ except PackageNotFoundError:
+-    import tomllib
++    import sys
++
++    if sys.version_info >= (3, 11):
++        import tomllib
++    else:
++        import tomli as tomllib
+     from pathlib import Path
+ 
+     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+diff --git a/mbridge/core/bridge.py b/mbridge/core/bridge.py
+index 031e922..734b3e4 100644
+--- a/mbridge/core/bridge.py
++++ b/mbridge/core/bridge.py
+@@ -1,7 +1,7 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ import os
+ from abc import ABC
+-from typing import Callable, Generator
++from typing import Callable, Generator, Optional
+ 
+ import torch
+ from megatron.core.models.gpt.gpt_model import ModelType
+@@ -18,14 +18,164 @@ from .util import (
+ )
+ 
+ 
++# When ep_size >= this threshold, each expert block of a GEMM ``weight1``
++# tensor is gathered in two rounds (gate half / up half) instead of one, so a
++# single all_gather round only keeps half an expert block alive. The gate half
++# is exactly the HF w1 tensor and the up half is w3, so each round can be
++# persisted independently. Below the threshold a whole-expert round is cheap
++# enough and halves the number of collective rounds.
++_GEMM_EP_SPLIT_THRESHOLD = 64
++
++
+ class Bridge(ABC):
+     """
+     Base model bridge class.
+ 
+     This class implements the core functionality to bridge between
+     Hugging Face models and Megatron-Core optimized implementations.
++
++    GEMM expert layout contract
++    ===========================
++    Subclasses that use GEMM-format (``moe_gemm``) expert weights — where
++    all local experts are concatenated into a single ``weight1`` / ``weight2``
++    tensor consumed by fused MoE kernels — **must** override the following
++    hooks for any parameter whose name :meth:`_is_expert_gemm_name` returns
++    True:
++
++    1. :meth:`_is_expert_gemm_name`       — identify GEMM expert names
++    2. :meth:`_get_hf_experts_key`        — HF-side expert path segment,
++                                            must return a non-``None`` string
++    3. :meth:`_weight_to_mcore_format_gemm`   — HF → GEMM MCore (import)
++    4. :meth:`_iter_gemm_export_experts`       — GEMM MCore → per-expert HF,
++                                                  streamed one expert at a time
++    5. :meth:`_iter_gemm_etp_slices`          — GEMM MCore split by ETP rank,
++                                                 streamed one slice at a time
++
++    Additionally, because the generic TP merge/split/weight-format helpers in
++    this base class deliberately know nothing about a given model's GEMM
++    memory layout, the subclass is responsible for overriding:
++
++    * :meth:`_weight_to_hf_format`
++    * :meth:`_weight_merge_across_tp`
++    * :meth:`_weight_split_across_tp`
++
++    and, inside each override, dispatching to a GEMM-specific private helper
++    (e.g. ``_weight_to_hf_format_gemm``) when the current parameter is a
++    GEMM expert. See :class:`DeepseekV4Bridge` for the reference pattern.
+     """
+ 
++    # GEMM hook contract: once a subclass overrides ``_is_expert_gemm_name``
++    # (i.e. declares GEMM-format expert weights), all of the following hooks
++    # must be overridden as well; the base-class defaults only fail loudly.
++    _GEMM_REQUIRED_OVERRIDES = (
++        "_is_expert_gemm_name",
++        "_get_hf_experts_key",
++        "_weight_to_mcore_format_gemm",
++        "_iter_gemm_export_experts",
++        "_iter_gemm_etp_slices",
++    )
++
++    def __init_subclass__(cls, **kwargs):
++        super().__init_subclass__(**kwargs)
++        # Static check at class-definition time: if a subclass overrides
++        # ``_is_expert_gemm_name`` (declaring a GEMM expert layout), every
++        # required companion hook must be overridden too, instead of failing
++        # late at runtime with confusing shape errors.
++        if cls._is_expert_gemm_name is not Bridge._is_expert_gemm_name:
++            missing = [
++                name
++                for name in Bridge._GEMM_REQUIRED_OVERRIDES
++                if getattr(cls, name, None) is getattr(Bridge, name, None)
++            ]
++            if missing:
++                raise TypeError(
++                    f"{cls.__name__} overrides _is_expert_gemm_name() so it "
++                    f"declares support for GEMM-format expert weights, but it "
++                    f"does not override the required companion hooks: "
++                    f"{missing}. See Bridge class docstring for the full "
++                    f"GEMM-expert contract."
++                )
++
++    def _assert_gemm_contract_satisfied(self, param_context: str) -> None:
++        """
++        Runtime guard invoked immediately before any GEMM-expert code path.
++
++        Catches the edge case where a subclass did *not* override
++        ``_is_expert_gemm_name`` (so the __init_subclass__ static check
++        didn't fire) but some other routing logic still landed us in a GEMM
++        code path. Without this guard, the failure mode is a confusing
++        shape-error or a silent weight mis-ordering deep inside the loop.
++        """
++        missing = [
++            name
++            for name in Bridge._GEMM_REQUIRED_OVERRIDES
++            if getattr(type(self), name, None) is getattr(Bridge, name, None)
++        ]
++        if missing:
++            raise RuntimeError(
++                f"{type(self).__name__} is about to execute a GEMM-expert "
++                f"code path ({param_context}), but has not implemented the "
++                f"required GEMM hooks: {missing}. See Bridge class docstring "
++                f"for the full GEMM-expert contract."
++            )
++        # ``_get_hf_experts_key`` must return a non-empty string; it is used
++        # on both the import and the export path to locate the expert id.
++        key = self._get_hf_experts_key()
++        if key is None or not isinstance(key, str) or not key:
++            raise RuntimeError(
++                f"{type(self).__name__} declares GEMM experts but "
++                f"_get_hf_experts_key() returned {key!r}; expected a non-empty "
++                f"HF path segment string such as '.ffn.experts.'."
++            )
++
++    # ------------------------------------------------------------------
++    # Model-variant naming hooks.
++    #
++    # Different model families (and different Megatron-side implementations)
++    # name the same logical parameters differently. The base class defaults
++    # below reproduce the historical "official HF checkpoint" behavior;
++    # subclasses for other variants override only the hooks they differ in.
++    # ------------------------------------------------------------------
++
++    # HF names of vocab-parallel parameters (token embedding / output head).
++    # ``load_weights`` uses this set to skip these weights on value models
++    # whose embedding/head row-dim is 1.
++    _VOCAB_PARALLEL_HF_NAMES = ("lm_head.weight", "model.embed_tokens.weight")
++
++    # Substrings of MCore parameter names whose HF counterpart is stored in
++    # FP32 (e.g. router expert bias). These parameters are exempted from the
++    # import-side dtype cast so a HF -> MCore -> HF round-trip stays FP32.
++    _FP32_HF_PARAM_KEYS = ("expert_bias",)
++
++    # Substrings of MCore parameter names that are tensor-model-parallel but
++    # not marked ``tensor_model_parallel`` by the model implementation (e.g.
++    # attention sink). ``export_weights`` forces the TP gather path for them.
++    _FORCE_TP_PARALLEL_KEYS: tuple = ()
++
++    def _is_local_expert_weight_name(self, name: str) -> bool:
++        """
++        Whether an MCore parameter name is a per-expert (sequential) MoE
++        expert weight that is sharded across ETP ranks, e.g.
++        ``...mlp.experts.linear_fc1.weight{expert_id}`` in the default
++        Megatron naming.
++        """
++        return ".mlp.experts.linear_fc" in name
++
++    def _parse_local_expert_weight_name(self, name: str) -> tuple[str, int, str]:
++        """
++        Split a local-expert weight name into ``(prefix, local_expert_id,
++        suffix)``. The default Megatron naming is ``{prefix}.weight{id}`` and
++        carries no suffix.
++        """
++        prefix, local_expert_id = name.split(".weight")
++        return prefix, int(local_expert_id), ""
++
++    def _format_global_expert_weight_name(
++        self, prefix: str, global_expert_id: int, suffix: str = ""
++    ) -> str:
++        """Inverse of :meth:`_parse_local_expert_weight_name`."""
++        return f"{prefix}.weight{global_expert_id}"
++
+     def __init__(
+         self,
+         hf_config: AutoConfig,
+@@ -168,10 +318,13 @@ class Bridge(ABC):
+                 for k, v in local_to_global_map.items()
+                 if "_extra_state" not in k
+             }
++
+             # only tp_rank0/etp_rank0 load from disk, others load from tp_rank0/etp_rank0
+             to_load_from_disk = []
+             for local_name, hf_names in local_to_hf_map.items():
+-                if ".mlp.experts.linear_fc" in local_name:
++                if self._is_local_expert_weight_name(
++                    local_name
++                ) or self._is_expert_gemm_name(local_name):
+                     if self.mpu.etp_rank == 0:
+                         to_load_from_disk.extend(hf_names)
+                 else:
+@@ -203,7 +356,8 @@ class Bridge(ABC):
+                     mcore_weight = self._weight_to_mcore_format(local_name, hf_weights)
+                 else:
+                     mcore_weight = None
+-                if hf_names[0] in {"lm_head.weight", "model.embed_tokens.weight"}:
++
++                if hf_names[0] in self._VOCAB_PARALLEL_HF_NAMES:
+                     if param.shape[0] == 1 and (
+                         mcore_weight is None or mcore_weight.shape[0] != 1
+                     ):
+@@ -211,7 +365,16 @@ class Bridge(ABC):
+                         continue
+ 
+                 param_to_load = torch.empty_like(param)
+-                if ".mlp.experts.linear_fc" in local_name:
++                if self._is_expert_gemm_name(local_name):
++                    # GEMM-format expert: stream one ETP chunk at a time to
++                    # avoid materializing etp_size full copies of the weight.
++                    self._assert_gemm_contract_satisfied(
++                        f"import load_weights param {local_name!r}"
++                    )
++                    self._load_gemm_weights_over_etp(
++                        local_name, mcore_weight, param_to_load
++                    )
++                elif self._is_local_expert_weight_name(local_name):
+                     # split mcore weights across etp
+                     if self.mpu.etp_rank == 0:
+                         mcore_weights_tp_split = self._weight_split_across_tp(
+@@ -294,6 +457,331 @@ class Bridge(ABC):
+         self.extra_args.update(kwargs)
+         self.config = self._build_config()
+ 
++    def _is_expert_gemm_name(self, name: str) -> bool:
++        """
++        Whether an MCore parameter name corresponds to the GEMM-format expert
++        weights (e.g. mcore `mlp.experts.weight1` / `weight2`).
++
++        GEMM-format experts concatenate all local experts into a single big
++        weight consumed by `moe_gemm`-style kernels. This is a per-model
++        property, so subclasses using that layout must override this to True.
++
++        Returns:
++            bool: True if the name is a GEMM-format expert weight.
++        """
++        return False
++
++    def _get_hf_experts_key(self) -> Optional[str]:
++        """
++        HF-side path segment that locates the expert id within exported weight
++        names, e.g. ``'.ffn.experts.'`` for DeepSeek-style checkpoints.
++
++        Only relevant when :meth:`_is_expert_gemm_name` is True. Return ``None``
++        to indicate no GEMM expert renaming is needed (default).
++        """
++        return None
++
++    def _weight_to_mcore_format_gemm(
++        self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
++    ) -> torch.Tensor:
++        """
++        Convert Hugging Face weights to the GEMM-format MCore expert tensor.
++
++        Called from :meth:`_weight_to_mcore_format` only for GEMM expert names
++        (see :meth:`_is_expert_gemm_name`). Subclasses using that layout must
++        override this.
++        """
++        raise NotImplementedError(
++            f"GEMM expert layout not supported by {type(self).__name__} "
++            f"for parameter: {mcore_weights_name}"
++        )
++
++    def _export_gemm_weights(
++        self,
++        name: str,
++        broad_pp_param: torch.Tensor,
++        hf_experts_key: str,
++        num_experts_per_rank: int,
++    ) -> Generator[tuple[str, torch.Tensor], None, None]:
++        """
++        Export GEMM-format expert weights (moe_gemm) as per-expert HF weights.
++
++        Only called from :meth:`export_weights` for GEMM expert names with
++        ``ep_size > 1``. The GEMM weight carries the local experts of this EP
++        rank; after merging across ETP (if any) and converting to per-expert HF
++        tensors, the global expert id is spliced back into each HF name using
++        ``hf_experts_key``.
++
++        Streaming cross-EP collection (per-expert-block all_gather): every
++        process first all_gathers within its own ETP group to rebuild the full
++        GEMM weight of its own EP rank, then slices it into
++        ``num_experts_per_rank`` expert blocks and all_gathers each block
++        within its own ``ep_group``. Every member of the group then yields the
++        complete expert sequence, so all ranks produce exactly the same stream
++        of weight names (the base-class symmetry contract relied upon e.g. by
++        verl, where each training rank streams independently to its paired
++        inference engine). Peak memory is ``ep_size`` x one expert block
++        instead of ``ep_size`` full weights, and all collectives reuse the
++        existing ``ep_group`` (no new communication domain, no barrier).
++
++        Args:
++            name: MCore weight name (e.g. ``decoder.layers.0.mlp.experts.weight1``)
++            broad_pp_param: Broadcast GEMM expert tensor (post model-parallel)
++            hf_experts_key: HF path segment locating the expert id, from
++                :meth:`_get_hf_experts_key`
++            num_experts_per_rank: Number of experts owned by each EP rank
++
++        Returns:
++            Generator of ``(hf_name, hf_tensor)`` pairs.
++        """
++        # Stage 1: merge within the own ETP group to rebuild the full GEMM
++        # weight of the EP rank this process belongs to. All processes join
++        # this collective, keeping the group-wide cadence consistent.
++        if self.mpu.etp_size > 1:
++            etp_params = [
++                torch.empty_like(broad_pp_param)
++                for _ in range(self.mpu.etp_size)
++            ]
++            torch.distributed.all_gather(
++                etp_params, broad_pp_param, group=self.mpu.etp_group
++            )
++            own_merged = self._weight_merge_across_tp(
++                name, etp_params, broad_pp_param
++            )
++            # The ETP buffers are merged into own_merged; release them
++            # explicitly so the caching allocator can reuse the memory.
++            del etp_params
++            self._release_gemm_memory(broad_pp_param.device)
++        else:
++            # etp_size == 1: no ETP shard to merge, but the raw GEMM layout
++            # stacks experts along columns (weight1) / row-blocks (weight2),
++            # which differs from the per-expert row-block layout expected by
++            # ``_iter_gemm_export_experts``. ``_weight_merge_across_tp`` with
++            # a single input performs exactly that transposed regrouping, so
++            # the layout of ``own_merged`` matches the etp_size > 1 branch.
++            own_merged = self._weight_merge_across_tp(name, [broad_pp_param], broad_pp_param)
++            self._release_gemm_memory(broad_pp_param.device)
++
++        # Stage 2: stream the experts out, one all_gather per expert block.
++        device = broad_pp_param.device
++        ep_group = self.mpu.ep_group
++        rows_per_expert = own_merged.shape[0] // num_experts_per_rank
++        split_gate_up = (
++            ".weight1" in name and self.mpu.ep_size >= _GEMM_EP_SPLIT_THRESHOLD
++        )
++
++        def splice_name(hf_name: str, global_expert_id: int) -> str:
++            """Replace the local expert id in an HF name with the global id."""
++            hf_name_left, hf_name_right = hf_name.split(hf_experts_key)
++            _, name_suffix = hf_name_right.split(".", 1)
++            return f"{hf_name_left}{hf_experts_key}{global_expert_id}.{name_suffix}"
++
++        if split_gate_up:
++            # gate/up split rounds: two rounds per expert (gate, then up);
++            # the product of each round is a complete HF tensor (w1 or w3)
++            # and can be persisted independently.
++            hf_names_all = self._weight_name_mapping_mcore_to_hf(name)
++            for expert_k in range(num_experts_per_rank):
++                block = own_merged[
++                    expert_k * rows_per_expert : (expert_k + 1) * rows_per_expert
++                ]
++                gate, up = block.chunk(2, dim=0)
++                for half_idx, half in enumerate((gate, up)):
++                    gathered = [
++                        torch.empty_like(half) for _ in range(self.mpu.ep_size)
++                    ]
++                    torch.distributed.all_gather(
++                        gathered, half, group=ep_group
++                    )
++                    # Every group member yields the full sequence so that all
++                    # ranks produce identical weight-name streams.
++                    for ep_rank in range(self.mpu.ep_size):
++                        hf_name = hf_names_all[2 * expert_k + half_idx]
++                        global_expert_id = (
++                            num_experts_per_rank * ep_rank + expert_k
++                        )
++                        yield splice_name(
++                            hf_name, global_expert_id
++                        ), gathered[ep_rank]
++                    del gathered
++                    self._release_gemm_memory(device)
++        else:
++            # Whole-expert rounds: each slice is one complete expert block and
++            # is decomposed via the subclass per-expert iterator.
++            for expert_k in range(num_experts_per_rank):
++                block = own_merged[
++                    expert_k * rows_per_expert : (expert_k + 1) * rows_per_expert
++                ]
++                gathered = [
++                    torch.empty_like(block) for _ in range(self.mpu.ep_size)
++                ]
++                torch.distributed.all_gather(gathered, block, group=ep_group)
++                for ep_rank in range(self.mpu.ep_size):
++                    for hf_name_lst, hf_w_lst in self._iter_gemm_export_experts(
++                        name,
++                        gathered[ep_rank],
++                        num_experts_in_tensor=1,
++                        expert_offset=expert_k,
++                    ):
++                        converted_names = [
++                            splice_name(
++                                hf_name,
++                                num_experts_per_rank * ep_rank + expert_k,
++                            )
++                            for hf_name in hf_name_lst
++                        ]
++                        yield from zip(converted_names, hf_w_lst)
++                del gathered
++                self._release_gemm_memory(device)
++
++        # GEMM parameter done: drop the full merged weight so it does not
++        # accumulate into the remaining (non-expert) parameters.
++        del own_merged
++        self._release_gemm_memory(device)
++
++        # Wait for this parameter's communication and export copies to
++        # complete so the communication streams are returned for reuse
++        # instead of accumulating across layers. Only relevant on NPU.
++        if device.type == "npu" and hasattr(torch, "npu"):
++            torch.npu.synchronize()
++
++    @staticmethod
++    def _release_gemm_memory(device) -> None:
++        """Return cached accelerator memory during GEMM export to avoid OOM.
++
++        Only affects accelerators with a caching allocator (CUDA / Ascend
++        NPU); CPU or unknown devices are skipped.
++        """
++        device_type = getattr(device, "type", None)
++        if device_type == "cuda":
++            torch.cuda.empty_cache()
++        elif device_type == "npu":
++            npu = getattr(torch, "npu", None)
++            if npu is not None and hasattr(npu, "empty_cache"):
++                npu.empty_cache()
++
++    def _iter_gemm_export_experts(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        num_experts_in_tensor: Optional[int] = None,
++        expert_offset: int = 0,
++    ) -> Generator[tuple[list[str], list[torch.Tensor]], None, None]:
++        """
++        Iterate a GEMM-format expert weight per expert (streaming).
++
++        Each **yield corresponds to exactly one local expert** and returns a
++        tuple of ``(hf_names, hf_tensors)`` whose length matches the number of
++        sub-weights for that expert:
++
++        * For ``weight1`` (gate+up fused): yields ``([w1_name, w3_name],
++          [gate_tensor, up_tensor])`` — **order must be gate first, up second**.
++        * For ``weight2`` (down): yields ``([w2_name], [down_tensor])``.
++
++        The yielded ``hf_names`` are the **local-expert HF names** as produced
++        by :meth:`_weight_name_mapping_mcore_to_hf` for the current EP rank;
++        the caller (:meth:`_export_gemm_weights`) is responsible for splicing
++        the global expert id back in.
++
++        Subclasses using the GEMM layout **must override this method** instead
++        of relying on a generic default. The generic default is intentionally
++        disabled because the per-yield grouping order (e.g. whether gate/up
++        are interleaved per-expert or grouped per-sub-weight) is a per-model
++        layout invariant; getting it wrong silently mis-weights every expert
++        gate/up pair with no shape error to catch it. Implementing this in the
++        subclass also enables true streaming: only the yielded expert needs
++        to be materialized at once, rather than all local experts upfront.
++
++        Args:
++            mcore_weights_name: MCore weight name
++            mcore_weights: Merged GEMM expert weight tensor (after ETP merge,
++                in the layout produced by :meth:`_weight_merge_across_tp`)
++            num_experts_in_tensor: Number of experts contained in
++                ``mcore_weights``. ``None`` (default) means all local experts
++                of this EP rank; the sliced streaming export passes 1 so only
++                a single expert block is enumerated.
++            expert_offset: Offset of the first expert of this tensor within
++                the local expert sequence of this EP rank; the HF names are
++                taken from ``[offset, offset + num_experts_in_tensor)``.
++
++        Returns:
++            Generator yielding per-expert ``(hf_names, hf_tensors)`` tuples.
++            Must yield exactly ``num_local_experts`` tuples (default) or
++            ``num_experts_in_tensor`` tuples (sliced mode), in ascending
++            local-expert-id order starting from ``expert_offset``.
++        """
++        raise NotImplementedError(
++            f"{type(self).__name__} must override _iter_gemm_export_experts() "
++            f"to define the per-expert streaming layout for GEMM expert "
++            f"weights (parameter: {mcore_weights_name}). See the method "
++            f"docstring for the strict per-yield ordering contract."
++        )
++
++    def _iter_gemm_etp_slices(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++    ) -> Generator[torch.Tensor, None, None]:
++        """
++        Split a GEMM-format expert weight into per-ETP-rank slices.
++
++        Yields one tensor per ETP rank (the slice owned by that rank), in rank
++        order. Subclasses using the GEMM layout must override this, since the
++        ETP tiling is a per-model property.
++        """
++        raise NotImplementedError(
++            f"GEMM expert layout not supported by {type(self).__name__} "
++            f"for parameter: {mcore_weights_name}"
++        )
++
++    def _load_gemm_weights_over_etp(
++        self,
++        local_name: str,
++        mcore_weight: torch.Tensor,
++        param_to_load: torch.Tensor,
++    ) -> None:
++        """
++        Stream-import a GEMM-format expert weight across ETP ranks.
++
++        ETP rank 0 holds the full merged GEMM weight; it slices it one ETP
++        chunk at a time and ``send``/``recv`` each chunk to its owning rank, so
++        only a single chunk of the full weight is live at once instead of
++        materializing all ETP pieces (the previous ``all_gather``-style
++        ``scatter`` peak). For ``etp_size == 1`` this is a plain local copy and
++        does not touch the network.
++        """
++        etp_size = self.mpu.etp_size
++        dtype = param_to_load.dtype
++        device = param_to_load.device
++
++        if etp_size == 1:
++            # mcore_weight may be a CPU tensor loaded from disk; move it here.
++            param_to_load.copy_(mcore_weight.to(device=device, dtype=dtype))
++            return
++
++        etp_group = self.mpu.etp_group
++        etp_rank = self.mpu.etp_rank
++        src_global_rank = torch.distributed.get_global_rank(etp_group, 0)
++
++        if etp_rank == 0:
++            split_iter = self._iter_gemm_etp_slices(local_name, mcore_weight.to(device))
++            chunk0 = None
++            for r in range(etp_size):
++                sl = next(split_iter).to(device=device, dtype=dtype).contiguous()
++                if r == 0:
++                    chunk0 = sl
++                else:
++                    torch.distributed.send(
++                        sl,
++                        dst=torch.distributed.get_global_rank(etp_group, r),
++                        group=etp_group,
++                    )
++            param_to_load.copy_(chunk0)
++        else:
++            torch.distributed.recv(
++                param_to_load, src=src_global_rank, group=etp_group
++            )
++
+     def export_weights(
+         self, models: list[torch.nn.Module]
+     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+@@ -346,11 +834,16 @@ class Bridge(ABC):
+             self._weight_name_mapping_mcore_local_to_global(model, consider_ep=False)
+             for model in models
+         ]
++
+         for iter_pp_rank, iter_vpp_rank, iter_name in weights_names_all_pp:
+             local_to_global_map = local_to_global_maps[iter_vpp_rank]
+             if iter_pp_rank == self.mpu.pp_rank:
+                 try:
+                     name, param = next(model_chunk_generator)
++                    # Force the TP gather path for TP-sharded parameters that
++                    # the model implementation does not mark as such.
++                    if any(k in name for k in self._FORCE_TP_PARALLEL_KEYS):
++                        param.tensor_model_parallel = True
+                 except StopIteration:
+                     name, param = None, None
+                 name = local_to_global_map[iter_name]
+@@ -360,8 +853,28 @@ class Bridge(ABC):
+             name = broadcast_str_from_megatron_pp(name)
+             broad_pp_param = broadcast_from_megatron_pp(param)
+ 
++            # use gemm & ep_size > 1
++            if self._is_expert_gemm_name(name) and self.mpu.ep_size > 1:
++                self._assert_gemm_contract_satisfied(
++                    f"export_weights param {name!r}"
++                )
++                hf_experts_key = self._get_hf_experts_key()
++                assert hf_experts_key is not None, (
++                    f"_is_expert_gemm_name({name}) is True but _get_hf_experts_key() is None"
++                )
++                num_experts = self.config.num_moe_experts
++                num_experts_per_rank = num_experts // self.mpu.ep_size
++
++                yield from self._export_gemm_weights(
++                    name,
++                    broad_pp_param,
++                    hf_experts_key,
++                    num_experts_per_rank,
++                )
++                continue
++
+             # EP
+-            if ".mlp.experts.linear_fc" in name and self.mpu.ep_size > 1:
++            if self._is_local_expert_weight_name(name) and self.mpu.ep_size > 1:
+                 num_experts = self.config.num_moe_experts
+                 num_experts_per_rank = num_experts // self.mpu.ep_size
+                 infer_params = [
+@@ -370,15 +883,17 @@ class Bridge(ABC):
+                 torch.distributed.all_gather(
+                     infer_params, broad_pp_param, group=self.mpu.ep_group
+                 )
+-
+-                name_prefix, local_expert_id = name.split(".weight")
+-                local_expert_id = int(local_expert_id)
++                name_prefix, local_expert_id, name_suffix = (
++                    self._parse_local_expert_weight_name(name)
++                )
+                 global_expert_ids = [
+                     num_experts_per_rank * ep_rank + local_expert_id
+                     for ep_rank in range(self.mpu.ep_size)
+                 ]
+                 global_expert_names = [
+-                    f"{name_prefix}.weight{expert_id}"
++                    self._format_global_expert_weight_name(
++                        name_prefix, expert_id, name_suffix
++                    )
+                     for expert_id in global_expert_ids
+                 ]
+ 
+@@ -429,7 +944,6 @@ class Bridge(ABC):
+             converted_names, converted_params = self._weight_to_hf_format(
+                 name, infer_params
+             )
+-
+             yield from zip(converted_names, converted_params)
+ 
+     def _build_config(self):
+@@ -512,12 +1026,16 @@ class Bridge(ABC):
+             }
+             for k in ret.keys():
+                 v = ret[k]
+-                if ".mlp.experts.linear_fc" in v:
+-                    name_prefix, local_expert_id = v.split(".weight")
++                if self._is_local_expert_weight_name(v):
++                    name_prefix, local_expert_id, name_suffix = (
++                        self._parse_local_expert_weight_name(v)
++                    )
+                     global_expert_idx = local_expert_to_global_expert[
+-                        int(local_expert_id)
++                        local_expert_id
+                     ]
+-                    ret[k] = f"{name_prefix}.weight{global_expert_idx}"
++                    ret[k] = self._format_global_expert_weight_name(
++                        name_prefix, global_expert_idx, name_suffix
++                    )
+ 
+         return ret
+ 
+@@ -670,6 +1188,17 @@ class Bridge(ABC):
+         else:
+             return self._weight_name_mapping_other(mcore_weights_name)
+ 
++    def _is_fp32_hf_param(self, mcore_weights_name: str) -> bool:
++        """Whether the HF counterpart of this parameter is stored in FP32
++        (e.g. router expert bias).
++
++        Such parameters are exempted from the import-side cast to the model
++        dtype, so a HF -> MCore -> HF round-trip keeps their FP32 precision.
++        Model variants extend :attr:`_FP32_HF_PARAM_KEYS` to declare their
++        own FP32 parameters.
++        """
++        return any(k in mcore_weights_name for k in self._FP32_HF_PARAM_KEYS)
++
+     def _weight_to_hf_format(
+         self, mcore_weights_name: str, mcore_weights: torch.Tensor
+     ) -> tuple[list[str], list[torch.Tensor]]:
+@@ -767,12 +1296,18 @@ class Bridge(ABC):
+         if (
+             hasattr(self, "dtype")
+             and self.dtype is not None
+-            and "expert_bias" not in mcore_weights_name
++            and not self._is_fp32_hf_param(mcore_weights_name)
+         ):
+             hf_weights = [
+                 w.to(self.dtype) if w.dtype != self.dtype else w for w in hf_weights
+             ]
+ 
++        if self._is_expert_gemm_name(mcore_weights_name):
++            self._assert_gemm_contract_satisfied(
++                f"_weight_to_mcore_format param {mcore_weights_name!r}"
++            )
++            return self._weight_to_mcore_format_gemm(mcore_weights_name, hf_weights)
++
+         if len(hf_weights) == 1:
+             # pad embeding and output layer
+             if self.make_vocab_size_divisible_by is not None and (
+@@ -852,10 +1387,11 @@ class Bridge(ABC):
+         if self.mpu.tp_size == 1:
+             assert len(mcore_weights) == 1
+             return mcore_weights[0]
+-        if "mlp.experts.linear_fc" in mcore_weights_name:
++        if self._is_local_expert_weight_name(mcore_weights_name):
+             assert len(mcore_weights) == self.mpu.etp_size
+         else:
+             assert len(mcore_weights) == self.mpu.tp_size
++
+         if (
+             "self_attention.linear_qkv." in mcore_weights_name
+             and "layer_norm" not in mcore_weights_name
+@@ -880,7 +1416,7 @@ class Bridge(ABC):
+             up = torch.cat(up_lst, dim=0)
+             ret = torch.cat((gate, up), dim=0)
+ 
+-        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
++        elif "linear_fc2.weight" in mcore_weights_name and self._is_local_expert_weight_name(mcore_weights_name):  # moe
+             ret = torch.cat(mcore_weights, dim=1)
+         else:
+             assert (
+@@ -928,7 +1464,7 @@ class Bridge(ABC):
+             gates = gate.chunk(tp_split_size)
+             ups = up.chunk(tp_split_size)
+             ret = [torch.cat([g, u], dim=0) for g, u in zip(gates, ups)]
+-        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
++        elif "linear_fc2.weight" in mcore_weights_name and self._is_local_expert_weight_name(mcore_weights_name):  # moe
+             ret = mcore_weights.chunk(tp_split_size, dim=1)
+         else:
+             if param.shape == mcore_weights.shape:
+diff --git a/mbridge/models/__init__.py b/mbridge/models/__init__.py
+index 65b2b8a..4f7104d 100644
+--- a/mbridge/models/__init__.py
++++ b/mbridge/models/__init__.py
+@@ -17,6 +17,7 @@ Classes:
+ # fmt: off
+ 
+ from .deepseek_v3 import DeepseekV3Bridge
++from .deepseek_v4 import DeepseekV4Bridge
+ from .llama import LLaMABridge
+ from .mimo import MimoBridge
+ from .mixtral import MixtralBridge
+diff --git a/mbridge/models/deepseek_v4.py b/mbridge/models/deepseek_v4.py
+new file mode 100644
+index 0000000..8497400
+--- /dev/null
++++ b/mbridge/models/deepseek_v4.py
+@@ -0,0 +1,740 @@
++# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
++
++
++import re
++from typing import Callable, Generator, Optional
++
++import torch
++from megatron.core.models.gpt.gpt_layer_specs import (
++    get_gpt_layer_with_transformer_engine_spec,
++    get_gpt_mtp_block_spec,
++)
++from megatron.core.models.gpt.gpt_model import GPTModel
++from megatron.core.transformer import MLATransformerConfig
++from megatron.core.transformer.enums import AttnBackend
++
++from ..core import LLMBridge, register_model
++
++
++@register_model("deepseek_v4")
++class DeepseekV4Bridge(LLMBridge):
++    """
++    Bridge implementation for DeepSeek V4 models.
++
++    Compared with :class:`DeepseekV3Bridge`, the HF-side checkpoint uses a
++    different naming scheme (``embed.weight`` / ``head.weight`` /
++    ``layers.{n}.attn.*`` / ``layers.{n}.ffn.*``) and the Megatron-side
++    experts may be stored either as sequential per-expert weights
++    (``mlp.experts.local_experts.{i}.linear_fc1/linear_fc2.weight``) or in
++    GEMM (``moe_gemm``) format (``mlp.experts.weight1`` / ``weight2``), where
++    all local experts are fused into a single tensor consumed by fused MoE
++    kernels. Both layouts are supported; the GEMM layout is handled through
++    the GEMM hook contract of the base class.
++    """
++
++    TransformerConfigClass = MLATransformerConfig
++
++    # DeepSeek V4 uses MLA and its HF config carries no
++    # ``num_key_value_heads`` / ``intermediate_size`` / ``attention_dropout``;
++    # adapt the base config mapping accordingly.
++    _CONFIG_MAPPING = {
++        "num_layers": "num_hidden_layers",
++        "hidden_size": "hidden_size",
++        "num_attention_heads": "num_attention_heads",
++        "num_query_groups": "num_attention_heads",
++        "layernorm_epsilon": "rms_norm_eps",
++        "hidden_dropout": ("hidden_dropout", 0.0),
++        "kv_channels": ("head_dim", None),
++    }
++
++    # megatron to hf name
++    _DIRECT_MAPPING = {
++        "embedding.word_embeddings.weight": "embed.weight",
++        "final_layernorm.weight": "norm.weight",
++        "output_layer.weight": "head.weight",
++        "hc_head.hc_base": "hc_head_base",
++        "hc_head.hc_fn.weight": "hc_head_fn",
++        "hc_head.hc_scale": "hc_head_scale",
++    }
++
++    _MLP_MAPPING = {
++        "pre_mlp_layernorm.weight": ["layers.{layer_number}.ffn_norm.weight"],
++        "mlp.router.tid2eid": ["layers.{layer_number}.ffn.gate.tid2eid"],
++        "mlp.router.weight": ["layers.{layer_number}.ffn.gate.weight"],
++        "mlp.router.expert_bias": ["layers.{layer_number}.ffn.gate.bias"],
++        "mlp.shared_experts.linear_fc1.weight": [
++            "layers.{layer_number}.ffn.shared_experts.w1.weight",
++            "layers.{layer_number}.ffn.shared_experts.w3.weight",
++        ],
++        "mlp.shared_experts.linear_fc2.weight": [
++            "layers.{layer_number}.ffn.shared_experts.w2.weight"
++        ],
++        "mlp_mhc.hc_base": ["layers.{layer_number}.hc_ffn_base"],
++        "mlp_mhc.hc_scale": ["layers.{layer_number}.hc_ffn_scale"],
++        "mlp_mhc.hc_fn.weight": ["layers.{layer_number}.hc_ffn_fn"],
++        r"mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight": [
++            "layers.{layer_number}.ffn.experts.{expert_id}.w1.weight",
++            "layers.{layer_number}.ffn.experts.{expert_id}.w3.weight",
++        ],
++        r"mlp\.experts\.local_experts\.(\d+)\.linear_fc2\.weight": [
++            "layers.{layer_number}.ffn.experts.{expert_id}.w2.weight"
++        ],
++        "mlp.experts.weight1": [
++            "layers.{layer_number}.ffn.experts.{expert_id}.w1.weight",
++            "layers.{layer_number}.ffn.experts.{expert_id}.w3.weight",
++        ],
++        "mlp.experts.weight2": [
++            "layers.{layer_number}.ffn.experts.{expert_id}.w2.weight"
++        ],
++    }
++
++    _ATTENTION_MAPPING = {
++        "input_layernorm.weight": ["layers.{layer_number}.attn_norm.weight"],
++        "self_attention.attn_sink": ["layers.{layer_number}.attn.attn_sink"],
++        "self_attention.kv_layernorm.weight": [
++            "layers.{layer_number}.attn.kv_norm.weight"
++        ],
++        "self_attention.q_layernorm.weight": [
++            "layers.{layer_number}.attn.q_norm.weight"
++        ],
++        "self_attention.linear_kv.weight": [
++            "layers.{layer_number}.attn.wkv.weight"
++        ],
++        "self_attention.linear_q.weight": [
++            "layers.{layer_number}.attn.wq_a.weight"
++        ],
++        "self_attention.linear_q_up_proj.weight": [
++            "layers.{layer_number}.attn.wq_b.weight"
++        ],
++        "self_attention.linear_o_down_proj.weight": [
++            "layers.{layer_number}.attn.wo_a.weight"
++        ],
++        "self_attention.linear_o_up_proj.weight": [
++            "layers.{layer_number}.attn.wo_b.weight"
++        ],
++        "attn_mhc.hc_base": ["layers.{layer_number}.hc_attn_base"],
++        "attn_mhc.hc_scale": ["layers.{layer_number}.hc_attn_scale"],
++        "attn_mhc.hc_fn.weight": ["layers.{layer_number}.hc_attn_fn"],
++        "self_attention.compressor.ape": [
++            "layers.{layer_number}.attn.compressor.ape"
++        ],
++        "self_attention.compressor.wkv.weight": [
++            "layers.{layer_number}.attn.compressor.wkv.weight"
++        ],
++        "self_attention.compressor.wgate.weight": [
++            "layers.{layer_number}.attn.compressor.wgate.weight"
++        ],
++        "self_attention.compressor.norm.weight": [
++            "layers.{layer_number}.attn.compressor.norm.weight"
++        ],
++        "self_attention.indexer.wq_b.weight": [
++            "layers.{layer_number}.attn.indexer.wq_b.weight"
++        ],
++        "self_attention.indexer.kv_compressor.ape": [
++            "layers.{layer_number}.attn.indexer.compressor.ape"
++        ],
++        "self_attention.indexer.kv_compressor.wkv.weight": [
++            "layers.{layer_number}.attn.indexer.compressor.wkv.weight"
++        ],
++        "self_attention.indexer.kv_compressor.wgate.weight": [
++            "layers.{layer_number}.attn.indexer.compressor.wgate.weight"
++        ],
++        "self_attention.indexer.kv_compressor.norm.weight": [
++            "layers.{layer_number}.attn.indexer.compressor.norm.weight"
++        ],
++        "self_attention.indexer.weights_proj.weight": [
++            "layers.{layer_number}.attn.indexer.weights_proj.weight"
++        ],
++    }
++
++    _SHARED_STATE_DICT_MAPPING = {
++        "embedding.word_embeddings.weight": [
++            "model.embed_tokens.weight",
++            "model.layers.61.embed_tokens.weight",
++        ],
++        "output_layer.weight": [
++            "lm_head.weight",
++            "model.layers.61.shared_head.head.weight",
++        ],
++    }
++
++    # Vocab-parallel parameters on the HF side.
++    _VOCAB_PARALLEL_HF_NAMES = ("head.weight", "embed.weight")
++
++    # HF-side FP32 parameters: attention sink, compressor positional
++    # embeddings, hyper-connection parameters and router expert bias must
++    # keep FP32 across the HF -> MCore -> HF round-trip.
++    _FP32_HF_PARAM_KEYS = (
++        "expert_bias",
++        "sink",
++        "ape",
++        "hc_base",
++        "hc_fn",
++        "hc_scale",
++    )
++
++    # ``attn_sink`` is tensor-model-parallel but not marked as such by the
++    # model implementation; force the TP gather path on export.
++    _FORCE_TP_PARALLEL_KEYS = ("self_attention.attn_sink",)
++
++    # ------------------------------------------------------------------
++    # Model-variant naming hooks (see Bridge)
++    # ------------------------------------------------------------------
++    def _is_local_expert_weight_name(self, name: str) -> bool:
++        return ".mlp.experts.local_experts" in name
++
++    def _parse_local_expert_weight_name(self, name: str) -> tuple[str, int, str]:
++        left, right = name.split(".local_experts.")
++        local_expert_id, suffix = right.split(".", 1)
++        return f"{left}.local_experts", int(local_expert_id), suffix
++
++    def _format_global_expert_weight_name(
++        self, prefix: str, global_expert_id: int, suffix: str = ""
++    ) -> str:
++        return f"{prefix}.{global_expert_id}.{suffix}"
++
++    # ------------------------------------------------------------------
++    # GEMM (moe_gemm) hook contract implementation
++    # ------------------------------------------------------------------
++    def _is_expert_gemm_name(self, name: str) -> bool:
++        """GEMM-format (moe_gemm) expert weights: ``weight1`` / ``weight2``."""
++        return ".weight1" in name or ".weight2" in name
++
++    def _get_hf_experts_key(self) -> str:
++        return ".ffn.experts."
++
++    @property
++    def _num_local_experts(self) -> int:
++        """Number of experts owned by each EP rank."""
++        return self.config.num_moe_experts // self.mpu.ep_size
++
++    def _build_config(self):
++        hf_config = self.hf_config
++        mla_rope_config = {
++            "beta_fast": 32,
++            "beta_slow": 1,
++            "factor": 1,
++            "mscale": 1.0,
++            "mscale_all_dim": 1.0,
++            "original_max_position_embeddings": 4096,
++            "type": "rope",
++        }
++        if "rope_scaling" in hf_config and hf_config.rope_scaling is not None:
++            mla_rope_config.update(hf_config.rope_scaling)
++        moe_layer_freq = [1] * hf_config.num_hidden_layers
++        mtp_args = {}
++        if "num_nextn_predict_layers" in hf_config:
++            mtp_args["mtp_num_layers"] = hf_config.num_nextn_predict_layers
++            mtp_args["mtp_loss_scaling_factor"] = 0.1
++
++        return self._build_base_config(
++            attention_backend=AttnBackend.fused,
++            layernorm_epsilon=hf_config.rms_norm_eps,
++            qk_layernorm=True,
++            # moe specific
++            moe_ffn_hidden_size=hf_config.moe_intermediate_size,
++            moe_token_dispatcher_type="alltoall",
++            moe_router_bias_update_rate=0.001,
++            moe_router_enable_expert_bias=True,
++            num_moe_experts=hf_config.n_routed_experts,
++            moe_shared_expert_intermediate_size=hf_config.moe_intermediate_size
++            * hf_config.n_shared_experts,
++            moe_aux_loss_coeff=getattr(hf_config, "aux_loss_alpha", 0.001),
++            moe_router_load_balancing_type="none",  # default None for RL
++            moe_shared_expert_overlap=True,
++            moe_grouped_gemm=True,
++            moe_router_score_function=hf_config.scoring_func,
++            moe_router_pre_softmax=True,
++            moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
++            moe_layer_freq=moe_layer_freq,
++            # MLA
++            q_lora_rank=hf_config.q_lora_rank,
++            rotary_base=hf_config.rope_theta,
++            rotary_scaling_factor=mla_rope_config["factor"],
++            rope_type=mla_rope_config["type"],
++            mscale=mla_rope_config["mscale"],
++            mscale_all_dim=mla_rope_config["mscale_all_dim"],
++            max_position_embeddings=mla_rope_config["original_max_position_embeddings"],
++            beta_fast=mla_rope_config["beta_fast"],
++            beta_slow=mla_rope_config["beta_slow"],
++            # mcore 0.12 moe
++            moe_router_dtype="fp32",
++            disable_bf16_reduced_precision_matmul=True,
++            # other
++            persist_layer_norm=True,
++            bias_activation_fusion=True,
++            bias_dropout_fusion=True,
++            **mtp_args,
++        )
++
++    def _get_gptmodel_args(self) -> dict:
++        """
++        Gets the arguments for GPTModel initialization.
++
++        Constructs a dictionary of arguments required to initialize a GPTModel
++        based on the configuration.
++
++        Returns:
++            dict: A dictionary of arguments for GPTModel initialization
++        """
++        ret = dict(
++            vocab_size=self.hf_config.vocab_size,
++            max_sequence_length=self.hf_config.max_position_embeddings,
++            position_embedding_type="rope",
++            rotary_base=self.hf_config.rope_theta,
++        )
++
++        return ret
++
++    def _model_provider(
++        self, post_model_creation_callbacks: list[Callable[[torch.nn.Module], None]]
++    ):
++        """
++        Creates and returns a model provider function.
++
++        The returned function creates a GPTModel with the specified configuration
++        when called with pre_process and post_process parameters.
++
++        Args:
++            post_model_creation_callbacks: List of callbacks to be called after model creation
++
++        Returns:
++            function: A provider function that creates and returns a GPTModel instance
++        """
++
++        share_embeddings_and_output_weights = getattr(
++            self.hf_config, "tie_word_embeddings", False
++        )
++
++        def provider(pre_process, post_process, vp_stage: Optional[int] = None):
++            transformer_layer_spec = self._get_transformer_layer_spec(vp_stage)
++            gptmodel_args = self._get_gptmodel_args()
++            if vp_stage is not None and self.has_vp_stage:
++                gptmodel_args["vp_stage"] = vp_stage
++
++            if (
++                self.config.mtp_num_layers is not None
++                and self.config.mtp_num_layers > 0
++            ):
++                if (
++                    hasattr(transformer_layer_spec, "layer_specs")
++                    and len(transformer_layer_spec.layer_specs) == 0
++                ):
++                    # Get the decoder layer spec explicitly if no decoder layer in the last stage,
++                    # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
++                    transformer_layer_spec_for_mtp = (
++                        get_gpt_layer_with_transformer_engine_spec(
++                            num_experts=self.config.num_moe_experts,
++                            moe_grouped_gemm=self.config.moe_grouped_gemm,
++                            qk_layernorm=self.config.qk_layernorm,
++                            multi_latent_attention=True,
++                        )
++                    )
++                else:
++                    transformer_layer_spec_for_mtp = transformer_layer_spec
++                mtp_block_spec = get_gpt_mtp_block_spec(
++                    self.config,
++                    transformer_layer_spec_for_mtp,
++                    use_transformer_engine=True,
++                    vp_stage=vp_stage,
++                )
++                gptmodel_args["mtp_block_spec"] = mtp_block_spec
++            model = GPTModel(
++                config=self.config,
++                transformer_layer_spec=transformer_layer_spec,
++                pre_process=pre_process,
++                post_process=post_process,
++                share_embeddings_and_output_weights=share_embeddings_and_output_weights,
++                **gptmodel_args,
++            )
++            for callback in post_model_creation_callbacks:
++                callback(
++                    model,
++                    pre_process=pre_process,
++                    post_process=post_process,
++                    config=self.config,
++                    hf_config=self.hf_config,
++                )
++
++            return model
++
++        return provider
++
++    def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
++        """
++        Map MCore weight names to Hugging Face weight names.
++
++        Args:
++            mcore_weights_name: MCore weight name
++
++        Returns:
++            list: Corresponding Hugging Face weight names
++        """
++        assert (
++            "_extra_state" not in mcore_weights_name
++        ), "extra_state should not be loaded"
++        if mcore_weights_name in self._DIRECT_MAPPING:
++            return [self._DIRECT_MAPPING[mcore_weights_name]]
++
++        if "mtp" in mcore_weights_name:
++            return self._convert_mtp_param(mcore_weights_name)
++        elif (
++            "self_attention" in mcore_weights_name
++            or "input_layernorm.weight" in mcore_weights_name
++            or "attn_mhc" in mcore_weights_name
++        ):
++            return self._weight_name_mapping_attention(mcore_weights_name)
++        elif "mlp" in mcore_weights_name:
++            return self._weight_name_mapping_mlp(mcore_weights_name)
++        else:
++            raise NotImplementedError(
++                f"Unsupported parameter name: {mcore_weights_name}"
++            )
++
++    def _weight_to_hf_format(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> tuple[list[str], list[torch.Tensor]]:
++
++        # note: only support one mtp layer for now
++        if (
++            self.config.mtp_num_layers == 1
++            and self.config.num_layers == 61
++            and mcore_weights_name in self._SHARED_STATE_DICT_MAPPING
++        ):
++            hf_names = self._SHARED_STATE_DICT_MAPPING[mcore_weights_name]
++            return hf_names, [mcore_weights] * len(hf_names)
++        if self._is_expert_gemm_name(mcore_weights_name):
++            return self._weight_to_hf_format_gemm(mcore_weights_name, mcore_weights)
++        return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
++
++    # ------------------------------------------------------------------
++    # GEMM (moe_gemm) expert weight transforms. Only reached for
++    # weight1/weight2 names; everything else delegates to the base class.
++    # ------------------------------------------------------------------
++    def _weight_to_hf_format_gemm(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> tuple[list[str], list[torch.Tensor]]:
++        # _weight_name_mapping_mcore_to_hf -> _weight_name_mapping_mlp's gemm
++        # branch yields the *local* expert HF names for the current EP rank.
++        hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
++        num_local_experts = self._num_local_experts
++        assert len(hf_names) == (
++            num_local_experts * 2 if ".weight1" in mcore_weights_name else num_local_experts
++        )
++        # The GEMM tensor must split evenly into one piece per HF name and
++        # every gate/up pair must have identical shapes, otherwise a silent
++        # mis-ordering of the w1/w3 interleave would go unnoticed.
++        chunks_out = mcore_weights.chunk(len(hf_names))
++        if ".weight1" in mcore_weights_name:
++            assert mcore_weights.shape[0] % len(hf_names) == 0, (
++                f"weight1 {mcore_weights_name} cannot split rows {mcore_weights.shape[0]} "
++                f"into {len(hf_names)} hf pieces"
++            )
++            for i in range(0, len(chunks_out), 2):
++                assert chunks_out[i].shape == chunks_out[i + 1].shape, (
++                    f"weight1 {mcore_weights_name} gate/up mismatched at piece {i}: "
++                    f"{chunks_out[i].shape} vs {chunks_out[i + 1].shape}"
++                )
++        return hf_names, chunks_out
++
++    def _iter_gemm_export_experts(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        num_experts_in_tensor: Optional[int] = None,
++        expert_offset: int = 0,
++    ) -> Generator[tuple[list[str], list[torch.Tensor]], None, None]:
++        """Stream the merged GEMM expert weight one expert at a time.
++
++        Each yield is a single expert's ``(hf_names, tensors)``: ``weight1``
++        yields ``[w1, w3]`` names and the ``[gate, up]`` tensors, ``weight2``
++        yields ``[w2]`` and ``[down]``. Slicing per expert keeps the peak
++        memory to a single expert instead of materializing every expert.
++
++        Sliced mode: when ``num_experts_in_tensor`` is given, the tensor is
++        chunked into that many experts (instead of all local experts of this
++        EP rank) and names are taken starting at ``expert_offset``; used by
++        ``_export_gemm_weights`` for its per-expert-block all_gather.
++        """
++        # _weight_name_mapping_mcore_to_hf -> _weight_name_mapping_mlp's gemm
++        # branch yields the *local* expert HF names for the current EP rank.
++        hf_names_all = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
++        num_local_experts = self._num_local_experts
++        num_in = (
++            num_local_experts
++            if num_experts_in_tensor is None
++            else num_experts_in_tensor
++        )
++        assert len(hf_names_all) == (
++            num_local_experts * 2
++            if ".weight1" in mcore_weights_name
++            else num_local_experts
++        ), (
++            f"{mcore_weights_name}: expected "
++            f"{num_local_experts * 2 if '.weight1' in mcore_weights_name else num_local_experts} "
++            f"hf names, got {len(hf_names_all)}"
++        )
++
++        if ".weight1" in mcore_weights_name:
++            assert mcore_weights.shape[0] % num_in == 0, (
++                f"weight1 {mcore_weights_name} cannot split rows "
++                f"{mcore_weights.shape[0]} into {num_in} experts"
++            )
++            intermediate = mcore_weights.shape[0] // num_in
++            for i in range(num_in):
++                block = mcore_weights[
++                    i * intermediate : (i + 1) * intermediate, :
++                ]
++                gate, up = block.chunk(2, dim=0)
++                assert gate.shape == up.shape, (
++                    f"weight1 {mcore_weights_name} gate/up mismatched at "
++                    f"expert {i}: {gate.shape} vs {up.shape}"
++                )
++                name_idx = 2 * (expert_offset + i)
++                yield hf_names_all[name_idx : name_idx + 2], [gate, up]
++        else:
++            assert mcore_weights.shape[0] % num_in == 0, (
++                f"weight2 {mcore_weights_name} cannot split rows "
++                f"{mcore_weights.shape[0]} into {num_in} experts"
++            )
++            hidden = mcore_weights.shape[0] // num_in
++            for i in range(num_in):
++                name_idx = expert_offset + i
++                yield hf_names_all[name_idx : name_idx + 1], [
++                    mcore_weights[i * hidden : (i + 1) * hidden, :]
++                ]
++
++    def _weight_to_mcore_format_gemm(
++        self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
++    ) -> torch.Tensor:
++        num_local_experts = self._num_local_experts
++
++        if ".weight1" in mcore_weights_name:
++            assert len(hf_weights) == num_local_experts * 2
++            experts_fc1_list = []
++            for i in range(0, len(hf_weights), 2):
++                w1 = hf_weights[i]
++                w3 = hf_weights[i + 1]
++                # Per-expert block layout is [gate; up] (plain concatenation).
++                # ETP shards whole experts (see _weight_split_across_tp_gemm /
++                # _weight_merge_across_tp_gemm), so the gate/up rows must NOT
++                # be interleaved by ETP part here -- the export side recovers
++                # gate/up by halving each expert block.
++                fc1_w = torch.cat([w1, w3], dim=0).contiguous()
++                experts_fc1_list.append(fc1_w.t().contiguous())
++            hidden = experts_fc1_list[0].shape[0]
++            mcore = torch.cat(experts_fc1_list).contiguous().reshape(hidden, -1)
++            return mcore
++
++        if ".weight2" in mcore_weights_name:
++            assert len(hf_weights) == num_local_experts
++            experts_fc2_list = []
++            for i in range(len(hf_weights)):
++                w2 = hf_weights[i]
++                experts_fc2_list.append(w2.t().contiguous())
++            hidden = experts_fc2_list[0].shape[-1]
++            mcore = torch.cat(experts_fc2_list).contiguous().reshape(-1, hidden)
++            return mcore
++
++        raise NotImplementedError(f"Unsupported parameter name: {mcore_weights_name}")
++
++    def _weight_merge_across_tp(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: list[torch.Tensor],
++        param: torch.Tensor,
++    ) -> torch.Tensor:
++        if self._is_expert_gemm_name(mcore_weights_name):
++            return self._weight_merge_across_tp_gemm(
++                mcore_weights_name, mcore_weights, param
++            )
++        return super()._weight_merge_across_tp(mcore_weights_name, mcore_weights, param)
++
++    def _weight_merge_across_tp_gemm(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: list[torch.Tensor],
++        param: torch.Tensor,
++    ) -> torch.Tensor:
++        num_local_experts = self._num_local_experts
++        bucket_expert_num = num_local_experts // self.mpu.etp_size
++        assert len(mcore_weights) == self.mpu.etp_size
++
++        first_mw = mcore_weights[0]
++        if ".weight1" in mcore_weights_name:
++            hidden_size = first_mw.shape[0]
++            intermediate = first_mw.shape[1] // bucket_expert_num
++            ret = torch.empty(
++                num_local_experts * intermediate,
++                hidden_size,
++                dtype=first_mw.dtype,
++                device=first_mw.device,
++            )
++            expert_offset = 0
++            for mw in mcore_weights:
++                mw_3d = mw.reshape(bucket_expert_num, hidden_size, intermediate)
++                for j in range(bucket_expert_num):
++                    expert_idx = expert_offset + j
++                    expert_weight_t = mw_3d[j].t().contiguous()
++                    gate, up = torch.chunk(expert_weight_t, 2, dim=0)
++                    start_row = expert_idx * intermediate
++                    ret[start_row : start_row + intermediate // 2, :] = gate
++                    ret[start_row + intermediate // 2 : start_row + intermediate, :] = up
++                expert_offset += bucket_expert_num
++            return ret
++
++        intermediate = first_mw.shape[0] // bucket_expert_num
++        hidden_size = first_mw.shape[1]
++        ret = torch.empty(
++            num_local_experts * hidden_size,
++            intermediate,
++            dtype=first_mw.dtype,
++            device=first_mw.device,
++        )
++        expert_offset = 0
++        for mw in mcore_weights:
++            mw_3d = mw.reshape(bucket_expert_num, intermediate, hidden_size)
++            for j in range(bucket_expert_num):
++                expert_idx = expert_offset + j
++                w2 = mw_3d[j].t().contiguous()
++                start_row = expert_idx * hidden_size
++                ret[start_row : start_row + hidden_size, :] = w2
++            expert_offset += bucket_expert_num
++        return ret
++
++    def _weight_split_across_tp(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        param: torch.Tensor,
++        tp_split_size: int,
++    ) -> list[torch.Tensor]:
++        if self._is_expert_gemm_name(mcore_weights_name):
++            return self._weight_split_across_tp_gemm(
++                mcore_weights_name, mcore_weights, param, tp_split_size
++            )
++        return super()._weight_split_across_tp(
++            mcore_weights_name, mcore_weights, param, tp_split_size
++        )
++
++    def _weight_split_across_tp_gemm(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        param: torch.Tensor,
++        tp_split_size: int,
++    ) -> list[torch.Tensor]:
++        if tp_split_size == 1:
++            return [mcore_weights]
++        num_local_experts = self._num_local_experts
++        if ".weight1" in mcore_weights_name:
++            hidden = mcore_weights.shape[0]
++            fc1_3d = mcore_weights.reshape(num_local_experts, hidden, -1)
++            fc1_chunks = torch.chunk(fc1_3d, tp_split_size, dim=0)
++            return [ck.reshape(hidden, -1).contiguous() for ck in fc1_chunks]
++
++        hidden = mcore_weights.shape[-1]
++        fc2_3d = mcore_weights.reshape(num_local_experts, -1, hidden)
++        fc2_chunks = torch.chunk(fc2_3d, tp_split_size, dim=0)
++        return [ck.reshape(-1, hidden).contiguous() for ck in fc2_chunks]
++
++    def _iter_gemm_etp_slices(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> Generator[torch.Tensor, None, None]:
++        """Yield the GEMM weight split one ETP-chunk at a time (streaming).
++
++        Mirrors :meth:`_weight_split_across_tp_gemm` layout but yields instead
++        of materializing the full list, so the importing ETP rank 0 never holds
++        all ``etp_size`` pieces simultaneously.
++        """
++        split_size = self.mpu.etp_size
++        if split_size == 1:
++            yield mcore_weights
++            return
++        num_local_experts = self._num_local_experts
++
++        if ".weight1" in mcore_weights_name:
++            hidden = mcore_weights.shape[0]
++            fc1_3d = mcore_weights.reshape(num_local_experts, hidden, -1)
++            for ck in torch.chunk(fc1_3d, split_size, dim=0):
++                yield ck.reshape(hidden, -1)
++        else:
++            hidden = mcore_weights.shape[-1]
++            fc2_3d = mcore_weights.reshape(num_local_experts, -1, hidden)
++            for ck in torch.chunk(fc2_3d, split_size, dim=0):
++                yield ck.reshape(-1, hidden)
++
++    def _get_safetensor_io(self, weights_path: str):
++        if self.dtype == torch.bfloat16:
++            from .ext.deepseek_v3.dequant_fp8_safetensor_io import (
++                DequantFP8SafeTensorIO,
++            )
++
++            return DequantFP8SafeTensorIO(self._get_actual_hf_path(weights_path))
++        else:
++            raise NotImplemented("only support bfloat16 for now")
++
++    def _weight_name_mapping_mlp(self, name: str) -> list[str]:
++        layer_number = name.split(".")[2]
++        convert_names = []
++        for pattern, mapping_names in self._MLP_MAPPING.items():
++            match = re.search(pattern, name)
++            if match:
++                groups = match.groups()
++
++                # GEMM expert weights expand to all local experts of this
++                # EP rank.
++                if ".weight1" in pattern or ".weight2" in pattern:
++                    per_ep_rank_num_experts = self._num_local_experts
++                    for i in range(per_ep_rank_num_experts):
++                        expert_id = per_ep_rank_num_experts * self.mpu.ep_rank + i
++                        for template in mapping_names:
++                            convert_names.append(
++                                template.format(
++                                    layer_number=layer_number, expert_id=expert_id
++                                )
++                            )
++                    break
++
++                for template in mapping_names:
++                    if "{expert_id}" in template:
++                        if not groups:
++                            raise ValueError(
++                                f"Pattern {pattern} matched but no capture group for expert_id"
++                            )
++                        expert_id = groups[0]
++                        convert_names.append(
++                            template.format(
++                                layer_number=layer_number, expert_id=expert_id
++                            )
++                        )
++                    else:
++                        convert_names.append(
++                            template.format(layer_number=layer_number)
++                        )
++                break
++        if not convert_names:
++            raise NotImplementedError(f"Unsupported parameter name: {name}")
++        return convert_names
++
++    def _convert_mtp_param(self, name: str) -> tuple[list[str]]:
++        assert self.config.mtp_num_layers == 1, "only support one mtp layer for now"
++        assert self.config.num_layers == 61, "only support 61 layers for now"
++        direct_name_mapping = {
++            "mtp.layers.0.enorm.weight": "model.layers.61.enorm.weight",
++            "mtp.layers.0.hnorm.weight": "model.layers.61.hnorm.weight",
++            "mtp.layers.0.eh_proj.weight": "model.layers.61.eh_proj.weight",
++            "mtp.layers.0.final_layernorm.weight": "model.layers.61.shared_head.norm.weight",
++        }
++        if name in direct_name_mapping:
++            return [direct_name_mapping[name]]
++        assert "mtp.layers.0.transformer_layer" in name, "mtp not found"
++        # use proxy name to convert
++        proxy_name = name.replace("mtp.layers.0.transformer_layer", "decoder.layers.61")
++        if "self_attention" in proxy_name or "input_layernorm.weight" in proxy_name:
++            convert_names = self._weight_name_mapping_attention(proxy_name)
++        elif "mlp" in proxy_name:
++            convert_names = self._weight_name_mapping_mlp(proxy_name)
++        else:
++            raise NotImplementedError(f"Unsupported parameter name: {name}")
++        return convert_names
+diff --git a/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py b/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
+index 5012942..12f62eb 100644
+--- a/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
++++ b/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
+@@ -31,7 +31,7 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
+             file_to_weight_map[filename].append(name)
+         for filename, weight_names in file_to_weight_map.items():
+             safetensor_file = os.path.join(hf_dir, filename)
+-            with safe_open(safetensor_file, framework="pt", device="cuda") as f:
++            with safe_open(safetensor_file, framework="pt") as f:
+                 for name in weight_names:
+                     weight = f.get_tensor(name)
+                     scale_inv_name = f"{name}_scale_inv"
+@@ -47,8 +47,7 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
+                                     os.path.join(
+                                         hf_dir, weight_to_file_map[scale_inv_name]
+                                     ),
+-                                    framework="pt",
+-                                    device="cuda",
++                                    framework="pt"
+                                 ) as f2:
+                                     scale_inv = f2.get_tensor(scale_inv_name)
+                             ret[name] = weight_dequant(weight, scale_inv)
+diff --git a/pyproject.toml b/pyproject.toml
+index d1ec6d7..ff89e28 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -13,6 +13,9 @@ readme = "README.md"
+ requires-python = ">=3.8"
+ license = "Apache-2.0"
+ license-files = ["LICENSE"]
++dependencies = [
++    "tomli; python_version < '3.11'",
++]
+ 
+ 
+ [project.urls]

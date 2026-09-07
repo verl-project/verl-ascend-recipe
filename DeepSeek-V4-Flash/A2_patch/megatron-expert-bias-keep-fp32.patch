@@ -1,0 +1,35 @@
+diff --git a/megatron/core/transformer/module.py b/megatron/core/transformer/module.py
+--- a/megatron/core/transformer/module.py
++++ b/megatron/core/transformer/module.py
+@@ -152,6 +152,20 @@
+         self.fp16 = config.fp16
+         self.bf16 = config.bf16
+ 
++        # DSV4 / single_fwd_dump 0.1 B3:
++        # Float16Module.bfloat16() also recasts the expert_bias buffer.
++        # _maintain_float32_expert_bias then .to(fp32) and cannot restore
++        # mantissa. Keep the buffer in fp32 across the wrap so mbridge
++        # load writes HF gate.bias into a true fp32 tensor.
++        _expert_bias_stash = []
++        for _m in module.modules():
++            _b = getattr(_m, "expert_bias", None)
++            if _b is not None and torch.is_tensor(_b):
++                _persistent = "expert_bias" not in getattr(
++                    _m, "_non_persistent_buffers_set", set()
++                )
++                _expert_bias_stash.append((_m, _b.detach().clone(), _persistent))
++
+         if self.fp16:
+             self.add_module('module', module.half())
+ 
+@@ -167,6 +181,10 @@
+         else:
+             raise Exception('Either config.fp16 or config.bf16 should be True.')
+ 
++        for _m, _t, _persistent in _expert_bias_stash:
++            _m.register_buffer(
++                "expert_bias", _t.to(dtype=torch.float32), persistent=_persistent
++            )
+         self.float16_convertor = float16_convertor
+ 
+     def set_input_tensor(self, input_tensor):
