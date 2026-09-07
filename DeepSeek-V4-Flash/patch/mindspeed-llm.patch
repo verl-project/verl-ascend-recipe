@@ -1,0 +1,95 @@
+diff --git a/mindspeed_llm/core/transformer/moe/moe_utils.py b/mindspeed_llm/core/transformer/moe/moe_utils.py
+index d20e40a0..90816b98 100644
+--- a/mindspeed_llm/core/transformer/moe/moe_utils.py
++++ b/mindspeed_llm/core/transformer/moe/moe_utils.py
+@@ -18,6 +18,7 @@ from functools import wraps
+ from typing import Optional
+ 
+ import torch
++from enum import Enum
+ import torch.nn.functional as F
+ from megatron.core import parallel_state
+ from megatron.core.transformer.moe.moe_utils import get_capacity
+@@ -108,6 +109,7 @@ def topk_softmax_with_capacity_and_hash(
+     token_hash: bool = False,
+     tid2eid: Optional[torch.Tensor] = None,
+     input_ids: Optional[torch.Tensor] = None,
++    router_replay = None,
+ ):
+     """
+     patch hash operator in megatron topk_softmax_with_capacity
+@@ -115,7 +117,7 @@ def topk_softmax_with_capacity_and_hash(
+     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
+     num_tokens, num_experts = logits.shape
+ 
+-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++    def _compute_topk(scores, topk, num_groups=None, group_topk=None):
+         if group_topk:
+             return group_limited_topk(
+                 scores=scores,
+@@ -128,6 +130,41 @@ def topk_softmax_with_capacity_and_hash(
+         else:
+             return torch.topk(scores, k=topk, dim=1)
+ 
++    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++        from verl.utils.megatron.router_replay_patch import RouterReplayAction
++        # Default behavior if no replay is active
++        routing_action = router_replay.router_replay_action if router_replay is not None else None
++
++        if routing_action is None:
++            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++
++        if routing_action == RouterReplayAction.RECORD:
++            probs, top_indices = _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++            if router_replay is not None:
++                router_replay.record_indices(top_indices)
++            return probs, top_indices
++        elif routing_action == RouterReplayAction.REPLAY_FORWARD:
++            if router_replay is None or router_replay.target_topk_idx is None:
++                # Fallback if replay data is not available
++                return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++            # Use the provided indices for replay
++            top_indices = router_replay.target_topk_idx
++            top_indices = top_indices.to(scores.device)
++            probs = scores.gather(1, top_indices)
++            return probs, top_indices
++        elif routing_action == RouterReplayAction.REPLAY_BACKWARD:
++            if router_replay is None or not router_replay.replay_backward_list:
++                # Fallback if replay data is not available
++                return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++            # Use the last recorded indices for backward replay
++            top_indices = router_replay.replay_backward_list.pop(0)
++            # Ensure indices are on the correct device
++            top_indices = top_indices.to(scores.device)
++            probs = scores.gather(1, top_indices)
++            return probs, top_indices
++        else:  # Unknown action, fallback
++            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++
+     if score_function == "softmax":
+         if use_pre_softmax:
+             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+diff --git a/mindspeed_llm/core/transformer/moe/router.py b/mindspeed_llm/core/transformer/moe/router.py
+index 5555ca2b..e0948d3c 100644
+--- a/mindspeed_llm/core/transformer/moe/router.py
++++ b/mindspeed_llm/core/transformer/moe/router.py
+@@ -599,6 +599,7 @@ def topk_router_routing(self, logits: torch.Tensor, input_ids: torch.Tensor = No
+                 token_hash=self.hash if hasattr(self, "hash") else None,
+                 tid2eid=self.tid2eid if hasattr(self, "tid2eid") else None,
+                 input_ids=input_ids,
++                router_replay=getattr(self, "router_replay", None)
+             )
+         else:
+             # A naive top-k routing without load balancing
+diff --git a/pretrain_deepseek4.py b/pretrain_deepseek4.py
+index 8e7ca23a..64d88cb4 100644
+--- a/pretrain_deepseek4.py
++++ b/pretrain_deepseek4.py
+@@ -54,6 +54,7 @@ def model_provider(
+         Union[DeepSeek4Model, megatron.legacy.model.DeepSeek4Model]: The returned model
+     """
+     args = get_args()
++    args.enable_routing_replay = model_provider.enable_routing_replay
+     use_te = args.transformer_impl == "transformer_engine"
+ 
+     print_rank_0('building GPT model ...')
