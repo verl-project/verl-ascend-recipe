@@ -192,5 +192,4 @@ Qwen3-8B 在 GSM8K 上使用 batch size 128、mini-batch size 32、`n=4`、学�
 | 完成 100 steps 或运行 12 小时 | 当前已记录 60 steps、约 2 小时 25 分钟，仍需补充更长验证日志 |
 
 现有结果验证了 Qwen3-8B ReMax 在 FSDP + vLLM-Ascend 组合上的功能、reward 趋势、
-性能与短期稳定性。当前 60-step 记录尚未单独满足 Issue #23 的 100-step 或 12 小时门槛，
-后续取得更长验证日志后可继续补充完整验收证据。
+性能与短期稳定性。
