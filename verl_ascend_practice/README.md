@@ -120,6 +120,123 @@ which demonstrates continuous optimization of the model’s reasoning policy.
 
 <img src="figures/qwen3_8b_gsm8k_rl_reward_curve.png" style="width: 50%;" alt="Reward Curve">
 
+### 4.3 ReMax (Qwen3-8B + GSM8K/MATH)
+
+This recipe runs Qwen3-8B ReMax training with an FSDP actor/reference model and a
+vLLM-Ascend rollout backend. It was validated on an Atlas 800T A2 node with 8 x
+Ascend 910B3 64 GB NPUs.
+
+Corresponding task:
+[verl-ascend-recipe #23](https://github.com/verl-project/verl-ascend-recipe/issues/23)
+
+#### 4.3.1 Adaptation
+
+ReMax generates sampled responses together with one greedy baseline for each prompt,
+then uses their reward difference as the policy-gradient advantage. The combined
+rollout path is already backend-independent in VeRL, so vLLM-Ascend can be used
+without modifying the trainer or rollout implementation.
+
+```text
+GSM8K / MATH prompts
+          |
+          v
+vLLM-Ascend sampled rollout + greedy baseline
+          |
+          v
+sampled reward - baseline reward
+          |
+          v
+ReMax advantage + KL-in-reward
+          |
+          v
+FSDP actor update and rollout weight synchronization
+```
+
+The launch script applies the following Ascend-specific settings:
+
+- `trainer.device=npu` with the vLLM-Ascend rollout backend.
+- Torch compile is disabled for the actor and reference model.
+- Actor parameter/optimizer offload and reference parameter offload are enabled to
+  leave HBM for the colocated rollout engine.
+- Rollout memory utilization defaults to 0.6 because ReMax generates sampled
+  responses plus a greedy baseline.
+- Full-decode-only ACL Graph capture, HCCL timeouts, task queue, and CPU affinity
+  settings are enabled.
+
+#### 4.3.2 Validated Environment and Configuration
+
+| Component | Version or configuration |
+| --- | --- |
+| Hardware | Atlas 800T A2, 8 x Ascend 910B3 64 GB |
+| CANN | 25.5.1 |
+| torch-npu | 2.9.0.post2 |
+| vLLM | 0.18 |
+| vLLM-Ascend | 0.18.1.dev41 |
+| transformers | 5.3.0.dev0 |
+| Model | Qwen3-8B |
+| Algorithm | ReMax with KL-in-reward, `kl_coef=0.001` |
+| Training backend | FSDP |
+| Rollout backend | vLLM-Ascend, TP=2, n=4 |
+| Training batch / mini batch | 128 / 32 |
+| Prompt / response length | 1024 / 1024 |
+| Actor learning rate | `1e-6` |
+
+#### 4.3.3 Data Preprocessing
+
+Prepare the default GSM8K and MATH datasets from the VeRL repository root:
+
+```bash
+python3 examples/data_preprocess/gsm8k.py \
+--local_save_dir "${HOME}/data/gsm8k"
+
+python3 examples/data_preprocess/math_dataset.py \
+--local_save_dir "${HOME}/data/math"
+```
+
+The default dataset directories can be overridden with `GSM8K_DATA_DIR` and
+`MATH_DATA_DIR`.
+
+#### 4.3.4 Launch ReMax Training
+
+Run the recipe from the VeRL repository root:
+
+```bash
+TRAIN_BATCH_SIZE=128 \
+PPO_MINI_BATCH_SIZE=32 \
+ROLLOUT_N=4 \
+ROLLOUT_TP=2 \
+ROLLOUT_GPU_MEM_UTIL=0.6 \
+MAX_RESPONSE_LENGTH=1024 \
+MODEL_PATH=/data/models/Qwen3-8B \
+bash /path/to/verl-ascend-recipe/verl_ascend_practice/run_qwen3_8b_remax_fsdp_npu.sh \
+    'trainer.logger=["console"]'
+```
+
+Model, data, cluster size, batch size, sequence length, rollout parallelism, memory
+utilization, save frequency, and test frequency can be overridden with environment
+variables. Additional arguments are forwarded to `verl.trainer.main_ppo` as Hydra
+overrides.
+
+#### 4.3.5 Validation and Performance
+
+| Test | Result |
+| --- | --- |
+| Smoke test | Qwen3-0.6B completed 2 steps on 8 NPUs; ReMax advantage and `temperature=0` greedy baseline requests were observed |
+| Stability test | Qwen3-8B completed 5 consecutive steps with batch size 128 and response length 1024, without OOM or HCCL timeout |
+| Training run | Qwen3-8B completed 60 steps on GSM8K in approximately 2 hours 25 minutes |
+| Reward trend | `critic/score/mean` increased from approximately 0.26 to the 0.60-0.76 range, peaking at 0.764 |
+| Throughput | Average cluster throughput was approximately 381 tokens/s, with a 337-425 tokens/s range |
+| Stress test | Response length 2048 completed 3 steps without OOM at 343-411 tokens/s |
+
+The measured throughput is above the 100 tokens/s target, and the reward shows a
+clear upward trend.
+
+#### 4.3.6 Reward Curve
+
+The following figure shows `critic/rewards/mean` during the training run:
+
+<img src="https://github.com/user-attachments/assets/45428637-fe4b-45ba-a63a-96cac151e719" style="width: 70%;" alt="Qwen3-8B ReMax Reward Curve">
+
 
 ## 5. Extension and Compatibility
 
