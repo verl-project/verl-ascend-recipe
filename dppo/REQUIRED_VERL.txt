@@ -1,0 +1,7 @@
+# DPPO - tracks the current verl main branch.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=rolling
+BRANCH=main
+VERL_COMMIT=bd6f5645023a774e75b3ea1ed63f652feb922ace
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bd6f5645023a774e75b3ea1ed63f652feb922ace
+RECIPE_FOLDER=dppo

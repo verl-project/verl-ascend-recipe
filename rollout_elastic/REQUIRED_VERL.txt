@@ -1,0 +1,15 @@
+# rollout_elastic — rolling; exact commits refreshed from this workspace
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=rolling
+BRANCH=main
+# Exact upstream verl commit this file was refreshed against (core library).
+VERL_COMMIT=dfc01f85
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@dfc01f85
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout dfc01f85 && git submodule update --init --recursive recipe
+# Recipe submodule snapshot at the same verl checkout (see `git ls-tree HEAD recipe` in verl).
+RECIPE_SUBMODULE_COMMIT=ba246418f4de12b845a09bba975f1a5242adc898
+RECIPE_FOLDER=rollout_elastic
+# Latest commit in the recipe repo that touched only this recipe subdirectory.
+RECIPE_FOLDER_LAST_COMMIT=a9b5caff93a7ec8c9f7ec034d7ccfd033f4a3064
+NOTES=VERL_COMMIT pins the core library; RECIPE_SUBMODULE_COMMIT is the `recipe/` submodule gitlink at that verl revision; RECIPE_FOLDER_LAST_COMMIT narrows to this folder inside the submodule.
+REFRESH=Recompute: (cd verl && git rev-parse HEAD); (cd verl/recipe && git rev-parse HEAD); (cd verl/recipe && git log -1 --format=%H -- rollout_elastic)

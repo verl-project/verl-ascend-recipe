@@ -1,0 +1,100 @@
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer, 
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+  
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, LLMServerClient auto resume generation, making rollout interruption invisible to the AgentLoop.
+  partial_rollout: True
+
+  # whether to use trainer do_validate
+  use_trainer_do_validate: False
+
+  # Fault tolerance (P1/P2 elastic rollout). See verl/workers/rollout/fault_tolerance/types.py.
+  # When enabled=False, all FT code paths are skipped — behavior is bit-exact identical
+  # to the pre-FT implementation.
+  fault_tolerance:
+    enabled: False
+    max_request_retries: 3
+    request_timeout_s: 600.0
+    server_call_timeout_s: 120.0
+    min_ok_ratio: 0.5
+    weight_sync_member_timeout_s: 60.0
+    weight_sync_transfer_timeout_s: 600.0
+    max_weight_sync_retries: 2
+    heartbeat_interval_s: 5.0
+    heartbeat_miss_threshold: 3
+    replace_dead_replicas: True
+    # Mode C (token continuation): resume partial rollout from the persisted progress
+    # checkpoint after a fault. Only active when BOTH fault_tolerance.enabled and
+    # progress.enabled are True.
+    progress:
+      enabled: False
+      persist_root: "checkpoints/rollout_progress"
+      flush_token_interval: 64
+      gc_delay_s: 300.0
+      gc_period_s: 60.0
+      gc_retry_backoff_s: 30.0
+      model_version_policy:
+        mode: "exact"
+      write_timeout_s: 30.0
+      max_pending_writes_per_recovery: 8
+      stats_log_interval_s: 60.0
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node                     
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples # TODO rename to total_rollout_samples
+  total_rollout_steps: 100
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True
