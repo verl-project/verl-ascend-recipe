@@ -113,7 +113,7 @@ Configuration = the GPU reference script `examples/tuning/lora/run_qwen3_8b_merg
 | 10 | 267.0 | 146.4 | 62.0 | 12.6 | 770 | 0.596 |
 
 - Mean over steps 2–10: **277.5 s/step**, **824.7 tokens/s/NPU** (approximately 3299 tokens/s across 4 NPUs), MFU (actor) 0.44–0.51.
-- Actor peak HBM 32.6 GB allocated / 40.2 GB reserved per card; `npu-smi` shows ≈50 GB per card during training
+- Actor peak HBM 32.6 GiB allocated / 40.2 GiB reserved per card; `npu-smi` shows ≈50 GB per card during training
   (vLLM keeps 0.6 × HBM while awake and sleeps during training).
 - Reward (`critic/score/mean`, gsm8k exact-match) increases overall from 0.229 to 0.596, with a decrease at step 6; response length drops from
   875 to 725 tokens and the 1024-token clip ratio from 0.53 to 0.25; `response/aborted_ratio` = 0.

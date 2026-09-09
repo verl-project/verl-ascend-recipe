@@ -13,7 +13,7 @@ vllm_ascend 推理后端，补齐 Qwen3-8B + GRPO + LoRA（`model.lora.merge=Tru
 | 路径可用性 | 参考脚本 `examples/tuning/lora/run_qwen3_8b_merge_fsdp.sh` 的算法与 LoRA 配置不改，只改 NPU 启动项，即可在 4 × 910B1 上跑通 |
 | 10 步冒烟 | 第 2–10 步均值为 277.5 s/步、824.7 tokens/s/NPU；reward 首末 0.229 → 0.596，总体上升但非单调，rc=0 |
 | merge 权重同步 | 每步 11.7–12.9 s（占步时 ≈4.5%），vLLM-Ascend 收到全量 bf16 权重，无需推理侧 LoRA |
-| 显存 | actor 侧峰值 32.6 GB allocated / 40.2 GB reserved（每卡 64 GB），训练中 `npu-smi` ≈50 GB/卡 |
+| 显存 | actor 侧峰值 32.6 GiB allocated / 40.2 GiB reserved（每卡 64 GB），训练中 `npu-smi` ≈50 GB/卡 |
 | NPU 单测 | `tests/utils/test_fsdp_lora_merge.py -k fsdp2` 在 2 卡上 6/6 通过（199 s） |
 | 需要的适配 patch | verl 的 `get_npu_versions()` 设备探测补丁，以及 vLLM-Ascend 的 sampler `record_stream` 回移补丁分别应用到各自源码目录。 |
 | 100 步 / 长跑 | 原版轨迹已恢复至100步；补丁版完整验证尚未完成，不能合并两种环境的证据。 |
@@ -88,10 +88,17 @@ TP 2、`gpu_memory_utilization 0.6`、`layered_summon=True`、`load_format=safet
 | 10 | 267.0 | 146.4 | 24.3 | 19.2 | 62.0 | 12.6 | 770 | 0.596 | 725 | 0.25 |
 
 - steps 2–10 均值：步时 277.5 s，吞吐 824.7 tokens/s/NPU（四卡合计约 3299 tokens/s），actor MFU 0.44–0.51。
-- 显存：`actor/perf/max_memory_allocated_gb` 32.6、`max_memory_reserved_gb` 40.2；主机内存 `cpu_memory_used_gb` 208–256。
+- 显存：`actor/perf/max_memory_allocated_gb` 为32.6 GiB，`actor/perf/max_memory_reserved_gb` 为40.2 GiB；
+  `actor/perf/cpu_memory_used_gb` 为208–256 GiB。
 - reward（gsm8k 精确匹配，`critic/score/mean`）首末值 0.229 → 0.596，总体上升但非单调（step 5 → 6 从约 0.404 降至 0.387）；响应长度均值 875 → 725、1024 截断比例 0.53 → 0.25；
   `actor/kl_loss` 3.4e-4 → 8e-3，`grad_norm` 0.018–0.033，`response/aborted_ratio` 0。
 - 退出码 0；结束时 vLLM 服务打印 `multiprocessing.resource_tracker` 的 `KeyError('/psm_*')`，为关闭期共享内存清理噪音。
+
+固定 verl 提交的 `verl/workers/engine_workers.py` 将上述内存字节数除以 `1024**3`，因此字段虽以
+`_gb` 命名，单位实际为GiB。CPU字段使用 `psutil.virtual_memory().used`，表示进程可见的系统已用内存，
+不能解释为actor进程RSS或主机锁页内存。固定 torch_npu 版本提供 `torch_npu.npu.host_memory_stats()`，
+其 `allocated_bytes` 和 `reserved_bytes` 分别统计锁页分配器的活动字节与保留字节；`peak` 是按分配桶
+汇总的近似峰值。当前训练没有采集该接口，主机锁页内存占用仍未测得。
 
 ### 6.2 NPU 单测
 
