@@ -10,6 +10,27 @@ See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt) for the upstream repository, the va
 the copy-pastable install line. The validated commit is the `/verl` checkout shipped in
 `quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm`.
 
+### 固定镜像的 vLLM-Ascend sampler 补丁
+
+本次固定镜像 ID 为 `sha256:b25fae72319d0c16451fb27afd6391f97e8734452ce369901082dd5b8956ae91`，
+其中 vLLM-Ascend 提交为 `a43c8cc8057f490ed1df2c6ed66253e2d7817da4`。训练前在 **vLLM-Ascend**
+源码目录应用补丁；`install_verl.sh` 只安装 verl，不处理此依赖：
+
+```bash
+cd /vllm-ascend
+test "$(git rev-parse HEAD)" = a43c8cc8057f490ed1df2c6ed66253e2d7817da4
+git apply --check /path/to/lora_rl_merge/patches/vllm-ascend/0001-record-sampler-stream.patch
+git apply /path/to/lora_rl_merge/patches/vllm-ascend/0001-record-sampler-stream.patch
+cd /verl
+```
+
+补丁回移上游已合入的 [PR #13394](https://github.com/vllm-project/vllm-ascend/pull/13394)，提交为
+`fc0ce85b58f019e5a1988dbd3f39d014052fb44b`。`wait_stream` 建立执行依赖，新增的
+`q.record_stream(torch.npu.current_stream())` 防止随机采样张量在消费者 stream 完成前被分配器重用。
+2026-09-10 同卡 Qwen3-8B、TP=1 对照中，原版 224621 个 token 出现 4 个越界 token 及对应的 `-inf`
+log-prob；补丁组 225828 个 token 中两类异常均为 0。两组各 256 条序列，此结果只支持该样本，
+修复后的目标训练完整验证仍在准备。包含上游修复的其他版本无需重复应用，但不能直接继承本镜像的验证结论。
+
 ## Why "merge" needs no inference-side LoRA support
 
 With `model.lora.merge=True` (`peft_merge` in `verl/workers/engine_workers.py`), the FSDP2 engine merges the adapters into
@@ -103,16 +124,27 @@ Configuration = the GPU reference script `examples/tuning/lora/run_qwen3_8b_merg
 
 The retained log `lora_merge_100step_4npu_0828T0414Z.log` contains steps 1–58 and a progress duration of 4:34:03.
 The process exited with code 0, but the default `TOTAL_EPOCHS=1` limits this dataset to `7473 // 128 = 58` steps
-in the validated trainer. The current script corrects the epoch limit and checks completed training steps; hardware continuation has not yet been validated.
-Neither the 100-step nor the 12-hour requirement has been met.
+in the validated trainer. The current script corrects the epoch limit and checks completed training steps; the continuation result is recorded below.
 
 - Mean reward over the first/last 10 steps: 0.3990234375 / 0.90390625.
 - Arithmetic mean of the 58 per-step `perf/throughput` values: 673.807293 tokens/s/NPU, or 2695.229173 tokens/s
   across four NPUs. This metric divides total training-step tokens by step duration and NPU count; it does not
   include all job startup/validation time and is not pure rollout generation throughput.
-- The latest checkpoint is step 50. Its files exist, but loading and continuation have not been tested.
+- The latest checkpoint is step 50. It was successfully restored in the subsequent continuation.
 - All 58 steps contain non-finite `rollout_corr` diagnostics. Actor losses, gradient norms and rewards are finite;
-  the diagnostic cause and its effect on training remain unresolved.
+  the sampler investigation and its limits are recorded above.
+
+### 原版 sampler 的 100 步续训结果（2026-09-10）
+
+从 checkpoint50 恢复后实际完成第 51–100 步，保存 checkpoint100，并完成最终 GSM8K 验证。
+统计只采用原始第 1–50 步和续训第 51–100 步，不重复计入原先第 51–58 步。首末各 10 步 reward 均值为
+0.3990234375 与 0.94755859375；GSM8K greedy 准确率从 321/1319 上升到 1216/1319。
+总训练步 token 数 66803533 除以累计步时 25897.94468626156 秒和 4 张卡，得到
+644.8729214739403 tokens/s/NPU；该口径不包含所有启动、恢复、停机与验证时间。
+
+100 步 actor loss 和梯度均有限、梯度均非零，但每步都存在非有限 `rollout_corr` 诊断。
+此轨迹使用未修复的 sampler，不能作为当前补丁版的完整验证。checkpoint50 的恢复已实测；
+checkpoint100 仅核查文件和额外状态，尚未实际加载模型及优化器继续训练。
 
 These are partial validation results. The issue does not explicitly require eight NPUs; neither four-card results
 nor a successful process exit establish final acceptance.

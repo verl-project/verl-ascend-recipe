@@ -1,13 +1,17 @@
-# lora_rl_merge — validated against the verl commit shipped in the Ascend verl image; rolling main is expected to work
+# lora_rl_merge — validated against the verl commit shipped in the Ascend verl image; patched sampler training is pending
 UPSTREAM=https://github.com/verl-project/verl.git
-MODE=rolling
-BRANCH=main
+MODE=pinned_commit
 # Exact upstream verl commit this recipe was validated on (it is the /verl checkout inside the image below).
-VERL_COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
+COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
 PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bc72e38edba78e778bfbd462638f9634b9140a76
 GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout bc72e38edba78e778bfbd462638f9634b9140a76
 # Container image used for validation (verl + vllm-ascend + CANN 9.0.0, Atlas 800T A2 / 910B):
 IMAGE=quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm
 RECIPE_FOLDER=lora_rl_merge
-NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch on VERL_COMMIT when the container mounts only a subset of the NPUs (verl hard-codes 'npu-smi info -t board -i 1'); see README.md.
-REFRESH=Recompute VERL_COMMIT from the validated checkout: (cd verl && git rev-parse HEAD)
+NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch on COMMIT when the container mounts only a subset of the NPUs (verl hard-codes 'npu-smi info -t board -i 1'); see README.md.
+REFRESH=Recompute COMMIT from the validated checkout: (cd verl && git rev-parse HEAD)
+
+# Apply the sampler fix in /vllm-ascend, not in /verl; see README.md.
+VLLM_ASCEND_COMMIT=a43c8cc8057f490ed1df2c6ed66253e2d7817da4
+VLLM_ASCEND_PATCH=patches/vllm-ascend/0001-record-sampler-stream.patch
+IMAGE_ID=sha256:b25fae72319d0c16451fb27afd6391f97e8734452ce369901082dd5b8956ae91
