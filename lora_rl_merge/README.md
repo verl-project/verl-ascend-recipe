@@ -23,7 +23,7 @@ from the actor with adapters disabled (`ref_in_actor`), so no separate reference
 
 | Component | Version |
 | --- | --- |
-| Hardware | Atlas 800T A2, 4 × 910B1 (64 GB HBM each) — 8 cards also fit |
+| Hardware | Atlas 800T A2, 4 × 910B1 (64 GB HBM each); 8-card configuration untested |
 | Image | `quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm` |
 | verl | 0.9.0.dev0, commit `bc72e38e` (see `REQUIRED_VERL.txt`) |
 | vllm / vllm-ascend | 0.18.0 / 0.18.1.dev44 |
@@ -55,10 +55,18 @@ from the actor with adapters disabled (`ref_in_actor`), so no separate reference
      MODEL_PATH=/path/to/Qwen3-8B DATA_DIR=$HOME/data/gsm8k \
      bash run_qwen3_8b_lora_merge_fsdp2_npu.sh
 
-   # 100-step run (checkpoint every 10 steps, validation every 20 steps, resume_mode=auto)
-   NPROC_PER_NODE=4 MODEL_PATH=/path/to/Qwen3-8B DATA_DIR=$HOME/data/gsm8k \
+   # 100-step training, or continuation from the latest checkpoint in DEFAULT_LOCAL_DIR
+   TOTAL_TRAINING_STEPS=100 MODEL_PATH=/path/to/Qwen3-8B DATA_DIR=$HOME/data/gsm8k \
+     DEFAULT_LOCAL_DIR=$HOME/ckpts/lora_merge_100 \
      bash run_qwen3_8b_lora_merge_fsdp2_npu.sh
    ```
+
+   The default epoch limit equals `TOTAL_TRAINING_STEPS`, so even a filtered dataset with only one full batch
+   per epoch has enough capacity. The trainer still stops at the requested step. `TOTAL_EPOCHS` can override
+   that limit. Each invocation retains a unique `training.*.log` under `DEFAULT_LOCAL_DIR` and checks that its
+   consecutive training metrics reach the requested final step. A successful trainer exit before that step
+   is an error. This checks training length; reward, throughput and numerical diagnostics require separate review.
+   Keep the `console` logger enabled. Checkpoints are saved every 10 steps and `RESUME_MODE=auto` is the default.
 
    `tools/parse_step_metrics.py <console.log>` prints the per-step timing / throughput / reward table used below.
 
@@ -70,7 +78,7 @@ Configuration = the GPU reference script `examples/tuning/lora/run_qwen3_8b_merg
 `rollout.n` 8, prompt 1024 + response 1024, LoRA rank 32 / alpha 64, lr 1e-5, FSDP2 bf16 without offload, vLLM TP 2,
 `gpu_memory_utilization` 0.6), only NPU launch items changed.
 
-| step | step time (s) | gen (s) | update_actor (s) | merge + weight sync (s) | throughput (tokens/s, 4 cards) | reward mean |
+| step | step time (s) | gen (s) | update_actor (s) | merge + weight sync (s) | throughput (tokens/s/NPU, 4 NPUs) | reward mean |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 360.6 | 166.4 | 81.6 | 11.7 | 681 | 0.229 |
 | 2 | 280.5 | 144.5 | 71.4 | 12.1 | 861 | 0.291 |
@@ -83,17 +91,31 @@ Configuration = the GPU reference script `examples/tuning/lora/run_qwen3_8b_merg
 | 9 | 273.4 | 148.4 | 64.1 | 12.7 | 803 | 0.530 |
 | 10 | 267.0 | 146.4 | 62.0 | 12.6 | 770 | 0.596 |
 
-- Mean over steps 2–10: **277.5 s/step**, **824.7 tokens/s** global (206 tokens/s per card), MFU (actor) 0.44–0.51.
+- Mean over steps 2–10: **277.5 s/step**, **824.7 tokens/s/NPU** (approximately 3299 tokens/s across 4 NPUs), MFU (actor) 0.44–0.51.
 - Actor peak HBM 32.6 GB allocated / 40.2 GB reserved per card; `npu-smi` shows ≈50 GB per card during training
   (vLLM keeps 0.6 × HBM while awake and sleeps during training).
-- Reward (`critic/score/mean`, gsm8k exact-match) rises monotonically from 0.229 to 0.596; response length drops from
+- Reward (`critic/score/mean`, gsm8k exact-match) increases overall from 0.229 to 0.596, with a decrease at step 6; response length drops from
   875 to 725 tokens and the 1024-token clip ratio from 0.53 to 0.25; `response/aborted_ratio` = 0.
 - Exit code 0; the only tracebacks are `multiprocessing.resource_tracker` `KeyError('/psm_*')` printed by the vLLM
   server at shutdown (shared-memory cleanup noise).
 
-### 100-step run
+### Attempted 100-step run: 58 steps completed (2026-08-28)
 
-_To be filled after the scheduled 100-step run (≈7.7 h on 4 cards at the measured step time; checkpoint every 10 steps)._
+The retained log `lora_merge_100step_4npu_0828T0414Z.log` contains steps 1–58 and a progress duration of 4:34:03.
+The process exited with code 0, but the default `TOTAL_EPOCHS=1` limits this dataset to `7473 // 128 = 58` steps
+in the validated trainer. The current script corrects the epoch limit and checks completed training steps; hardware continuation has not yet been validated.
+Neither the 100-step nor the 12-hour requirement has been met.
+
+- Mean reward over the first/last 10 steps: 0.3990234375 / 0.90390625.
+- Arithmetic mean of the 58 per-step `perf/throughput` values: 673.807293 tokens/s/NPU, or 2695.229173 tokens/s
+  across four NPUs. This metric divides total training-step tokens by step duration and NPU count; it does not
+  include all job startup/validation time and is not pure rollout generation throughput.
+- The latest checkpoint is step 50. Its files exist, but loading and continuation have not been tested.
+- All 58 steps contain non-finite `rollout_corr` diagnostics. Actor losses, gradient norms and rewards are finite;
+  the diagnostic cause and its effect on training remain unresolved.
+
+These are partial validation results. The issue does not explicitly require eight NPUs; neither four-card results
+nor a successful process exit establish final acceptance.
 
 ### Unit test `tests/utils/test_fsdp_lora_merge.py` on NPU
 
@@ -108,10 +130,11 @@ test_merged_lora_context_gptoss[True-fsdp2-2]     PASSED
 test_merged_lora_context_gptoss[False-fsdp2-2]    PASSED
 test_collect_merged_lora_params[all-linear-fsdp2-2]   PASSED
 test_collect_merged_lora_params[lora_targets0-fsdp2-2] PASSED
-6 passed, 6 deselected in 199.34s
+6 passed, 6 deselected, 1 warning in 199.34s
 ```
 
-The FSDP1 (`strategy=fsdp`) half of the parametrization was not run here; the exclusion can at least be narrowed to it.
+The FSDP1 (`strategy=fsdp`) half of the parametrization was not run here. These historical results do not establish
+that the current upstream CI exclusion can be changed without further validation.
 
 ## NPU adaptation notes
 

@@ -6,7 +6,7 @@
 # eager vLLM, no uv wrapper). With `model.lora.merge=True` the adapters are merged into the base weights before
 # every rollout weight sync, so vLLM-Ascend receives plain full weights and no inference-side LoRA support is needed.
 #
-# Validated on 4 x 910B1 (64 GB HBM), see README.md: 10-step smoke ~277 s/step, ~825 tokens/s (4-card global),
+# Validated on 4 x 910B1 (64 GB HBM), see README.md: 10-step smoke ~277 s/step, ~825 tokens/s/NPU,
 # reward 0.23 -> 0.60, actor peak HBM 32.6 GB. All knobs are env-overridable.
 set -xeuo pipefail
 
@@ -43,8 +43,9 @@ rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 rollout_n=${ROLLOUT_N:-8}
 max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 
-total_epochs=${TOTAL_EPOCHS:-1}
 total_training_steps=${TOTAL_TRAINING_STEPS:-100}
+# One epoch may contain only one full batch after prompt filtering. The step limit remains authoritative.
+total_epochs=${TOTAL_EPOCHS:-$total_training_steps}
 save_freq=${SAVE_FREQ:-10}               # checkpoint every 10 steps so a shared host can pause/resume
 test_freq=${TEST_FREQ:-20}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
@@ -148,6 +149,26 @@ if [ -n "${ray_temp_dir}" ]; then
 fi
 
 ########################### launch ###########################
+# Honor trailing Hydra overrides when checking the actual training target and selecting the log directory.
+expected_steps=$total_training_steps
+log_dir=$default_local_dir
+console_logger=$logger
+for override in "$@"; do
+    case "$override" in
+        trainer.total_training_steps=*) expected_steps=${override#*=} ;;
+        trainer.default_local_dir=*) log_dir=${override#*=} ;;
+        trainer.logger=*) console_logger=${override#*=} ;;
+    esac
+done
+if ! [[ "$expected_steps" =~ ^[1-9][0-9]*$ ]] || [[ "$console_logger" != *console* ]]; then
+    echo "A positive trainer.total_training_steps and console logger are required for completion verification." >&2
+    exit 2
+fi
+mkdir -p "$log_dir"
+training_log=$(mktemp "$log_dir/training.XXXXXXXX.log")
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+echo "Training log: $training_log"
+
 # Run from the verl repo root (the Ascend image ships verl at /verl).
 python3 -m verl.trainer.main_ppo \
     "${DATA[@]}" \
@@ -157,4 +178,5 @@ python3 -m verl.trainer.main_ppo \
     "${REF[@]}" \
     "${TRAINER[@]}" \
     "${EXTRA[@]}" \
-    "$@"
+    "$@" 2>&1 | tee "$training_log"
+python3 "$script_dir/tools/check_training_completion.py" "$training_log" --expected-step "$expected_steps"

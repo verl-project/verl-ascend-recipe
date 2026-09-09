@@ -4,19 +4,19 @@
 vllm_ascend 推理后端，补齐 Qwen3-8B + GRPO + LoRA（`model.lora.merge=True`，训练中 merge 进 base 模型用于 rollout）
 对 FSDP2 后端的支持。配套脚本与文件见本目录 [`README.md`](README.md)。
 
-> 状态说明：第 6.1、6.2 节为已完成的实测；第 6.3 节（100 步训练）待排期完成后补全。
+> 状态说明（2026-09-09 复核）：已完成 10 步冒烟、FSDP2 单测和一次仅完成 58 步的正式运行。尚未满足 100 步或 12 小时条件；脚本默认 epoch 上限与完成检查已修正并通过本地测试，checkpoint 恢复和非有限诊断指标仍待验证。
 
 ## 1. 结论概览
 
 | 项目 | 结果 |
 | --- | --- |
 | 路径可用性 | 参考脚本 `examples/tuning/lora/run_qwen3_8b_merge_fsdp.sh` 的算法与 LoRA 配置不改，只改 NPU 启动项，即可在 4 × 910B1 上跑通 |
-| 10 步冒烟 | 步时均值 277.5 s，全局吞吐 824.7 tokens/s（每卡 206），reward 均值 0.229 → 0.596 单调上升，rc=0 |
+| 10 步冒烟 | 第 2–10 步均值为 277.5 s/步、824.7 tokens/s/NPU；reward 首末 0.229 → 0.596，总体上升但非单调，rc=0 |
 | merge 权重同步 | 每步 11.7–12.9 s（占步时 ≈4.5%），vLLM-Ascend 收到全量 bf16 权重，无需推理侧 LoRA |
 | 显存 | actor 侧峰值 32.6 GB allocated / 40.2 GB reserved（每卡 64 GB），训练中 `npu-smi` ≈50 GB/卡 |
 | NPU 单测 | `tests/utils/test_fsdp_lora_merge.py -k fsdp2` 在 2 卡上 6/6 通过（199 s） |
 | 需要的适配 patch | 1 个：`get_npu_versions()` 不再硬编码 `npu-smi -i 1`（容器只挂部分卡时必需） |
-| 100 步 / 长跑 | 待补（按实测步时 4 卡约 7.7 h） |
+| 100 步 / 长跑 | 正式运行只完成 58 步、4:34:03；未满足 100 步或 12 小时条件 |
 
 ## 2. 机制：为什么 merge 路径不依赖 vllm-ascend 的 LoRA 能力
 
@@ -61,7 +61,7 @@ TP 2、`gpu_memory_utilization 0.6`、`layered_summon=True`、`load_format=safet
 | 项 | 取值 | 原因 |
 | --- | --- | --- |
 | `trainer.device` | `npu` | 设备选择 |
-| `trainer.n_gpus_per_node` | 4（可 8） | 共享主机实际可用卡数；LoRA 优化器状态极小，4 卡显存充裕 |
+| `trainer.n_gpus_per_node` | 4（8 卡未验证） | 共享主机实际可用卡数；LoRA 优化器状态极小，4 卡显存充裕 |
 | `rollout.enforce_eager` | `True` | 与已验证的 `verl_ascend_practice/run_rl_qwen3_8b_npu.sh` 一致；ACL graph 模式未评估 |
 | `rollout.max_num_batched_tokens` | 8192 | 同上 |
 | `actor/ref.entropy_from_logits_with_chunking` | `True` | 降低 logits 熵计算峰值显存 |
@@ -74,7 +74,7 @@ TP 2、`gpu_memory_utilization 0.6`、`layered_summon=True`、`load_format=safet
 
 ### 6.1 10 步冒烟（4 × 910B1，2026-08-20）
 
-| step | 步时 (s) | gen (s) | old_log_prob (s) | ref (s) | update_actor (s) | merge + 权重同步 (s) | 吞吐 (tokens/s, 4 卡) | reward 均值 | 响应长度均值 | 截断比例 |
+| step | 步时 (s) | gen (s) | old_log_prob (s) | ref (s) | update_actor (s) | merge + 权重同步 (s) | 吞吐 (tokens/s/NPU，4 卡) | reward 均值 | 响应长度均值 | 截断比例 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 360.6 | 166.4 | 32.9 | 22.6 | 81.6 | 11.7 | 681 | 0.229 | 875 | 0.53 |
 | 2 | 280.5 | 144.5 | 28.5 | 21.5 | 71.4 | 12.1 | 861 | 0.291 | 857 | 0.51 |
@@ -87,9 +87,9 @@ TP 2、`gpu_memory_utilization 0.6`、`layered_summon=True`、`load_format=safet
 | 9 | 273.4 | 148.4 | 25.8 | 20.1 | 64.1 | 12.7 | 803 | 0.530 | 774 | 0.33 |
 | 10 | 267.0 | 146.4 | 24.3 | 19.2 | 62.0 | 12.6 | 770 | 0.596 | 725 | 0.25 |
 
-- steps 2–10 均值：步时 277.5 s，吞吐 824.7 tokens/s（每卡 206.2），actor MFU 0.44–0.51；10 步共 8.24 M tokens。
+- steps 2–10 均值：步时 277.5 s，吞吐 824.7 tokens/s/NPU（四卡合计约 3299 tokens/s），actor MFU 0.44–0.51。
 - 显存：`actor/perf/max_memory_allocated_gb` 32.6、`max_memory_reserved_gb` 40.2；主机内存 `cpu_memory_used_gb` 208–256。
-- reward（gsm8k 精确匹配，`critic/score/mean`）0.229 → 0.596 单调上升；响应长度均值 875 → 725、1024 截断比例 0.53 → 0.25；
+- reward（gsm8k 精确匹配，`critic/score/mean`）首末值 0.229 → 0.596，总体上升但非单调（step 5 → 6 从约 0.404 降至 0.387）；响应长度均值 875 → 725、1024 截断比例 0.53 → 0.25；
   `actor/kl_loss` 3.4e-4 → 8e-3，`grad_norm` 0.018–0.033，`response/aborted_ratio` 0。
 - 退出码 0；结束时 vLLM 服务打印 `multiprocessing.resource_tracker` 的 `KeyError('/psm_*')`，为关闭期共享内存清理噪音。
 
@@ -98,14 +98,24 @@ TP 2、`gpu_memory_utilization 0.6`、`layered_summon=True`、`load_format=safet
 `.github/workflows/npu_unit_tests.yml` 以 `--ignore-glob="*test_fsdp_lora_merge*"` 排除了该文件。2 × 910B1（容器只挂
 这两张卡，已打 `get_npu_versions` 补丁）上 `pytest -v -s tests/utils/test_fsdp_lora_merge.py -k fsdp2`：
 `test_merged_lora_context_qwen2[True/False-fsdp2-2]`、`test_merged_lora_context_gptoss[True/False-fsdp2-2]`、
-`test_collect_merged_lora_params[all-linear-fsdp2-2]`、`[lora_targets0-fsdp2-2]` 全部 PASSED，6 passed in 199 s。
-FSDP1（`strategy=fsdp`）子集未在本任务范围内运行；排除项至少可缩小到 FSDP1。
+`test_collect_merged_lora_params[all-linear-fsdp2-2]`、`[lora_targets0-fsdp2-2]` 全部 PASSED，原始总计为 `6 passed, 6 deselected, 1 warning in 199.34s`。
+FSDP1（`strategy=fsdp`）子集未运行；这一历史结果不能直接证明当前上游 CI 的排除项可以解除。
 
-### 6.3 100 步训练（待补）
+### 6.3 正式运行实际完成 58 步（2026-08-28）
 
-计划：同配置 100 步，`save_freq 10`、`test_freq 20`、`val_before_train True`、`resume_mode auto`（共享主机可按 checkpoint
-分段续跑）。按 277.5 s/步估计 4 卡约 7.7 h。待完成后补充：训练 reward 曲线、验证集 `val-core/openai/gsm8k/reward/mean@1`
-起点/终点、吞吐均值、显存峰值、分段续跑记录。
+原始日志 `lora_merge_100step_4npu_0828T0414Z.log` 连续记录 step 1–58，进度条为 58/100、4:34:03，
+随后 `LAUNCH_WRAP_EXIT rc=0`。默认 `TOTAL_EPOCHS=1`，该版本按 `7473 // 128 = 58` 计算每 epoch 步数，
+达到 epoch 上限后正常退出。设置 `total_training_steps=100` 不会自动扩大 epoch 上限。
+当前脚本将默认 epoch 上限设置为目标步数，并检查日志中的实际训练步数；这两项修正尚待实机续训验证。
+
+首 10 步 reward 均值为 0.3990234375，末 10 步为 0.90390625。58 步 `perf/throughput` 算术均值为
+673.807293 tokens/s/NPU，四卡合计为 2695.229173 tokens/s。验证版本 `metric_utils.py` 的定义为
+`total_num_tokens / (time_per_step * n_gpus)`；它不等于含启动、完整验证等开销的全作业吞吐，也不是纯生成速度。
+issue 没有明确要求八卡，也未定义 TPS 是整机或每卡；这里披露实际卡数和源码口径，不能据此声称已获维护者接受。
+
+最新 checkpoint 为 step 50，文件已确认存在且非空，但尚未实际加载恢复。58 步均存在非有限的
+`rollout_corr` 诊断指标，而 actor loss、grad_norm 和 reward 有限；原因与对训练的影响仍待核实。
+现有结果未满足 100 步或 12 小时要求，不能称为完整验收证据。
 
 ## 7. 显存与性能分析、调参建议
 
@@ -160,7 +170,7 @@ docker run -d --name verl-lora --shm-size 128g \
 docker exec verl-lora bash -c 'cd /verl && git apply /workspace/work/lora_rl_merge/patches/0001-get_npu_versions-first-visible-npu-id.patch'
 # 3) 数据
 docker exec verl-lora bash -c 'cd /verl && python3 examples/data_preprocess/gsm8k.py --local_save_dir /workspace/work/data/gsm8k'
-# 4) 冒烟 10 步 / 正式 100 步
+# 4) 冒烟 10 步；正式训练设置 TOTAL_TRAINING_STEPS=100，并保留默认 checkpoint 保存与自动恢复配置
 docker exec verl-lora bash -c 'cd /verl && NPROC_PER_NODE=4 TOTAL_TRAINING_STEPS=10 SAVE_FREQ=-1 TEST_FREQ=-1 VAL_BEFORE_TRAIN=False \
   MODEL_PATH=/workspace/work/models/Qwen3-8B DATA_DIR=/workspace/work/data/gsm8k RAY_TEMP_DIR=/workspace/work/ray_tmp \
   bash /workspace/work/lora_rl_merge/run_qwen3_8b_lora_merge_fsdp2_npu.sh'
@@ -170,7 +180,7 @@ python3 lora_rl_merge/tools/parse_step_metrics.py <console.log>
 
 ## 10. 限制与后续
 
-- 仅 10 步冒烟 + 单测已完成；100 步精度/性能证据待排期（第 6.3 节）。
+- 已有 10 步冒烟、FSDP2 单测和 58 步正式训练；完整长度、checkpoint 恢复及诊断数值边界仍未验证（第 6.3 节）。
 - 吞吐在 `enforce_eager=True`、TP 2、4 卡下测得，未做性能调优；无同配置 GPU 对照数据，性能判据按 issue 的"无 GPU 标杆时
   TPS > 100"兜底。
 - 未测：8 卡配置、FSDP1 子集、ACL graph 模式、`max_response_length 2048`。
