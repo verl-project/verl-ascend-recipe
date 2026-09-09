@@ -12,9 +12,7 @@ def check_completion(text: str, expected_step: int) -> list[int]:
         match = re.search(r"\bstep:(\d+) - (.*)", line)
         if not match:
             continue
-        values = dict(
-            part.rsplit(":", 1) for part in match[2].split(" - ") if ":" in part
-        )
+        values = dict(part.rsplit(":", 1) for part in match[2].split(" - ") if ":" in part)
         values = {key.strip(): value.strip() for key, value in values.items()}
         # Validation-only lines have a step too; they cannot prove a training update.
         if "training/global_step" not in values or "timing_s/update_actor" not in values:

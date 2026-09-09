@@ -5,8 +5,7 @@ from check_training_completion import check_completion
 
 def training_lines(steps):
     return "\n".join(
-        f"(TaskRunnerV1 pid=1) step:{step} - training/global_step:{step} - timing_s/update_actor:1.2"
-        for step in steps
+        f"(TaskRunnerV1 pid=1) step:{step} - training/global_step:{step} - timing_s/update_actor:1.2" for step in steps
     )
 
 
