@@ -16,8 +16,9 @@ KEYS = [
     "timing_s/generate_sequences",
     "perf/throughput",
     "perf/total_num_tokens",
-    "perf/max_memory_allocated_gb",
-    "perf/max_memory_reserved_gb",
+    "actor/perf/max_memory_allocated_gb",
+    "actor/perf/max_memory_reserved_gb",
+    "actor/perf/cpu_memory_used_gb",
     "critic/score/mean",
     "critic/rewards/mean",
     "response_length/mean",
@@ -28,9 +29,10 @@ KEYS = [
     "actor/lr",
 ]
 ansi = re.compile(r"\x1b\[[0-9;]*m")
+printed_keys = False
 for line in open(log, errors="replace"):
     line = ansi.sub("", line)
-    m = re.search(r"TaskRunnerV1.*?step:(\d+) - (.*)", line)
+    m = re.search(r"\bstep:(\d+) - (.*)", line)
     if not m:
         continue
     kv = {}
@@ -38,6 +40,8 @@ for line in open(log, errors="replace"):
         if ":" in part:
             k, v = part.rsplit(":", 1)
             kv[k.strip()] = v.strip()
+    if "training/global_step" not in kv or "timing_s/update_actor" not in kv:
+        continue
     out = []
     for k in KEYS:
         if k in kv:
@@ -50,5 +54,6 @@ for line in open(log, errors="replace"):
             )
             out.append(f"{short}={kv[k]}")
     print("step", m.group(1), " ".join(out))
-    if show_keys and m.group(1) == "1":
+    if show_keys and not printed_keys:
         print("   keys:", ", ".join(sorted(kv.keys())))
+        printed_keys = True
