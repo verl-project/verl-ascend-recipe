@@ -4,7 +4,7 @@
 vllm_ascend 推理后端，补齐 Qwen3-8B + GRPO + LoRA（`model.lora.merge=True`，训练中 merge 进 base 模型用于 rollout）
 对 FSDP2 后端的支持。配套脚本与文件见本目录 [`README.md`](README.md)。
 
-> 状态说明（2026-09-09 复核）：已完成 10 步冒烟、FSDP2 单测和一次仅完成 58 步的正式运行。尚未满足 100 步或 12 小时条件；脚本默认 epoch 上限与完成检查已修正并通过本地测试，checkpoint 恢复和非有限诊断指标仍待验证。
+> 状态说明（2026-09-10）：原版 sampler 的轨迹已通过 checkpoint50 恢复到100步，reward和TPS达到声明阈值，但每步仍有非有限rollout诊断。同卡推理对照支持上游sampler生命周期修复；补丁后的独立四卡100步训练已启动，尚无完整通过结论。
 
 ## 1. 结论概览
 
@@ -15,8 +15,8 @@ vllm_ascend 推理后端，补齐 Qwen3-8B + GRPO + LoRA（`model.lora.merge=Tru
 | merge 权重同步 | 每步 11.7–12.9 s（占步时 ≈4.5%），vLLM-Ascend 收到全量 bf16 权重，无需推理侧 LoRA |
 | 显存 | actor 侧峰值 32.6 GB allocated / 40.2 GB reserved（每卡 64 GB），训练中 `npu-smi` ≈50 GB/卡 |
 | NPU 单测 | `tests/utils/test_fsdp_lora_merge.py -k fsdp2` 在 2 卡上 6/6 通过（199 s） |
-| 需要的适配 patch | 1 个：`get_npu_versions()` 不再硬编码 `npu-smi -i 1`（容器只挂部分卡时必需） |
-| 100 步 / 长跑 | 正式运行只完成 58 步、4:34:03；未满足 100 步或 12 小时条件 |
+| 需要的适配 patch | verl 的 `get_npu_versions()` 设备探测补丁，以及 vLLM-Ascend 的 sampler `record_stream` 回移补丁分别应用到各自源码目录。 |
+| 100 步 / 长跑 | 原版轨迹已恢复至100步；补丁版完整验证尚未完成，不能合并两种环境的证据。 |
 
 ## 2. 机制：为什么 merge 路径不依赖 vllm-ascend 的 LoRA 能力
 
@@ -29,7 +29,7 @@ vllm_ascend 推理后端，补齐 Qwen3-8B + GRPO + LoRA（`model.lora.merge=Tru
 - `verl/trainer/ppo/v1/trainer_base.py:316-323`：`lora_rank > 0` 时 `ref_in_actor=True`，参考模型 log-prob 由 actor 在
   `disable_adapter()` 下计算，不构建独立 ref worker（`engine_workers.py:424`）。
 
-因此本任务在昇腾侧的工作是"NPU 上验证 + 修复 + 交付"，而非从零实现。
+本任务基于上述已有实现，补齐固定昇腾环境下的依赖修复、真实训练验证和可复现材料。
 
 ## 3. 环境与版本
 
@@ -106,20 +106,48 @@ FSDP1（`strategy=fsdp`）子集未运行；这一历史结果不能直接证明
 原始日志 `lora_merge_100step_4npu_0828T0414Z.log` 连续记录 step 1–58，进度条为 58/100、4:34:03，
 随后 `LAUNCH_WRAP_EXIT rc=0`。默认 `TOTAL_EPOCHS=1`，该版本按 `7473 // 128 = 58` 计算每 epoch 步数，
 达到 epoch 上限后正常退出。设置 `total_training_steps=100` 不会自动扩大 epoch 上限。
-当前脚本将默认 epoch 上限设置为目标步数，并检查日志中的实际训练步数；这两项修正尚待实机续训验证。
+当前脚本将默认 epoch 上限设置为目标步数，并检查日志中的实际训练步数；这两项修正已在随后恢复至100步的作业中执行。
 
 首 10 步 reward 均值为 0.3990234375，末 10 步为 0.90390625。58 步 `perf/throughput` 算术均值为
 673.807293 tokens/s/NPU，四卡合计为 2695.229173 tokens/s。验证版本 `metric_utils.py` 的定义为
 `total_num_tokens / (time_per_step * n_gpus)`；它不等于含启动、完整验证等开销的全作业吞吐，也不是纯生成速度。
 issue 没有明确要求八卡，也未定义 TPS 是整机或每卡；这里披露实际卡数和源码口径，不能据此声称已获维护者接受。
 
-最新 checkpoint 为 step 50，文件已确认存在且非空，但尚未实际加载恢复。58 步均存在非有限的
-`rollout_corr` 诊断指标，而 actor loss、grad_norm 和 reward 有限；原因与对训练的影响仍待核实。
-现有结果未满足 100 步或 12 小时要求，不能称为完整验收证据。
+该次最新checkpoint为step50，随后已成功加载并继续训练。58步均存在非有限 `rollout_corr` 指标，
+actor loss、grad_norm和reward有限；原版轨迹的数值问题不能由正常退出消除。
+
+### 6.4 原版轨迹恢复到100步（2026-09-10）
+
+固定recipe `4130a43` 从checkpoint50继续完成第51–100步，训练启动器退出0。
+统计保留原始第1–50步和续训第51–100步，排除被重新计算的原始第51–58步。首末各10步reward均值为
+0.3990234375与0.94755859375，GSM8K greedy准确率由321/1319上升至1216/1319。
+66803533个训练步token除以25897.94468626156秒和4张卡，得到644.8729214739403 tokens/s/NPU。
+该分母不含停机间隔、启动、恢复以及部分验证时间，不能表述为全作业吞吐。
+
+100步actor loss和梯度均有限、梯度均非零，但每步均有非有限rollout诊断。原始第51步有效token中有
+366个rollout `-inf`，其training log-prob有限，K3中的 `exp(log_ratio)-log_ratio-1` 因此产生366个NaN。
+关闭IS/RS时，原函数重放确认不生成importance weights且不改变response mask；这不证明生成的token正确。
+checkpoint100文件和额外状态已检查，但该checkpoint尚未实际加载模型和优化器继续训练。
+
+### 6.5 sampler生命周期对照与修复
+
+固定镜像的 vLLM-Ascend `a43c8cc8057f490ed1df2c6ed66253e2d7817da4` 在辅助stream生成随机张量 `q`，
+等待生产stream完成后由当前stream消费。`wait_stream` 建立执行顺序，却不能单独阻止分配器提前重用该内存。
+回移的[上游PR #13394](https://github.com/vllm-project/vllm-ascend/pull/13394)增加
+`q.record_stream(torch.npu.current_stream())`，其主分支合入提交为
+`fc0ce85b58f019e5a1988dbd3f39d014052fb44b`。
+
+同一物理卡0、相同镜像及脚本，以Qwen3-8B base模型、TP1、32个GSM8K prompt各采样8条序列进行对照。
+原版224621个token出现4个越界ID151669，对应log-prob均为 `-inf`；补丁组225828个token中两类异常均为0。
+tokenizer长度为151669，因此该ID位于有效范围之外。两组启动器均退出0，实际sampler差异仅新增上述一行。
+原始训练捕获没有保存response token IDs，不能把此对照逐token对应到第51步的366个异常位置。
+
+本次样本支持生命周期修复，但不排除其他低概率问题，也不代替LoRA merge、TP2完整训练。
+recipe `84142b1` 已用独立checkpoint目录启动修复后的四卡100步作业，保留save10与resumeauto；结果仍待完成。
 
 ## 7. 显存与性能分析、调参建议
 
-**显存账（每卡 64 GB，估算 vs 实测）**
+**显存占用（每卡64 GB，估算与实测对照）**
 
 | 项 | 估算 | 实测 |
 | --- | --- | --- |
@@ -150,7 +178,7 @@ merge + 权重同步 12.6 s（4.5%）。瓶颈在 rollout 生成。
 | 容器内 `torch.npu.device_count()=0`、`aclInit 507899`、`dcmi -8020 device is used` | 共享主机上昇腾驱动按容器命名空间占用设备：`--network host`/`--ipc host` 的容器与任何他人已打开的卡冲突；某张卡被另一容器 open 后到该容器 stop 前都不可用 | 容器用桥接网络 + 私有 IPC（`--shm-size 128g`）；启动前逐卡做一次真实 open 探针（`torch.npu.set_device` + 计算），释放时 `docker stop` 而不只是杀进程 |
 | `aclrtMallocHostWithCfg` 207001（主机锁页内存） | FSDP actor param/optimizer CPU offload 触发驱动侧锁页内存上限 | LoRA 路径不需要 offload；保持 `param_offload=False`、`optimizer_offload=False` |
 | Ray 告警 `/tmp/ray ... over 95% full` | 主机根分区满 | `++ray_kwargs.ray_init._temp_dir=<可写目录>` |
-| 结束时 `resource_tracker KeyError('/psm_*')` | vLLM 服务关闭期共享内存清理 | 忽略，不影响退出码 |
+| 结束时 `resource_tracker KeyError('/psm_*')` | 历史日志出现在vLLM服务关闭期 | 保留告警，结合训练启动器退出码、完成步数和checkpoint判断；不能据此忽略运行期错误。 |
 | 镜像 entrypoint `import torch` 触发对首张映射卡的 open | `/usr/local/Ascend/nnal/atb/set_env.sh` 启动时探测 torch | 只在拿到卡后再 `docker run/start`；预建容器须立即 stop |
 
 ## 9. 复现步骤
@@ -166,8 +194,9 @@ docker run -d --name verl-lora --shm-size 128g \
   -v /etc/ascend_install.info:/etc/ascend_install.info -v /etc/hccn.conf:/etc/hccn.conf \
   -v /data/work:/workspace/work -w /workspace/work \
   quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm sleep infinity
-# 2) 补丁（容器只挂部分卡时）
+# 2) verl补丁（容器只挂部分卡时），以及固定vLLM-Ascend版本必需的sampler补丁
 docker exec verl-lora bash -c 'cd /verl && git apply /workspace/work/lora_rl_merge/patches/0001-get_npu_versions-first-visible-npu-id.patch'
+docker exec verl-lora bash -c 'cd /vllm-ascend && test "$(git rev-parse HEAD)" = a43c8cc8057f490ed1df2c6ed66253e2d7817da4 && git apply --check /workspace/work/lora_rl_merge/patches/vllm-ascend/0001-record-sampler-stream.patch && git apply /workspace/work/lora_rl_merge/patches/vllm-ascend/0001-record-sampler-stream.patch'
 # 3) 数据
 docker exec verl-lora bash -c 'cd /verl && python3 examples/data_preprocess/gsm8k.py --local_save_dir /workspace/work/data/gsm8k'
 # 4) 冒烟 10 步；正式训练设置 TOTAL_TRAINING_STEPS=100，并保留默认 checkpoint 保存与自动恢复配置
@@ -180,7 +209,7 @@ python3 lora_rl_merge/tools/parse_step_metrics.py <console.log>
 
 ## 10. 限制与后续
 
-- 已有 10 步冒烟、FSDP2 单测和 58 步正式训练；完整长度、checkpoint 恢复及诊断数值边界仍未验证（第 6.3 节）。
+- 已有历史10步冒烟、FSDP2单测和原版恢复后的100步训练；sampler补丁后的完整训练仍未完成（第6.4–6.5节）。
 - 吞吐在 `enforce_eager=True`、TP 2、4 卡下测得，未做性能调优；无同配置 GPU 对照数据，性能判据按 issue 的"无 GPU 标杆时
   TPS > 100"兜底。
 - 未测：8 卡配置、FSDP1 子集、ACL graph 模式、`max_response_length 2048`。
