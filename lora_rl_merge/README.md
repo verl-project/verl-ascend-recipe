@@ -74,12 +74,12 @@ from the actor with adapters disabled (`ref_in_actor`), so no separate reference
    # 10-step smoke on 4 NPUs
    NPROC_PER_NODE=4 TOTAL_TRAINING_STEPS=10 SAVE_FREQ=-1 TEST_FREQ=-1 VAL_BEFORE_TRAIN=False \
      MODEL_PATH=/path/to/Qwen3-8B DATA_DIR=$HOME/data/gsm8k \
-     bash run_qwen3_8b_lora_merge_fsdp2_npu.sh
+     bash /path/to/lora_rl_merge/run_qwen3_8b_lora_merge_fsdp2_npu.sh
 
    # 100-step training, or continuation from the latest checkpoint in DEFAULT_LOCAL_DIR
    TOTAL_TRAINING_STEPS=100 MODEL_PATH=/path/to/Qwen3-8B DATA_DIR=$HOME/data/gsm8k \
      DEFAULT_LOCAL_DIR=$HOME/ckpts/lora_merge_100 \
-     bash run_qwen3_8b_lora_merge_fsdp2_npu.sh
+     bash /path/to/lora_rl_merge/run_qwen3_8b_lora_merge_fsdp2_npu.sh
    ```
 
    The default epoch limit equals `TOTAL_TRAINING_STEPS`, so even a filtered dataset with only one full batch
