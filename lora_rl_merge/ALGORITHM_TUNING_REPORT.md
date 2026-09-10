@@ -158,10 +158,10 @@ recipe `84142b1` 已用独立checkpoint目录启动修复后的四卡100步作�
 
 | 项 | 估算 | 实测 |
 | --- | --- | --- |
-| 基座 bf16 16.4 GB，FSDP2 4 卡分片 | ≈4.1 GB/卡常驻，前反向逐层 all-gather | 含在 32.6 GB 峰值内 |
+| 基座 bf16 16.4 GB，FSDP2 4 卡分片 | ≈4.1 GB/卡常驻，前反向逐层 all-gather | 含在 32.6 GiB 峰值内 |
 | LoRA 参数（rank 32，all-linear）≈87.3 M | fp32 主权重 + Adam + 梯度 ≈1.2 GB 总量，分片后 <0.4 GB/卡 | 无需 optimizer offload |
 | 独立 ref 模型 | 无（`ref_in_actor`） | — |
-| vLLM 唤醒时 | 0.6 × 61 GiB ≈ 37 GB | `npu-smi` 训练期 ≈50 GB/卡（含 actor） |
+| vLLM 唤醒时 | 0.6 × 61 GiB ≈ 36.6 GiB | `npu-smi` 训练期 ≈50 GB/卡（含 actor） |
 | merge 峰值 | 最大张量（embed/lm_head 151936 × 4096 bf16 ≈ 1.2 GB） | 未观察到额外峰值 |
 
 **时间分解（steps 2–10 均值）**：gen 146 s（53%）> update_actor 67 s（24%）> old_log_prob 28 s（10%）> ref 21 s（8%）>
