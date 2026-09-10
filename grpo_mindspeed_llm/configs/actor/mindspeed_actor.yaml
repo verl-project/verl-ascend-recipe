@@ -1,0 +1,17 @@
+# mindspeed actor config, inheriting from trainer/config/actor/actor.yaml
+defaults:
+  - ../optim@optim: megatron
+
+  - ../engine@mindspeed:
+      - megatron
+      - mindspeed
+
+  - actor
+
+  - _self_
+
+_target_: backend.config.MindSpeedActorConfig
+
+strategy: mindspeed
+
+load_weight: True
