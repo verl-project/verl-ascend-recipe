@@ -146,6 +146,36 @@ in the validated trainer. The current script corrects the epoch limit and checks
 此轨迹使用未修复的 sampler，不能作为当前补丁版的完整验证。checkpoint50 的恢复已实测；
 checkpoint100 仅核查文件和额外状态，尚未实际加载模型及优化器继续训练。
 
+### 修复版 sampler 的完整 100 步结果（2026-09-11，910B1 + 910B3）
+
+应用 vLLM-Ascend `record_stream` 回移补丁后的独立轨迹：第 1–90 步在 4 × 910B1 上完成，
+第 91–100 步从 `global_step_90` 自动恢复后在 4 × 910B3 上完成（原主机可用的四张卡已被其他
+使用者的容器声明，迁移过程与镜像内容等价性核对见管理仓证据目录）。两段的 verl 提交、
+vLLM-Ascend 提交、镜像内容、两个 patch 和全部训练超参一致，容器内逐字节比对了
+`runtime.patch`、`vllm-ascend-runtime.patch` 与 `packages.txt`。统计只取原运行的第 1–90 步
+与本次的第 91–100 步，排除被替代的旧第 91–99 步。容器以退出码 0 结束。
+
+| 项目 | 第 1–90 步（4 × 910B1） | 第 91–100 步（4 × 910B3） |
+| --- | --- | --- |
+| 非有限 `rollout_corr` 指标 | 0 | 0 |
+| 零梯度步 | 0 | 0 |
+| 平均步时 | 259.88 s | 261.51 s |
+| 加权吞吐（tokens/s/NPU，4 卡分母） | 702.64 | 574.36 |
+| 最低逐步吞吐 | 593.42 | 551.23 |
+
+- 首 10 步 reward 均值 0.39462890625，末 10 步（第 91–100 步）0.926953125，上升。
+- GSM8K greedy 准确率：step 0 为 322/1319（24.41%）、step 20 为 929（70.43%）、
+  step 40 为 1045（79.23%）、step 60 为 1119（84.84%）、step 80 为 1180（89.46%）、
+  step 100 为 1148（87.04%）。恢复时对同一 `global_step_90` 的验证在原主机为 1198（90.90%）、
+  在新主机为 1205（91.36%），相差 7 条样本。**第 100 步低于第 80 步与第 90 步，
+  末 10 步 reward 也在 0.8867–0.9717 之间波动；本次未做多随机种子重复，不声称第 100 步是精度上限。**
+- 对照：原版 sampler 的 100 步轨迹在全部 100 步上都有 7 项非有限 `rollout_corr` 指标
+  （`kl`、`k3_kl`、`rollout_ppl`、`rollout_log_ppl`、`log_ppl_diff`、`log_ppl_abs_diff`、
+  `log_ppl_diff_min`），本轨迹为 0。
+- 两段硬件不同，吞吐按段披露，不合并成单一 TPS 结论。两段平均步时相近（259.88 与 261.51 s），
+  吞吐差异主要来自 `response_length/mean` 由第 1 步的 895 降到第 100 步的 517 后每步 token 总量下降；
+  910B1 自身也呈同一趋势（第 1–10 步 810.54、第 81–90 步 593–651）。
+
 These are partial validation results. The issue does not explicitly require eight NPUs; neither four-card results
 nor a successful process exit establish final acceptance.
 

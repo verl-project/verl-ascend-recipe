@@ -1,4 +1,4 @@
-# lora_rl_merge — validated against the verl commit shipped in the Ascend verl image; patched sampler training is pending
+# lora_rl_merge — validated against the verl commit shipped in the Ascend verl image; the patched-sampler 100-step run is complete (2026-09-11)
 UPSTREAM=https://github.com/verl-project/verl.git
 MODE=pinned_commit
 # Exact upstream verl commit this recipe was validated on (it is the /verl checkout inside the image below).
