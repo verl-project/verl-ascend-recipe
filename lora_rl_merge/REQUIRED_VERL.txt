@@ -1,22 +1,27 @@
-# lora_rl_merge — validated against the verl commit shipped in the Ascend verl image; the patched-sampler 100-step run is complete (2026-09-11)
+# Validated software versions for Qwen3-8B LoRA merge (100 steps, 2026-09-11).
 UPSTREAM=https://github.com/verl-project/verl.git
 MODE=pinned_commit
-# Exact upstream verl commit this recipe was validated on (it is the /verl checkout inside the image below).
+# Exact upstream verl commit used in the validation run.
 COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
 PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bc72e38edba78e778bfbd462638f9634b9140a76
 GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout bc72e38edba78e778bfbd462638f9634b9140a76
-# The historical Quay tag expired. Load the validated offline archive before using IMAGE; see README.md.
-IMAGE=sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c
-IMAGE_ARCHIVE=verl-issue78-image.tar.zst
-IMAGE_ARCHIVE_SHA256=2e2f56293ed3b39f91a84dd0d28ffaff8d293dbaedb6d3ac88548e3eb2118685
-IMAGE_ARCHIVE_BYTES=4973379981
-HISTORICAL_IMAGE=quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm
 RECIPE_FOLDER=lora_rl_merge
 NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch on COMMIT when the container mounts only a subset of the NPUs (verl hard-codes 'npu-smi info -t board -i 1'); see README.md.
 REFRESH=Recompute COMMIT from the validated checkout: (cd verl && git rev-parse HEAD)
 
-# Apply the sampler fix in /vllm-ascend, not in /verl; see README.md.
+# Apply the sampler fix to the installed vLLM-Ascend source; see README.md.
 VLLM_ASCEND_COMMIT=a43c8cc8057f490ed1df2c6ed66253e2d7817da4
 VLLM_COMMIT=bcf2be96120005e9aea171927f85055a6a5c0cf6
 VLLM_ASCEND_PATCH=patches/vllm-ascend/0001-record-sampler-stream.patch
-IMAGE_ID=sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c
+
+# Reproduction requires these software versions and patches, not a matching Docker image.
+CANN_VERSION=9.0.0
+TORCH_VERSION=2.9.0
+TORCH_NPU_VERSION=2.9.0.post2
+VLLM_VERSION=0.18.0
+VLLM_ASCEND_VERSION=0.18.1.dev44
+TRANSFORMERS_VERSION=5.10.4
+PEFT_VERSION=0.20.0
+RAY_VERSION=2.56.1
+# The host driver must support CANN; this is the observed driver version, not an image requirement.
+VALIDATED_DRIVER_VERSION=26.0.rc1
