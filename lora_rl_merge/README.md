@@ -1,21 +1,17 @@
 # Qwen3-8B 的 FSDP2 LoRA merge 训练
 
-本 recipe 对应 [issue #78](https://github.com/verl-project/verl-ascend-recipe/issues/78)：
-Qwen3-8B 使用 GRPO 和 LoRA 训练，每次 rollout 权重同步前将 adapter 合并进基座模型，
-训练后端为 FSDP2，推理后端为 vLLM-Ascend。
+本示例对应 [issue #78](https://github.com/verl-project/verl-ascend-recipe/issues/78)，使用 GRPO 和 LoRA
+训练 Qwen3-8B。训练后端为 FSDP2，推理后端为 vLLM-Ascend。每次向推理模型同步权重前，
+先将 LoRA 权重合并到基座模型。
 
-2026-09-11，固定依赖及两个补丁的配置在单台 **4 × 910B3** 上从头完成连续100步。
-首末十步 reward 均值由 **0.39160 升至 0.83555**，GSM8K 验证准确率由 **24.72% 升至 80.67%**，
-按全部四卡计算的训练步吞吐为 **655.51 tokens/s/NPU**。所有已记录训练指标有限，梯度非零，
-保存了 checkpoint100，进程退出码为0。结果满足 issue 在无GPU标杆时的训练长度、reward 和TPS条款。
-
-第80步验证准确率为89.08%，第96–100步出现梯度范数增大与 reward 下降，原因尚未定位。
-不把第100步称为最优checkpoint，也不保证每次重跑得到相同曲线。
-完整方法、证据与限制见[算法适配调优文档](ALGORITHM_TUNING_REPORT.md)。
+固定配置在单台四张 Ascend 910B3 上完成连续100步训练。首末十步平均奖励从0.39160升至0.83555，
+GSM8K 验证准确率从24.72%升至80.67%，每卡训练吞吐量为655.51 tokens/s。
+第80步验证准确率为89.08%，后期准确率下降的原因尚未确定。实验方法和结果见
+[适配与验证报告](ALGORITHM_TUNING_REPORT.md)。
 
 ## 离线复算
 
-从 recipe 仓库根目录执行，仅依赖Python标准库，不需要NPU：
+在仓库根目录执行以下命令；检查程序只依赖 Python 标准库，不需要 NPU。
 
 ```bash
 python3 lora_rl_merge/tools/check_validation.py \
@@ -23,16 +19,15 @@ python3 lora_rl_merge/tools/check_validation.py \
 python3 -m unittest discover -s lora_rl_merge/tools -v
 ```
 
-[证据目录](evidence/910b3-100step/README.md)保存从原始worker日志逐字抽取的全部训练和验证指标行、
-哈希、摘要、版本来源、输入校验值、进程退出状态及checkpoint检查结果。
-检查器拒绝缺步、重复步、验证行冒充训练、缺少rollout诊断、NaN/Inf、零梯度、错误卡数分母、
-reward未上升、TPS不超过100，以及缺少初始或最终验证的结果。
+[证据目录](evidence/910b3-100step/README.md)保存指标日志、版本、文件哈希及检查点记录。
+检查程序核对训练步数、指标是否有限、梯度是否非零、奖励是否上升和每卡吞吐量是否超过100 tokens/s，
+并要求日志包含初始和最终验证结果。
 
 ## 固定环境
 
 | 组件 | 实测版本或范围 |
 | --- | --- |
-| 硬件 | 主证据为单台4 × 910B3；另有910B1的历史冒烟及续训证据。8卡与A3未验证。 |
+| 硬件 | 本次使用单台四张 Ascend 910B3。 |
 | verl | `bc72e38edba78e778bfbd462638f9634b9140a76`，0.9.0.dev0。 |
 | vLLM | `bcf2be96120005e9aea171927f85055a6a5c0cf6`，0.18.0。 |
 | vLLM-Ascend | `a43c8cc8057f490ed1df2c6ed66253e2d7817da4`，0.18.1.dev44。 |
@@ -41,16 +36,13 @@ reward未上升、TPS不超过100，以及缺少初始或最终验证的结果�
 | transformers / peft / ray | 5.10.4 / 0.20.0 / 2.56.1。 |
 
 版本声明见 [REQUIRED_VERL.txt](REQUIRED_VERL.txt)。通用 `install_verl.sh` 只安装verl，
-不会配置CANN、vLLM-Ascend或应用本recipe的补丁，不能代替完整环境准备。
+不会配置CANN、vLLM-Ascend或应用本示例的补丁，不能代替完整环境准备。
 
 ### 镜像取得与加载
 
-原Quay标签 `latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm` 在
-2026-09-11返回 `TAG_EXPIRED`，原digest也返回404。**不要把拉取该标签作为可用的安装步骤。**
-固定环境保存在离线Docker镜像 `verl-issue78-image.tar.zst` 中，大小为4,973,379,981字节，
-SHA256为 `2e2f56293ed3b39f91a84dd0d28ffaff8d293dbaedb6d3ac88548e3eb2118685`。
-接收方须先取得该归档或已经持有经校验确认的同一镜像。本Git仓库不含镜像二进制，
-仅克隆仓库不能补齐此环境前置条件。
+原 Quay 标签及摘要地址在2026-09-11均返回404，因此复现需先取得离线 Docker 镜像
+`verl-issue78-image.tar.zst`。归档大小为4,973,379,981字节，SHA256如下方命令所示。
+镜像未包含在 Git 仓库中，公共下载地址尚未提供。
 
 ```bash
 echo '2e2f56293ed3b39f91a84dd0d28ffaff8d293dbaedb6d3ac88548e3eb2118685  verl-issue78-image.tar.zst' | sha256sum -c -
@@ -61,16 +53,13 @@ test -n "$IMAGE_ID"
 python3 lora_rl_merge/tools/check_image.py "$IMAGE_ID"
 ```
 
-归档在验证主机加载后的image ID为
-`sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c`，
-原主机为 `sha256:b25fae72319d0c16451fb27afd6391f97e8734452ce369901082dd5b8956ae91`。
-导出/加载后的配置序列化存在差异，RootFS层和主要运行配置的比对见[镜像证据](evidence/910b3-100step/image.json)。
-不同image ID不能单独证明环境一致或不一致。
+镜像检查程序比较 RootFS 层和主要运行配置，详见[镜像记录](evidence/910b3-100step/image.json)。
+导出和加载可能改变配置的序列化结果，因此 image ID 不同不一定表示镜像内容不同。
 
 ### 容器、模型与数据
 
-共享主机使用bridge网络和private IPC，只映射获准设备，不停止他人容器。
-宿主驱动须满足该CANN环境要求。以下示例使用已分配的物理卡4–7：
+宿主机驱动须兼容上述 CANN 版本。以下示例使用已分配的物理卡4–7，采用 bridge 网络和 private IPC；
+在共享主机上执行时，请只映射获准使用的设备。
 
 ```bash
 WORK_DIR=/data/verl-ascend/issue78
@@ -96,8 +85,8 @@ docker exec verl-issue78 bash -lc 'cd /verl && python3 examples/data_preprocess/
 docker exec verl-issue78 bash -lc 'cd /workspace/work && sha256sum -c lora_rl_merge/evidence/910b3-100step/inputs.sha256'
 ```
 
-校验覆盖模型权重、配置、tokenizer和两个parquet文件。哈希不同意味着输入身份尚未核对，
-不能直接继承本次实验结论；重新生成的parquet也可能因序列化版本不同而有不同字节内容。
+校验覆盖模型权重、配置、分词器和两个 Parquet 数据文件。若哈希不同，需核对输入内容；
+Parquet 文件也可能仅因序列化版本不同而产生字节差异。
 
 ### 应用两个依赖补丁
 
@@ -119,13 +108,13 @@ docker exec verl-issue78 bash -lc '
 
 设备探测补丁查询 `npu-smi info -m` 中首个可见物理卡，解决只挂部分卡时硬编码卡1的失败。
 原函数忽略 `ASCEND_VISIBLE_DEVICES`，设置它不能替代补丁。
-sampler补丁调用 `q.record_stream(...)`，回移上游
+采样器补丁调用 `q.record_stream(...)`，回移上游
 [PR #13394](https://github.com/vllm-project/vllm-ascend/pull/13394) 的张量生命周期修复。
 
 ## 运行完整100步
 
-正式运行使用与单机实测相同的训练脚本及超参。首次使用全新checkpoint目录，
-中断后重跑同一命令，由 `RESUME_MODE=auto` 恢复最近checkpoint。不要用已有实验目录冒充从头训练。
+以下命令使用实测的训练脚本和超参数。首次运行应使用新的检查点目录；中断后可重跑同一命令，
+由 `RESUME_MODE=auto` 恢复最近的检查点。
 
 ```bash
 docker exec verl-issue78 bash -lc '
@@ -139,18 +128,14 @@ docker exec verl-issue78 bash -lc '
 '
 ```
 
-默认 `TOTAL_EPOCHS=TOTAL_TRAINING_STEPS` 提供足够epoch容量，训练仍在目标步数停止。
-脚本保存独立 `training.*.log`，保留训练失败退出码，并拒绝未到目标步的正常提前退出。
-它只验证本次调用的连续更新和最终步号。无中断的完整日志可直接交给 `tools/check_validation.py`；
-续训证据须先按实际checkpoint选择唯一的1–100步轨迹，剔除被重算的更新。
-Ray转发日志缺行时，应保留对应TaskRunner的原始worker日志，不能用进度条补齐指标。
+默认 `TOTAL_EPOCHS=TOTAL_TRAINING_STEPS` 确保数据遍历次数足够，训练在目标步数停止。
+脚本保存 `training.*.log`，保留训练失败的退出码，并检查本次调用的训练步是否连续、是否达到目标步数。
+无中断的完整日志可直接用 `tools/check_validation.py` 检查。若训练曾中断，需根据实际恢复的检查点
+整理第1–100步记录，排除恢复时重复计算的步骤。若 Ray 转发的日志缺行，应保留 TaskRunner 的原始日志。
 
-作业结束后核对 `latest_checkpointed_iteration.txt`、模型/优化器分片及额外状态、最终验证和退出码。
-保存结果后停止本方容器释放设备。checkpoint100文件检查不等于实际加载恢复测试。
+训练结束后，核对 `latest_checkpointed_iteration.txt`、模型和优化器分片、额外状态、最终验证及退出码，
+保存结果后停止本方容器。检查点文件完整不等于实际恢复训练成功，本次未测试从第100步检查点恢复训练。
 
-## 交付边界
-
-吞吐定义为 `sum(perf/total_num_tokens) / sum(perf/time_per_step) / 4`，不含全部启动和验证开销，
-不是纯生成速度。无GPU基线，不主张达到A100的某个比例。
-历史FSDP2单测有6项NPU通过记录，不据此主张FSDP1、8卡、A3或当前上游CI已获验证。
-按issue定义，最终完成还需要PR合入及实践文档提交到issue，本地结果不替代维护者接受。
+吞吐量按 `sum(perf/total_num_tokens) / sum(perf/time_per_step) / 4` 计算，仅统计训练步，
+不代表全任务吞吐量或纯生成速度。本次未验证 GPU 对比、八卡或 A3 配置。
+按照 issue 的要求，最终完成还需合入 PR 并向 issue 提交实践文档。
