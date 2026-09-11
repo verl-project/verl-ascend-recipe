@@ -1,13 +1,21 @@
 # Qwen3-8B 的 FSDP2 LoRA merge 训练
 
-本示例对应 [issue #78](https://github.com/verl-project/verl-ascend-recipe/issues/78)，使用 GRPO 和 LoRA
-训练 Qwen3-8B。训练后端为 FSDP2，推理后端为 vLLM-Ascend。每次向推理模型同步权重前，
-先将 LoRA 权重合并到基座模型。
+本示例对应 [issue #78](https://github.com/verl-project/verl-ascend-recipe/issues/78)。
+每次向推理模型同步权重前，先将 LoRA 权重合并到基座模型。
 
-固定配置在单台四张 Ascend 910B3 上完成连续100步训练。首末十步平均奖励从0.39160升至0.83555，
-GSM8K 验证准确率从24.72%升至80.67%，每卡训练吞吐量为655.51 tokens/s。
-第80步验证准确率为89.08%，后期准确率下降的原因尚未确定。实验方法和结果见
-[适配与验证报告](ALGORITHM_TUNING_REPORT.md)。
+- 模型与算法：Qwen3-8B，GRPO + LoRA。
+- 训练后端：FSDP2。
+- 推理后端：vLLM-Ascend。
+
+固定配置已在单台四张 Ascend 910B3 上完成连续100步训练。
+
+| 指标 | 结果 |
+| --- | --- |
+| 首末十步平均奖励 | 0.39160 → 0.83555 |
+| GSM8K 验证准确率 | 24.72% → 80.67% |
+| 每卡训练吞吐量 | 655.51 tokens/s |
+
+第80步验证准确率为89.08%，后期下降原因尚未确定。详见[适配与验证报告](ALGORITHM_TUNING_REPORT.md)。
 
 ## 离线复算
 
@@ -20,29 +28,35 @@ python3 -m unittest discover -s lora_rl_merge/tools -v
 ```
 
 [证据目录](evidence/910b3-100step/README.md)保存指标日志、版本、文件哈希及检查点记录。
-检查程序核对训练步数、指标是否有限、梯度是否非零、奖励是否上升和每卡吞吐量是否超过100 tokens/s，
-并要求日志包含初始和最终验证结果。
+检查项目：
+
+- 训练步连续，指标有限，梯度非零。
+- 末十步平均奖励高于首十步，每卡吞吐量超过100 tokens/s。
+- 初始和最终验证结果完整。
 
 ## 固定环境
 
 | 组件 | 实测版本或范围 |
 | --- | --- |
-| 硬件 | 本次使用单台四张 Ascend 910B3。 |
-| verl | `bc72e38edba78e778bfbd462638f9634b9140a76`，0.9.0.dev0。 |
-| vLLM | `bcf2be96120005e9aea171927f85055a6a5c0cf6`，0.18.0。 |
-| vLLM-Ascend | `a43c8cc8057f490ed1df2c6ed66253e2d7817da4`，0.18.1.dev44。 |
-| torch / torch_npu | 2.9.0 / 2.9.0.post2。 |
-| CANN / 驱动 | 9.0.0 / 26.0.rc1。 |
-| transformers / peft / ray | 5.10.4 / 0.20.0 / 2.56.1。 |
+| 硬件 | 单台，4 × Ascend 910B3 |
+| verl | `bc72e38edba78e778bfbd462638f9634b9140a76`，0.9.0.dev0 |
+| vLLM | `bcf2be96120005e9aea171927f85055a6a5c0cf6`，0.18.0 |
+| vLLM-Ascend | `a43c8cc8057f490ed1df2c6ed66253e2d7817da4`，0.18.1.dev44 |
+| torch / torch_npu | 2.9.0 / 2.9.0.post2 |
+| CANN / 驱动 | 9.0.0 / 26.0.rc1 |
+| transformers / peft / ray | 5.10.4 / 0.20.0 / 2.56.1 |
 
 版本声明见 [REQUIRED_VERL.txt](REQUIRED_VERL.txt)。通用 `install_verl.sh` 只安装verl，
 不会配置CANN、vLLM-Ascend或应用本示例的补丁，不能代替完整环境准备。
 
 ### 镜像取得与加载
 
-原 Quay 标签及摘要地址在2026-09-11均返回404，因此复现需先取得离线 Docker 镜像
-`verl-issue78-image.tar.zst`。归档大小为4,973,379,981字节，SHA256如下方命令所示。
-镜像未包含在 Git 仓库中，公共下载地址尚未提供。
+原 Quay 标签及摘要地址在2026-09-11均返回404。复现需先取得离线 Docker 镜像：
+
+- 文件：`verl-issue78-image.tar.zst`。
+- 大小：4,973,379,981字节。
+- 校验：SHA256 见下方命令。
+- 获取状态：未包含在 Git 仓库中，尚无公共下载地址。
 
 ```bash
 echo '2e2f56293ed3b39f91a84dd0d28ffaff8d293dbaedb6d3ac88548e3eb2118685  verl-issue78-image.tar.zst' | sha256sum -c -
@@ -76,9 +90,14 @@ docker run -d --name verl-issue78 --network bridge --ipc private --shm-size 128g
   "$IMAGE_ID" -lc 'sleep infinity'
 ```
 
-将本仓库的 `lora_rl_merge/` 复制到 `$WORK_DIR/lora_rl_merge/`，将
-[`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) 权重及tokenizer放到
-`$WORK_DIR/models/Qwen3-8B/`。在容器内用固定verl预处理器生成GSM8K数据：
+先准备以下文件：
+
+| 内容 | 宿主机目标目录 |
+| --- | --- |
+| 本仓库的 `lora_rl_merge/` | `$WORK_DIR/lora_rl_merge/` |
+| [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) 权重和分词器 | `$WORK_DIR/models/Qwen3-8B/` |
+
+再在容器内生成 GSM8K 数据，并校验模型和数据文件：
 
 ```bash
 docker exec verl-issue78 bash -lc 'cd /verl && python3 examples/data_preprocess/gsm8k.py --local_save_dir /workspace/work/data/gsm8k'
@@ -106,15 +125,17 @@ docker exec verl-issue78 bash -lc '
 '
 ```
 
-设备探测补丁查询 `npu-smi info -m` 中首个可见物理卡，解决只挂部分卡时硬编码卡1的失败。
-原函数忽略 `ASCEND_VISIBLE_DEVICES`，设置它不能替代补丁。
-采样器补丁调用 `q.record_stream(...)`，回移上游
-[PR #13394](https://github.com/vllm-project/vllm-ascend/pull/13394) 的张量生命周期修复。
+两个补丁的作用：
+
+- **设备探测**：查询首个可见物理卡，修复硬编码卡1导致的失败。原函数不读取 `ASCEND_VISIBLE_DEVICES`，设置该变量不能替代补丁。
+- **采样器**：调用 `q.record_stream(...)`，回移上游 [PR #13394](https://github.com/vllm-project/vllm-ascend/pull/13394) 的张量生命周期修复。
 
 ## 运行完整100步
 
-以下命令使用实测的训练脚本和超参数。首次运行应使用新的检查点目录；中断后可重跑同一命令，
-由 `RESUME_MODE=auto` 恢复最近的检查点。
+以下命令使用实测的训练脚本和超参数。
+
+- 首次运行：使用新的检查点目录。
+- 中断恢复：重跑同一命令，由 `RESUME_MODE=auto` 加载最近的检查点。
 
 ```bash
 docker exec verl-issue78 bash -lc '
@@ -128,14 +149,25 @@ docker exec verl-issue78 bash -lc '
 '
 ```
 
-默认 `TOTAL_EPOCHS=TOTAL_TRAINING_STEPS` 确保数据遍历次数足够，训练在目标步数停止。
-脚本保存 `training.*.log`，保留训练失败的退出码，并检查本次调用的训练步是否连续、是否达到目标步数。
-无中断的完整日志可直接用 `tools/check_validation.py` 检查。若训练曾中断，需根据实际恢复的检查点
-整理第1–100步记录，排除恢复时重复计算的步骤。若 Ray 转发的日志缺行，应保留 TaskRunner 的原始日志。
+默认 `TOTAL_EPOCHS=TOTAL_TRAINING_STEPS` 确保数据遍历次数足够。训练仍在目标步数停止。
+脚本保存 `training.*.log`、保留失败退出码，并检查训练步数。
 
-训练结束后，核对 `latest_checkpointed_iteration.txt`、模型和优化器分片、额外状态、最终验证及退出码，
-保存结果后停止本方容器。检查点文件完整不等于实际恢复训练成功，本次未测试从第100步检查点恢复训练。
+### 日志与结束检查
 
-吞吐量按 `sum(perf/total_num_tokens) / sum(perf/time_per_step) / 4` 计算，仅统计训练步，
-不代表全任务吞吐量或纯生成速度。本次未验证 GPU 对比、八卡或 A3 配置。
+| 情况 | 处理方法 |
+| --- | --- |
+| 训练未中断 | 用 `tools/check_validation.py` 检查完整日志 |
+| 训练曾中断 | 按实际恢复的检查点整理第1–100步记录，排除重复计算的步骤 |
+| Ray 转发日志缺行 | 保留 TaskRunner 原始日志 |
+
+训练结束后，核对以下内容：
+
+- 最终步数：`latest_checkpointed_iteration.txt`。
+- 检查点：模型分片、优化器分片和额外状态。
+- 执行结果：最终验证和进程退出码。
+
+保存结果后停止本方容器。本次只检查了第100步检查点文件，尚未测试从该检查点恢复训练。
+
+吞吐量按 `sum(perf/total_num_tokens) / sum(perf/time_per_step) / 4` 计算。
+它仅统计训练步，不代表全任务吞吐量或纯生成速度。本次未验证 GPU 对比、八卡或 A3 配置。
 按照 issue 的要求，最终完成还需合入 PR 并向 issue 提交实践文档。
