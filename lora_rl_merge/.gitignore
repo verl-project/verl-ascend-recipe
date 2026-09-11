@@ -1,2 +1,3 @@
-# Keep the small, reviewed metric extract as part of the reproducible evidence.
+# Keep reviewed training logs as part of the reproducible evidence.
 !evidence/910b3-100step/metrics.log
+!evidence/910b3-100step/training_100step.log

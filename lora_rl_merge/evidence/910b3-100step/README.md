@@ -10,6 +10,8 @@
 
 | 文件 | 内容 |
 | --- | --- |
+| [training_100step.log](training_100step.log) | 完整 TaskRunner 日志，保留配置、初始化、全部训练步和最终验证 |
+| [log_sanitization.json](log_sanitization.json) | 脱敏规则、原始与公开文件哈希、行数及指标一致性检查 |
 | `metrics.log` | 原始指标行 |
 | `summary.json` | 指标复算结果 |
 | `provenance.json` | 源码和依赖版本；日志、脚本和补丁哈希 |
@@ -18,6 +20,10 @@
 | `checkpoint100.json` | 第100步检查点的文件及元数据；未测试恢复训练 |
 | `image.json` | 实测镜像的历史记录；镜像一致性不作为复现要求 |
 | `training-curves.png` / `.svg` | 训练曲线 |
+
+完整日志只将两处内部 IP 替换为 `[REDACTED_INTERNAL_IP]`，992行全部保留。
+101个指标行与 `metrics.log` 逐字一致。该文件是 TaskRunner 的完整输出，不包含其他分布式进程的单独日志。
+容器退出状态另见 `process.json`。
 
 在仓库根目录执行以下命令，即可复算并比较结果。
 
@@ -37,3 +43,12 @@ python3 lora_rl_merge/tools/plot_validation.py \
 
 实测代码版本见 `provenance.json` 的 `validated_recipe_commit`。此后只更正了训练脚本注释，
 可执行命令、超参数和两份依赖补丁均未改变。后期准确率下降及实验限制见[验证报告](../../ALGORITHM_TUNING_REPORT.md)。
+
+完整日志也可直接复算：
+
+```bash
+python3 lora_rl_merge/tools/check_validation.py \
+  lora_rl_merge/evidence/910b3-100step/training_100step.log --devices 4
+```
+
+两份日志的 `log_sha256` 不同，其余复算结果一致。

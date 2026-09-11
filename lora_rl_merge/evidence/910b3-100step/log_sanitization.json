@@ -1,0 +1,16 @@
+{
+  "source_log_sha256": "b4273bb72860b9833fea873783acb833ea09f9f0f003e871adcb5a4d612ac95d",
+  "source_log_bytes": 443069,
+  "public_log_sha256": "c164af433b5671c83519c5ac9dacf4b65be6c30ba86697e52191745a3c070adc",
+  "public_log_bytes": 443093,
+  "source_line_count": 992,
+  "public_line_count": 992,
+  "metric_line_count": 101,
+  "redactions": {
+    "internal_ipv4": 2
+  },
+  "policy": "Replace two internal IPv4 addresses with [REDACTED_INTERNAL_IP]. Preserve every line, timestamp, configuration value other than these addresses, warning and metric. No lines are removed.",
+  "metric_lines_byte_identical": true,
+  "validation_results_identical": true,
+  "scope": "Complete TaskRunner stdout log. Other distributed worker logs and container exit state are separate artifacts."
+}

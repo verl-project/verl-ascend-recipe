@@ -27,7 +27,7 @@ python3 lora_rl_merge/tools/check_validation.py \
 python3 -m unittest discover -s lora_rl_merge/tools -v
 ```
 
-[证据目录](evidence/910b3-100step/README.md)保存指标日志、版本、文件哈希及检查点记录。
+[证据目录](evidence/910b3-100step/README.md)保存[完整训练日志](evidence/910b3-100step/training_100step.log)、指标摘录、版本和检查点记录。
 检查项目：
 
 - 训练步连续，指标有限，梯度非零。

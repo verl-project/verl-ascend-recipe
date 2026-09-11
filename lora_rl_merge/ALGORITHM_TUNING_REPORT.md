@@ -81,7 +81,8 @@
 
 ## 实测结果
 
-[metrics.log](evidence/910b3-100step/metrics.log)包含全部训练和验证指标行，
+[完整日志](evidence/910b3-100step/training_100step.log)保留配置、初始化、训练和最终验证。
+[metrics.log](evidence/910b3-100step/metrics.log)提取全部训练和验证指标行，
 [summary.json](evidence/910b3-100step/summary.json)保存复算结果。
 
 | 检查项 | 结果 |
