@@ -1,0 +1,26 @@
+{
+  "utc": "2026-09-10T20:03:15.514126+00:00",
+  "source_image_id": "sha256:b25fae72319d0c16451fb27afd6391f97e8734452ce369901082dd5b8956ae91",
+  "local_image_id": "sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c",
+  "rootfs_layers_sha256": "10af7da80052e6f6798c873b6eb237709c585c13e98a94ad3db991aa789f1ace",
+  "runtime_config_fields_sha256": "11b951b2af330916afc5b3e08fdfa534cac24d74207d4245eda1c461a64c2fed",
+  "created": "2026-07-29T17:07:32.384532212Z",
+  "architecture": "arm64",
+  "os": "linux",
+  "layer_count": 12,
+  "layers": [
+    "sha256:caa9956c50e9facf65021733bc7890b61ce94076388533506c80c8ae1b603db4",
+    "sha256:1c4cd041a3ee7fecd901028a08ed5c2915c4bac79c53aa90f142f447757f8f84",
+    "sha256:c577de18433aa406b226dfc42ebf6b7b78db16fdd36dec2bfec42e025c1976d1",
+    "sha256:9878168cba2dd4e939d1195d9dcff9dcd6058c95692d406cae5b7acc172e8749",
+    "sha256:5fb7ac84837dfca7947cd7068539f8cb4240424169217163c0a2a7bdb99bf6dc",
+    "sha256:f829687799251922b64d9a0976fe5b908a62c026ce32f36d3b8e3715a3a108d7",
+    "sha256:71479c368a7a9a863d44ba6b20a314ef19d3371b9774953940385c960bc1e93e",
+    "sha256:45155f25782ff2c0d6cda3e6f1dbdf4db72ed119f141cf6fce2a3b3da5618425",
+    "sha256:9ef3dcca6646b66656e51bb80bc2a84ba6c617c6b94a4296a894ce55bee35fcf",
+    "sha256:95b5bd4b9ff7cdc93d3574e114c55a9f405300d19c2c36e516e22b965112ee85",
+    "sha256:e844e8ed36df9e4807f47089c524ab330104b91d98e850edd0fd0e8f31cbf56a",
+    "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+  ],
+  "id_difference_cause": "docker save/load normalises absent config fields between empty values and null, which changes the config digest only."
+}

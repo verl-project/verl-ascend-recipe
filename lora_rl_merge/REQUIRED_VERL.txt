@@ -5,13 +5,18 @@ MODE=pinned_commit
 COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
 PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bc72e38edba78e778bfbd462638f9634b9140a76
 GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout bc72e38edba78e778bfbd462638f9634b9140a76
-# Container image used for validation (verl + vllm-ascend + CANN 9.0.0, Atlas 800T A2 / 910B):
-IMAGE=quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm
+# The historical Quay tag expired. Load the validated offline archive before using IMAGE; see README.md.
+IMAGE=sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c
+IMAGE_ARCHIVE=verl-issue78-image.tar.zst
+IMAGE_ARCHIVE_SHA256=2e2f56293ed3b39f91a84dd0d28ffaff8d293dbaedb6d3ac88548e3eb2118685
+IMAGE_ARCHIVE_BYTES=4973379981
+HISTORICAL_IMAGE=quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm
 RECIPE_FOLDER=lora_rl_merge
 NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch on COMMIT when the container mounts only a subset of the NPUs (verl hard-codes 'npu-smi info -t board -i 1'); see README.md.
 REFRESH=Recompute COMMIT from the validated checkout: (cd verl && git rev-parse HEAD)
 
 # Apply the sampler fix in /vllm-ascend, not in /verl; see README.md.
 VLLM_ASCEND_COMMIT=a43c8cc8057f490ed1df2c6ed66253e2d7817da4
+VLLM_COMMIT=bcf2be96120005e9aea171927f85055a6a5c0cf6
 VLLM_ASCEND_PATCH=patches/vllm-ascend/0001-record-sampler-stream.patch
-IMAGE_ID=sha256:b25fae72319d0c16451fb27afd6391f97e8734452ce369901082dd5b8956ae91
+IMAGE_ID=sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c

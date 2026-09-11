@@ -2,22 +2,22 @@
 # GRPO + LoRA with merge | Qwen3-8B | gsm8k | vLLM-Ascend rollout | FSDP2 training | Ascend A2 (910B) NPUs
 #
 # Ported from verl `examples/tuning/lora/run_qwen3_8b_merge_fsdp.sh` (GPU, 8 cards). Algorithm and LoRA
-# hyper-parameters are kept identical; only the NPU launch items differ (trainer.device=npu, Ascend env vars,
-# eager vLLM, no uv wrapper). With `model.lora.merge=True` the adapters are merged into the base weights before
+# hyper-parameters are kept identical. NPU launch items, epoch capacity, checkpoint/evaluation cadence and
+# completion checks are adapted; see README.md. With `model.lora.merge=True` adapters merge into base weights before
 # every rollout weight sync, so vLLM-Ascend receives plain full weights and no inference-side LoRA support is needed.
 #
-# Validated on 4 x 910B1 (64 GB HBM), see README.md: 10-step smoke ~277 s/step, ~825 tokens/s/NPU,
-# reward 0.23 -> 0.60, actor peak HBM 32.6 GB. All knobs are env-overridable.
+# Validated for 100 steps on 4 x 910B3; see README.md for reward, throughput and late-training instability.
+# All knobs are env-overridable; changed configurations need their own validation.
 set -xeuo pipefail
 
 # ---- user-adjustable ----
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-8B}
 DATA_DIR=${DATA_DIR:-$HOME/data/gsm8k}
 NNODES=${NNODES:-1}
-NPROC_PER_NODE=${NPROC_PER_NODE:-4}      # 4 x 910B1 validated; rollout_tp must divide it
+NPROC_PER_NODE=${NPROC_PER_NODE:-4}      # Four-card validation; rollout_tp must divide it
 
-# Ascend: container-logical NPU ids are 0..N-1. PHYS_CARDS (e.g. "4,5,6,7") only feeds the fallback path of the
-# unpatched verl get_npu_versions() when the container mounts a subset of cards (see patches/ and README.md).
+# Ascend: container-logical NPU ids are 0..N-1. PHYS_CARDS records physical card IDs (e.g. "4,5,6,7").
+# The validated get_npu_versions() patch queries npu-smi; ASCEND_VISIBLE_DEVICES cannot replace that patch.
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((NPROC_PER_NODE-1)))}
 export ASCEND_VISIBLE_DEVICES=${PHYS_CARDS:-$ASCEND_RT_VISIBLE_DEVICES}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-5400}
