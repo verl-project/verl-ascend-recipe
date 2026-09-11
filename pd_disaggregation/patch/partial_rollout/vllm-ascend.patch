@@ -1,0 +1,79 @@
+diff --git a/tests/ut/kv_offload/test_mooncake_connector.py b/tests/ut/kv_offload/test_mooncake_connector.py
+--- a/tests/ut/kv_offload/test_mooncake_connector.py
++++ b/tests/ut/kv_offload/test_mooncake_connector.py
+@@ -1370,6 +1370,31 @@ class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
+         self.assertTrue(async_flag)
+         self.assertEqual(request.kv_transfer_params["num_computed_tokens"], 0)
+ 
++    def test_remote_decode_truncates_before_prefix_cache_lookup(self):
++        self.scheduler.need_truncate = True
++        request = MockRequest(
++            "req1",
++            prompt_token_ids=[1, 2, 3, 4],
++            kv_transfer_params={"do_remote_decode": True},
++        )
++        request.prompt_embeds = None
++        request._all_token_ids = request.prompt_token_ids.copy()
++        request.num_prompt_tokens = len(request.prompt_token_ids)
++        request.max_tokens = 32
++        request.block_hashes = ["old-prompt-hash"]
++        request.update_block_hashes = MagicMock(
++            side_effect=lambda: request.block_hashes.append("short-prompt-hash")
++        )
++
++        self.scheduler.on_new_request(request)
++
++        self.assertEqual(request.prompt_token_ids, [1, 2, 3])
++        self.assertEqual(request._all_token_ids, [1, 2, 3])
++        self.assertEqual(request.num_prompt_tokens, 3)
++        self.assertEqual(request.max_tokens, 1)
++        self.assertEqual(request.block_hashes, ["short-prompt-hash"])
++        self.assertTrue(request.kv_transfer_params["_p_side_truncated"])
++
+     def test_build_connector_meta(self):
+         request = MockRequest("req1")
+         self.scheduler._reqs_need_recv["req1"] = (request, [4, 5, 6], [0, 4, 5, 6], 48)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -1522,6 +1522,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+     # Scheduler Side Methods
+     ############################################################
+ 
++    def on_new_request(self, request: "Request") -> None:
++        assert self.connector_scheduler is not None
++        self.connector_scheduler.on_new_request(request)
++
+     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+         assert self.connector_scheduler is not None
+         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+@@ -1779,8 +1783,19 @@ class MooncakeConnectorScheduler:
+             request._all_token_ids.pop()
+             request.num_prompt_tokens -= 1
+             request.max_tokens = 1
++            # on_new_request runs after Request initially builds its hashes.
++            # Rebuild them for the shortened P-side prompt so prefix-cache
++            # lookup cannot return more computed tokens than the request now
++            # contains on a later rollout.
++            request.block_hashes.clear()
++            request.update_block_hashes()
+             params["_p_side_truncated"] = True
+ 
++    def on_new_request(self, request: "Request") -> None:
++        params = request.kv_transfer_params
++        if params is not None and params.get("do_remote_decode") and self.need_truncate:
++            self._truncate_request_for_prefill(request)
++
+     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+         """
+         For remote prefill, pull all prompt blocks from remote
+@@ -1813,9 +1828,6 @@ class MooncakeConnectorScheduler:
+             if count > 0:
+                 return count, True
+ 
+-        if params is not None and params.get("do_remote_decode") and self.need_truncate:
+-            self._truncate_request_for_prefill(request)
+-
+         # No remote prefill for this request.
+         return 0, False
+

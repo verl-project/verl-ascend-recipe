@@ -14,8 +14,8 @@
 """Plain-Python load-balancer state machine for elastic rollout.
 
 ``_LoadBalancerCore`` is a new class kept in the recipe (it does not exist in
-verl@dfc01f85). It is wrapped by verl's native ``GlobalRequestLoadBalancer``
-Ray actor via the ``patch.llm_server`` decorators, so the state machine is
+verl@dfc01f85). It is wrapped by the recipe-owned ``ElasticGlobalRequestLoadBalancer``
+Ray actor defined in ``patch.llm_server``, so the state machine is
 unit-testable without ``ray.init()``.
 """
 
@@ -29,7 +29,7 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 class _LoadBalancerCore:
     """Plain-Python state machine for load balancing.
 
-    Wrapped by `GlobalRequestLoadBalancer` (Ray actor) for remote access.
+    Wrapped by `ElasticGlobalRequestLoadBalancer` (Ray actor) for remote access.
     Splitting the logic from the Ray decorator makes it unit-testable without
     `ray.init()`, while keeping the Ray actor as a thin forwarder.
 
@@ -104,6 +104,10 @@ class _LoadBalancerCore:
         if server_id in self._server or server_id in self._inflight:
             self._dead.add(server_id)
         # If server_id is unknown entirely, silently no-op (idempotent on unknown ids).
+
+    def set_fault_tolerance(self, enabled: bool) -> None:
+        """Toggle fault-tolerant semantics (lenient release, dead-set routing)."""
+        self._ft = bool(enabled)
 
     def add_servers(self, servers: dict) -> None:
         """Register new servers. Idempotent on existing ids. Resurrect dead ids."""

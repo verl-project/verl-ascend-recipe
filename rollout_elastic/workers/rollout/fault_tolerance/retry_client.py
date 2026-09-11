@@ -178,11 +178,12 @@ class RetryLLMServerClient(LLMServerClient):
                 except Exception as e:
                     if not is_transient_fault(e):
                         raise
-                    print(
-                        f"RetryLLMServerClient: progress store unavailable"
-                        f"({type(e).__name__}), degrading to fresh attempt"
-                        f"(run={self._run_id}, recovery_id={recovery_id})",
-                        flush=True,
+                    logger.warning(
+                        "[FT] RetryLLMServerClient: progress store unavailable (%s), "
+                        "degrading to fresh attempt (run=%s, recovery_id=%s)",
+                        type(e).__name__,
+                        self._run_id,
+                        recovery_id,
                     )
                 else:
                     checkpoint = result.checkpoint
@@ -190,18 +191,17 @@ class RetryLLMServerClient(LLMServerClient):
                     prefix_for_call = checkpoint.resume_prefix_token_ids()
                     call_sampling = copy.deepcopy(original_sampling)
                     call_sampling["max_tokens"] = checkpoint.remaining_max_tokens()
-                    logger.info(
-                        "[progress] run=%s, rid=%s, attempt=%d, outcome=%s, inherited_len=%d"
-                        "prefix_len=%d remaining_max_tokens=%d (%s)",
-                        self._run_id,
-                        recovery_id,
-                        result.attempt_id,
-                        result.outcome.name,
-                        result.inherited_prefix_len,
-                        len(prefix_for_call),
-                        checkpoint.remaining_max_tokens(),
-                        result.failure_detail or "-",
-                    )
+                    if result.inherited_prefix_len > 0:
+                        logger.warning(
+                            "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
+                            "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
+                            result.inherited_prefix_len,
+                            self._run_id,
+                            recovery_id,
+                            result.attempt_id,
+                            len(prefix_for_call),
+                            call_sampling.get("max_tokens"),
+                        )
             try:
                 output, server_id = await self._generate_once(
                     request_id,
@@ -222,15 +222,26 @@ class RetryLLMServerClient(LLMServerClient):
                     raise
                 retries += 1
                 if retries > max_retries:
+                    logger.warning(
+                        "[FT] prompt retries exhausted: request_id=%s failed_server=%s "
+                        "retries=%d/%d, raising AllServersFailed",
+                        request_id,
+                        e.server_id,
+                        retries,
+                        max_retries,
+                    )
                     raise AllServersFailed(
                         f"RetryLLMServerClient: retries exhausted after {retries} attempts"
                     ) from None
                 logger.warning(
-                    "RetryLLMServerClient: server %s failed (%s), retries %d/%d",
-                    e.server_id,
-                    type(e.cause).__name__ if e.cause is not None else "server-fault",
+                    "[FT] prompt retry %d/%d: server %s failed (%s: %s) for request_id=%s, "
+                    "resetting to original prompt and retrying on a fresh server",
                     retries,
                     max_retries,
+                    e.server_id,
+                    type(e.cause).__name__ if e.cause is not None else "server-fault",
+                    e.cause,
+                    request_id,
                 )
                 continue
 
@@ -263,4 +274,14 @@ class RetryLLMServerClient(LLMServerClient):
                 final = output
             final.extra_fields["llm_generate_attempts"] = retries + 1
             final.extra_fields["llm_generate_retries"] = retries
+            if retries > 0:
+                logger.warning(
+                    "[FT] RetryLLMServerClient.generate completed after recovery: request_id=%s "
+                    "attempts=%d retries=%d tokens=%d stop_reason=%s",
+                    request_id,
+                    retries + 1,
+                    retries,
+                    len(final.token_ids),
+                    final.stop_reason,
+                )
             return final

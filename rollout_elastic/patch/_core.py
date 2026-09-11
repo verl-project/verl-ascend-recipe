@@ -86,7 +86,7 @@ def _register_actor_method(target: type, name: str, method: Callable) -> None:
     from ray._common.signature import extract_signature
 
     method_meta.methods[name] = method
-    method_meta.signatures[name] = extract_signature(method, ignores_first=True)
+    method_meta.signatures[name] = extract_signature(method, ignore_first=True)
     method_meta.decorators[name] = None
     method_meta.method_is_generator[name] = False
     method_meta.num_returns[name] = None

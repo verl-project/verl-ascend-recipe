@@ -1,5 +1,8 @@
 #!/bin/bash
 # Project Configuration
+
+export VLLM_ASCEND_TASK_QUEUE_ENABLE=0
+
 project_name='DeepSeek-V4-Flash'
 exp_name='DeepSeek-V4-Flash-8-nodes'
 
@@ -198,10 +201,10 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.attention_dropout=0.0
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.init_method_std=0.02
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.hidden_dropout=0.0
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.position_embedding_type=g2
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.position_embedding_type=deepseek4
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.normalization=RMSNorm
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_rotary_pos_emb=True
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_rotary_position_embeddings=True
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_rotary_pos_emb=False
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_rotary_position_embeddings=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_swiglu=True
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_rmsnorm=True
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.swiglu=True

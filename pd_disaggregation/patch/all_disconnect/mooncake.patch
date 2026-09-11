@@ -1,0 +1,212 @@
+diff --git a/mooncake-integration/CMakeLists.txt b/mooncake-integration/CMakeLists.txt
+index 10c9284e..d691f524 100644
+--- a/mooncake-integration/CMakeLists.txt
++++ b/mooncake-integration/CMakeLists.txt
+@@ -164,4 +164,8 @@ endif()
+ if (WITH_TE)
+     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+     install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
++    if (USE_ASCEND_DIRECT)
++        install(FILES $<TARGET_FILE:ascend_transport>
++                DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
++    endif()
+ endif()
+diff --git a/mooncake-integration/transfer_engine/transfer_engine_py.cpp b/mooncake-integration/transfer_engine/transfer_engine_py.cpp
+index b193302e..e5fbcbcf 100644
+--- a/mooncake-integration/transfer_engine/transfer_engine_py.cpp
++++ b/mooncake-integration/transfer_engine/transfer_engine_py.cpp
+@@ -21,6 +21,10 @@
+ #include <pybind11/stl.h>
+ #include "transport/rpc_communicator/rpc_interface.h"
+ 
++#ifdef USE_ASCEND_DIRECT
++#include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
++#endif
++
+ #ifdef USE_MNNVL
+ #include "transport/nvlink_transport/nvlink_transport.h"
+ #endif
+@@ -98,6 +102,26 @@ TransferEnginePy::~TransferEnginePy() {
+     large_buffer_list_.clear();
+ }
+ 
++int TransferEnginePy::disconnectAllPeers() {
++#ifdef USE_ASCEND_DIRECT
++    if (!engine_) {
++        LOG(ERROR) << "Transfer engine is not initialized";
++        return -1;
++    }
++    Transport *base_transport = engine_->getTransport("ascend");
++    if (base_transport == nullptr) {
++        LOG(ERROR) << "Ascend transport is not installed";
++        return -1;
++    }
++    auto *transport = static_cast<AscendDirectTransport *>(base_transport);
++    pybind11::gil_scoped_release release;
++    return transport->disconnectAllPeers();
++#else
++    LOG(ERROR) << "Mooncake was built without Ascend Direct transport";
++    return -1;
++#endif
++}
++
+ std::vector<std::string> buildDeviceFilter(const std::string &device_names) {
+     std::stringstream ss(device_names);
+     std::string item;
+@@ -1017,6 +1041,8 @@ PYBIND11_MODULE(engine, m) {
+                  &TransferEnginePy::batchRegisterMemory)
+             .def("batch_unregister_memory",
+                  &TransferEnginePy::batchUnregisterMemory)
++            .def("disconnect_all_peers",
++                 &TransferEnginePy::disconnectAllPeers)
+             .def("get_local_topology", &TransferEnginePy::getLocalTopology,
+                  py::arg("device_name") = nullptr)
+             .def("get_first_buffer_address",
+diff --git a/mooncake-integration/transfer_engine/transfer_engine_py.h b/mooncake-integration/transfer_engine/transfer_engine_py.h
+index 083ff357..6e88b4e9 100644
+--- a/mooncake-integration/transfer_engine/transfer_engine_py.h
++++ b/mooncake-integration/transfer_engine/transfer_engine_py.h
+@@ -65,6 +65,8 @@ class TransferEnginePy {
+ 
+     int getRpcPort();
+ 
++    int disconnectAllPeers();
++
+     uintptr_t allocateManagedBuffer(size_t length);
+ 
+     int freeManagedBuffer(uintptr_t user_tensor, size_t length);
+diff --git a/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h b/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h
+index 79bb1100..05a443b6 100644
+--- a/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h
++++ b/mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h
+@@ -74,6 +74,8 @@ class AscendDirectTransport : public Transport {
+     int unregisterLocalMemoryBatch(
+         const std::vector<void *> &addr_list) override;
+ 
++    int disconnectAllPeers();
++
+    private:
+     int allocateLocalSegmentID();
+ 
+@@ -130,6 +132,10 @@ class AscendDirectTransport : public Transport {
+     // Connection management for segment connections
+     std::set<std::string> connected_segments_;
+     std::mutex connection_mutex_;
++    std::mutex transfer_lifecycle_mutex_;
++    std::condition_variable transfer_lifecycle_cv_;
++    size_t active_sync_transfers_{0};
++    bool disconnecting_all_peers_{false};
+ 
+     int32_t device_logic_id_{};
+     aclrtContext rt_context_{nullptr};
+diff --git a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp
+index 27d319de..50d1d375 100644
+--- a/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp
+@@ -816,12 +816,27 @@ void AscendDirectTransport::processSliceList(
+ void AscendDirectTransport::connectAndTransfer(
+     const std::string &target_adxl_engine_name, adxl::TransferOp operation,
+     const std::vector<Slice *> &slice_list, int32_t times) {
++    {
++        std::unique_lock<std::mutex> lock(transfer_lifecycle_mutex_);
++        transfer_lifecycle_cv_.wait(
++            lock, [this] { return !disconnecting_all_peers_; });
++        ++active_sync_transfers_;
++    }
++    const auto finish_transfer = [this] {
++        {
++            std::lock_guard<std::mutex> lock(transfer_lifecycle_mutex_);
++            --active_sync_transfers_;
++        }
++        transfer_lifecycle_cv_.notify_all();
++    };
++
+     if (!auto_connect_) {
+         int ret = checkAndConnect(target_adxl_engine_name);
+         if (ret != 0) {
+             for (auto &slice : slice_list) {
+                 slice->markFailed();
+             }
++            finish_transfer();
+             return;
+         }
+     }
+@@ -837,8 +852,10 @@ void AscendDirectTransport::connectAndTransfer(
+         op_descs.emplace_back(op_desc);
+     }
+     if (use_async_transfer_) {
+-        return TransferWithAsync(target_adxl_engine_name, operation, slice_list,
+-                                 op_descs);
++        TransferWithAsync(target_adxl_engine_name, operation, slice_list,
++                          op_descs);
++        finish_transfer();
++        return;
+     }
+     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
+                                       operation, op_descs, transfer_timeout_);
+@@ -873,6 +890,7 @@ void AscendDirectTransport::connectAndTransfer(
+         disconnect(target_adxl_engine_name, kDefaultDisconnectTime);
+         need_update_metadata_segs_.emplace(slice_list[0]->target_id);
+     }
++    finish_transfer();
+ }
+ 
+ void AscendDirectTransport::TransferWithAsync(
+@@ -1176,11 +1194,54 @@ int AscendDirectTransport::disconnect(
+         if (status != adxl::SUCCESS) {
+             LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
+                        << ", status: " << status;
+-            connected_segments_.erase(target_adxl_engine_name);
+             return -1;
+         }
+     }
+     connected_segments_.erase(target_adxl_engine_name);
+     return 0;
+ }
+-}  // namespace mooncake
+\ No newline at end of file
++
++int AscendDirectTransport::disconnectAllPeers() {
++    if (auto_connect_) {
++        LOG(ERROR) << "disconnectAllPeers does not support ASCEND_AUTO_CONNECT";
++        return -1;
++    }
++
++    {
++        std::unique_lock<std::mutex> lock(transfer_lifecycle_mutex_);
++        disconnecting_all_peers_ = true;
++        transfer_lifecycle_cv_.wait(
++            lock, [this] { return active_sync_transfers_ == 0; });
++    }
++
++    {
++        std::unique_lock<std::mutex> lock(async_task_mutex_);
++        async_task_cv_.wait(
++            lock, [this] { return active_async_tasks_ == 0; });
++    }
++
++    int result = 0;
++    {
++        std::lock_guard<std::mutex> lock(connection_mutex_);
++        for (auto it = connected_segments_.begin();
++             it != connected_segments_.end();) {
++            auto status = adxl_->Disconnect(it->c_str(), connect_timeout_);
++            if (status != adxl::SUCCESS) {
++                LOG(ERROR) << "Failed to disconnect AdxlEngine:" << *it
++                           << ", status:" << status;
++                result = -1;
++                ++it;
++            } else {
++                it = connected_segments_.erase(it);
++            }
++        }
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(transfer_lifecycle_mutex_);
++        disconnecting_all_peers_ = false;
++    }
++    transfer_lifecycle_cv_.notify_all();
++    return result;
++}
++}  // namespace mooncake

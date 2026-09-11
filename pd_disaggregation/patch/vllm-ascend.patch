@@ -1,0 +1,546 @@
+diff --git a/tests/ut/kv_offload/test_mooncake_connector.py b/tests/ut/kv_offload/test_mooncake_connector.py
+index 846bc8553..af59a4298 100644
+--- a/tests/ut/kv_offload/test_mooncake_connector.py
++++ b/tests/ut/kv_offload/test_mooncake_connector.py
+@@ -3032,6 +3032,83 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
+         self.assertIsNone(add_request_calls[1].kwargs["local_block_ids_replicate_k"])
+         self.assertIsNone(add_request_calls[1].kwargs["remote_block_ids_replicate_k"])
+ 
++    def test_start_load_kv_passes_send_counts_for_hybrid_non_cp(self):
++        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
++        worker.kv_send_thread = None
++        worker.kv_recv_thread = MagicMock()
++        worker._prefill_tp_size = 8
++        worker._is_hma_required = True
++        send_counts = {31001: {"num": 2, "host": "localhost"}}
++        worker.remote_port_send_num = {}
++        worker._get_hybrid_remote_port_send_num = MagicMock(return_value=send_counts)
++        worker._get_sfa_replicate_k_block_ids = MagicMock(return_value=(tuple(), tuple()))
++        worker._get_kv_split_metadata = MagicMock(
++            return_value=([[31001]], [([10], [20])], [([30], [40])])
++        )
++        worker._get_group_pulls_metadata = MagicMock(
++            return_value=[[[GroupPull(group_id=0, remote_tp_offset=0, num_group_pulls=1)]]]
++        )
++        worker._get_remote_host_info_by_port = MagicMock(return_value=("localhost", "remote_engine"))
++        meta = types.SimpleNamespace(
++            remote_request_id="remote_req",
++            remote_engine_id="remote_engine",
++            remote_host="localhost",
++            remote_port=31000,
++            remote_pcp_size=1,
++            remote_dcp_size=1,
++            remote_ptp_size=8,
++            remote_multi_nodes_meta_mapping={},
++            remote_block_size=16,
++            local_block_ids=([10], [20]),
++            remote_block_ids=([30], [40]),
++            num_computed_tokens=0,
++        )
++        metadata = types.SimpleNamespace(reqs_in_batch=["req"], requests={"req": meta})
++
++        worker.start_load_kv(cast(MooncakeConnectorMetadata, metadata))
++
++        worker.kv_recv_thread.add_request.assert_called_once()
++        worker._get_hybrid_remote_port_send_num.assert_called_once_with("remote_req", meta, 8)
++        self.assertIs(
++            worker.kv_recv_thread.add_request.call_args.kwargs["remote_port_send_num"],
++            send_counts,
++        )
++
++    def test_hybrid_remote_port_send_num_counts_all_decode_senders(self):
++        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
++        worker.tp_size = 4
++        worker._prefill_pp_size = 1
++        worker.vllm_config = self.vllm_config
++        ranks_by_decode_tp = {
++            0: [0, 1],
++            1: [2, 3, 5],
++            2: [2, 4, 5],
++            3: [6, 7],
++        }
++        worker._get_hybrid_remote_rank_group_pulls = MagicMock(
++            side_effect=lambda _req_id, _prefill_tp_size, decode_tp_rank: (
++                ranks_by_decode_tp[decode_tp_rank],
++                {},
++            )
++        )
++        worker._get_remote_host_info_by_port = MagicMock(
++            side_effect=lambda _base, port, host, engine_id, _mapping: (f"{host}-{port}", engine_id)
++        )
++        meta = types.SimpleNamespace(
++            remote_port=30000,
++            remote_host="127.0.0.1",
++            remote_engine_id="remote_engine",
++            remote_multi_nodes_meta_mapping={},
++        )
++
++        send_num = worker._get_hybrid_remote_port_send_num("test", cast(ReqMeta, meta), 8)
++
++        self.assertEqual(
++            [send_num[30000 + rank]["num"] for rank in range(8)],
++            [1, 1, 2, 1, 1, 2, 1, 1],
++        )
++        self.assertEqual(send_num[30007]["host"], "127.0.0.1-30007")
++
+     def test_get_kv_split_metadata_dp1_remote_port_send_num_uses_absolute_ports(self):
+         self.vllm_config.kv_transfer_config.kv_port = 30000
+         self.vllm_config.model_config.is_deepseek_mla = True
+diff --git a/tests/ut/kv_offload/test_mooncake_transfer_engine.py b/tests/ut/kv_offload/test_mooncake_transfer_engine.py
+new file mode 100644
+index 000000000..ec504d3a2
+--- /dev/null
++++ b/tests/ut/kv_offload/test_mooncake_transfer_engine.py
+@@ -0,0 +1,42 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from unittest.mock import MagicMock
++
++from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import GlobalTE
++
++
++def test_unregister_and_reregister_registered_buffers():
++    global_te = GlobalTE()
++    global_te.transfer_engine = MagicMock()
++    global_te.transfer_engine.register_memory.return_value = 0
++    global_te.transfer_engine.unregister_memory.return_value = 0
++
++    global_te.register_buffer([0x1000, 0x2000], [128, 256])
++    global_te.unregister_buffer()
++
++    assert not global_te.is_register_buffer
++    assert global_te.transfer_engine.unregister_memory.call_count == 2
++
++    global_te.reregister_buffer()
++
++    assert global_te.is_register_buffer
++    assert global_te.transfer_engine.register_memory.call_count == 4
++
++
++def test_unregister_failure_rolls_back_completed_buffers():
++    global_te = GlobalTE()
++    global_te.transfer_engine = MagicMock()
++    global_te.transfer_engine.register_memory.return_value = 0
++    global_te.transfer_engine.unregister_memory.side_effect = [0, -1]
++    global_te.registered_buffers = [(0x1000, 128), (0x2000, 256)]
++    global_te.is_register_buffer = True
++
++    try:
++        global_te.unregister_buffer()
++    except RuntimeError as error:
++        assert "ptr=0x2000" in str(error)
++    else:
++        raise AssertionError("unregister_buffer should fail")
++
++    global_te.transfer_engine.register_memory.assert_called_once_with(0x1000, 128)
++    assert global_te.is_register_buffer
+diff --git a/tests/ut/patch/platform/test_patch_partial_wake_up.py b/tests/ut/patch/platform/test_patch_partial_wake_up.py
+new file mode 100644
+index 000000000..4e5403b53
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_partial_wake_up.py
+@@ -0,0 +1,70 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++
++from vllm_ascend.patch.platform.patch_partial_wake_up import (
++    _wake_up_without_early_scheduler_resume,
++)
++
++
++class _FakeExecutor:
++    def __init__(self) -> None:
++        self.sleeping_tags = {"weights", "kv_cache"}
++        self.wake_calls: list[list[str] | None] = []
++
++    @property
++    def is_sleeping(self) -> bool:
++        return bool(self.sleeping_tags)
++
++    def wake_up(self, tags: list[str] | None = None) -> None:
++        self.wake_calls.append(tags)
++        if tags is None:
++            self.sleeping_tags.clear()
++        else:
++            self.sleeping_tags.difference_update(tags)
++
++
++class _FakeEngineCore:
++    def __init__(self) -> None:
++        self.model_executor = _FakeExecutor()
++        self.resume_count = 0
++
++    def resume_scheduler(self) -> None:
++        self.resume_count += 1
++
++
++def test_weights_only_wake_keeps_scheduler_paused() -> None:
++    core = _FakeEngineCore()
++
++    _wake_up_without_early_scheduler_resume(core, ["weights"])
++
++    assert core.model_executor.wake_calls == [["weights"]]
++    assert core.model_executor.sleeping_tags == {"kv_cache"}
++    assert core.resume_count == 0
++
++
++def test_final_kv_cache_wake_resumes_scheduler() -> None:
++    core = _FakeEngineCore()
++    _wake_up_without_early_scheduler_resume(core, ["weights"])
++
++    _wake_up_without_early_scheduler_resume(core, ["kv_cache"])
++
++    assert core.model_executor.sleeping_tags == set()
++    assert core.resume_count == 1
++
++
++def test_full_wake_resumes_scheduler() -> None:
++    core = _FakeEngineCore()
++
++    _wake_up_without_early_scheduler_resume(core)
++
++    assert core.model_executor.wake_calls == [None]
++    assert core.resume_count == 1
++
++
++def test_explicit_scheduling_wake_resumes_without_memory_wake() -> None:
++    core = _FakeEngineCore()
++
++    _wake_up_without_early_scheduler_resume(core, ["scheduling"])
++
++    assert core.model_executor.wake_calls == []
++    assert core.resume_count == 1
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index 69e021115..3c941de56 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -3198,7 +3198,11 @@ class MooncakeConnectorWorker:
+         self,
+         req_id: str,
+         prefill_tp_size: int,
++        decode_tp_rank: int | None = None,
+     ) -> tuple[list[int], dict[int, list[GroupPull]]]:
++        if decode_tp_rank is None:
++            decode_tp_rank = self.tp_rank
++
+         rank_group_pulls: OrderedDict[int, list[GroupPull]] = OrderedDict()
+ 
+         def add_group_pull(remote_rank: int, group_pull: GroupPull) -> None:
+@@ -3216,7 +3220,7 @@ class MooncakeConnectorWorker:
+                 num_group_pulls = prefill_tp_size // self.tp_size
+                 for pp_rank in range(self._prefill_pp_size):
+                     pp_rank_offset = pp_rank * prefill_tp_size
+-                    local_tp_offset = self.tp_rank * num_group_pulls
++                    local_tp_offset = decode_tp_rank * num_group_pulls
+                     for remote_tp_offset in range(num_group_pulls):
+                         remote_rank = pp_rank_offset + local_tp_offset + remote_tp_offset
+                         add_group_pull(
+@@ -3232,7 +3236,12 @@ class MooncakeConnectorWorker:
+                 continue
+ 
+             num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
+-            chosen_rank_list = self._get_attention_group_remote_rank(req_id, group_spec, prefill_tp_size)
++            chosen_rank_list = self._get_attention_group_remote_rank(
++                req_id,
++                group_spec,
++                prefill_tp_size,
++                decode_tp_rank,
++            )
+             assert len(chosen_rank_list) == num_group_pulls * self._prefill_pp_size, (
+                 f"chosen_rank_list({chosen_rank_list}) does not match num_group_pulls({num_group_pulls}) "
+                 f"and prefill pp size({self._prefill_pp_size})."
+@@ -3252,6 +3261,36 @@ class MooncakeConnectorWorker:
+ 
+         return list(rank_group_pulls), dict(rank_group_pulls)
+ 
++    def _get_hybrid_remote_port_send_num(
++        self,
++        req_id: str,
++        meta: ReqMeta,
++        prefill_tp_size: int,
++    ) -> dict[int, RemotePortInfo]:
++        remote_port_send_num: dict[int, RemotePortInfo] = {}
++        num_prefill_workers = prefill_tp_size * self._prefill_pp_size
++        for remote_rank in range(num_prefill_workers):
++            remote_port = meta.remote_port + remote_rank
++            remote_host, _ = self._get_remote_host_info_by_port(
++                meta.remote_port,
++                remote_port,
++                meta.remote_host,
++                meta.remote_engine_id,
++                meta.remote_multi_nodes_meta_mapping,
++            )
++            remote_port_send_num[remote_port] = {"num": 0, "host": remote_host}
++
++        for decode_tp_rank in range(self.tp_size):
++            remote_ranks, _ = self._get_hybrid_remote_rank_group_pulls(
++                req_id,
++                prefill_tp_size,
++                decode_tp_rank,
++            )
++            for remote_rank in remote_ranks:
++                remote_port_send_num[meta.remote_port + remote_rank]["num"] += 1
++
++        return remote_port_send_num
++
+     def _get_attention_group_num_need_pulls(self, group_spec: dict[str, Any], prefill_tp_size: int) -> int:
+         return self._get_attention_group_num_need_pulls_for_decode_tp(group_spec, prefill_tp_size, self.tp_size)
+ 
+@@ -3287,7 +3326,10 @@ class MooncakeConnectorWorker:
+         req_id: str,
+         group_spec: dict[str, Any],
+         prefill_tp_size: int,
++        decode_tp_rank: int | None = None,
+     ) -> list[int]:
++        if decode_tp_rank is None:
++            decode_tp_rank = self.tp_rank
+         num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
+         num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
+         return self._get_remote_ranks_for_req(
+@@ -3296,7 +3338,7 @@ class MooncakeConnectorWorker:
+             num_key_value_heads=num_key_value_heads,
+             tp_num_need_pulls=num_group_pulls,
+             use_mla=num_key_value_heads == 1,
+-        )[self.tp_rank]
++        )[decode_tp_rank]
+ 
+     def _get_sfa_replicate_k_block_ids(
+         self,
+@@ -3416,6 +3458,17 @@ class MooncakeConnectorWorker:
+                 meta.remote_dcp_size,
+             )
+ 
++            if meta.remote_pcp_size * meta.remote_dcp_size > 1:
++                remote_port_send_num = self.remote_port_send_num[meta.remote_engine_id]
++            elif self._is_hma_required:
++                remote_port_send_num = self._get_hybrid_remote_port_send_num(
++                    remote_req_id,
++                    meta,
++                    prefill_tp_size,
++                )
++            else:
++                remote_port_send_num = None
++
+             for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
+                 for remote_tp_offset, remote_handshake_port in enumerate(remote_ports):
+                     assert self.kv_recv_thread is not None
+@@ -3426,11 +3479,6 @@ class MooncakeConnectorWorker:
+                         meta.remote_engine_id,
+                         meta.remote_multi_nodes_meta_mapping,
+                     )
+-                    remote_port_send_num = (
+-                        self.remote_port_send_num[meta.remote_engine_id]
+-                        if meta.remote_pcp_size * meta.remote_dcp_size > 1
+-                        else None
+-                    )
+                     local_block_ids_replicate_k_for_port = (
+                         local_block_ids_replicate_k
+                         if replicate_k_transfer_port is not None and remote_handshake_port == replicate_k_transfer_port
+diff --git a/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py b/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
+index 7cf309b0e..127a173c1 100644
+--- a/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
++++ b/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
+@@ -5,6 +5,7 @@ class GlobalTE:
+     def __init__(self):
+         self.transfer_engine = None
+         self.is_register_buffer: bool = False
++        self.registered_buffers: list[tuple[int, int]] = []
+         self.transfer_engine_lock = threading.Lock()
+         self.register_buffer_lock = threading.Lock()
+ 
+@@ -37,6 +38,55 @@ class GlobalTE:
+                 ret_value = self.transfer_engine.register_memory(ptr, size)
+                 if ret_value != 0:
+                     raise RuntimeError("Mooncake memory registration failed.")
++            self.registered_buffers = list(zip(ptrs, sizes))
++            self.is_register_buffer = True
++
++    def unregister_buffer(self):
++        with self.register_buffer_lock:
++            if not self.is_register_buffer or not self.registered_buffers:
++                return
++            assert self.transfer_engine is not None, "Transfer engine must be initialized"
++
++            unregistered_buffers: list[tuple[int, int]] = []
++            for ptr, size in self.registered_buffers:
++                ret_value = self.transfer_engine.unregister_memory(ptr)
++                if ret_value != 0:
++                    rollback_failures = []
++                    for unregistered_ptr, unregistered_size in reversed(unregistered_buffers):
++                        rollback_ret = self.transfer_engine.register_memory(unregistered_ptr, unregistered_size)
++                        if rollback_ret != 0:
++                            rollback_failures.append((unregistered_ptr, rollback_ret))
++                    self.is_register_buffer = not rollback_failures
++                    raise RuntimeError(
++                        f"Mooncake memory unregistration failed for ptr={ptr:#x}, "
++                        f"ret_value={ret_value}, rollback_failures={rollback_failures}"
++                    )
++                unregistered_buffers.append((ptr, size))
++
++            self.is_register_buffer = False
++
++    def reregister_buffer(self):
++        with self.register_buffer_lock:
++            if self.is_register_buffer or not self.registered_buffers:
++                return
++            assert self.transfer_engine is not None, "Transfer engine must be initialized"
++
++            reregistered_buffers: list[tuple[int, int]] = []
++            for ptr, size in self.registered_buffers:
++                ret_value = self.transfer_engine.register_memory(ptr, size)
++                if ret_value != 0:
++                    rollback_failures = []
++                    for reregistered_ptr, _ in reversed(reregistered_buffers):
++                        rollback_ret = self.transfer_engine.unregister_memory(reregistered_ptr)
++                        if rollback_ret != 0:
++                            rollback_failures.append((reregistered_ptr, rollback_ret))
++                    self.is_register_buffer = bool(rollback_failures)
++                    raise RuntimeError(
++                        f"Mooncake memory re-registration failed for ptr={ptr:#x}, "
++                        f"ret_value={ret_value}, rollback_failures={rollback_failures}"
++                    )
++                reregistered_buffers.append((ptr, size))
++
+             self.is_register_buffer = True
+ 
+ 
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index 44434810f..2be464c91 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -134,7 +134,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # ============================================================
+         # Part 3: Output Projection
+         # ============================================================
+-        maybe_save_kv_layer_to_connector("", [])
+         z_shape_og = z.shape
+         # Reshape input data into 2D tensor
+         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+@@ -452,3 +451,4 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+         else:
+             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
++        maybe_save_kv_layer_to_connector("", [])
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index 27a3a0530..70094d1e0 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -379,6 +379,25 @@
+ #       Remove this patch if upstream exposes a platform allocator capability hook
+ #       for sleep mode validation.
+ #
++# ** 14. File: platform/patch_partial_wake_up.py**
++# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++#   1. `vllm.v1.engine.core.EngineCore.wake_up`
++#    Why:
++#       Ascend CaMem can restore weights and KV cache in separate wake stages.
++#       Upstream resumes scheduling after every wake call, so a weights-only
++#       wake can dispatch partial-rollout requests while KV cache allocations
++#       are still unmapped.
++#    How:
++#       Keep the scheduler paused while the model executor still has sleeping
++#       allocation tags. Resume only after all tags are awake, or when an
++#       explicit scheduling-only wake is requested.
++#    Related PR (if no, explain why):
++#       No. This adapts upstream staged wake behavior to Ascend CaMem's tagged
++#       allocation lifecycle.
++#    Future Plan:
++#       Remove this patch once upstream EngineCore does not resume scheduling
++#       during a partial allocation-tag wake.
++#
+ # ** 15. File: platform/patch_weight_transfer_engine.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `vllm.distributed.weight_transfer.factory.WeightTransferEngineFactory._registry["nccl"]`
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index c9349694f..bb6986d7c 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -17,6 +17,7 @@
+ import os
+ 
+ import vllm_ascend.patch.platform.patch_camem_allocator  # noqa
++import vllm_ascend.patch.platform.patch_partial_wake_up  # noqa
+ import vllm_ascend.patch.platform.patch_distributed  # noqa
+ import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
+ import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
+diff --git a/vllm_ascend/patch/platform/patch_partial_wake_up.py b/vllm_ascend/patch/platform/patch_partial_wake_up.py
+new file mode 100644
+index 000000000..c123c502b
+--- /dev/null
++++ b/vllm_ascend/patch/platform/patch_partial_wake_up.py
+@@ -0,0 +1,46 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from __future__ import annotations
++
++from vllm.v1.engine.core import EngineCore
++
++
++def _wake_up_without_early_scheduler_resume(
++    self: EngineCore, tags: list[str] | None = None
++) -> None:
++    """Keep scheduling paused until all sleep-mode allocations are awake.
++
++    vLLM supports waking weights and KV cache in separate stages. The generic
++    EngineCore implementation resumes scheduling after every wake_up call,
++    including a weights-only wake. CaMem has not remapped the KV cache at that
++    point, so a queued partial-rollout request can execute against unmapped NPU
++    memory.
++
++    Preserve the explicit ``scheduling`` wake behavior, but otherwise resume
++    only after the executor reports that no allocation tags remain asleep.
++    """
++    resume_scheduling = tags is not None and "scheduling" in tags
++    if resume_scheduling:
++        tags = [tag for tag in tags if tag != "scheduling"]
++
++    if tags is None or tags:
++        self.model_executor.wake_up(tags)
++
++    if resume_scheduling or not self.model_executor.is_sleeping:
++        self.resume_scheduler()
++
++
++EngineCore.wake_up = _wake_up_without_early_scheduler_resume
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index c2e0e8f9d..a075e3177 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -60,6 +60,7 @@ from vllm_ascend.batch_invariant import init_batch_invariance
+ from vllm_ascend.cpu_binding import bind_cpus
+ from vllm_ascend.device_allocator.camem import CaMemAllocator
+ from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
++from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+ from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+ from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
+@@ -225,6 +226,7 @@ class NPUWorker(WorkerBase):
+             self.sleep_wakeup_manager.sleep()
+ 
+         allocator = CaMemAllocator.get_instance()
++        global_te.unregister_buffer()
+         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+         free_bytes_after_sleep, total = torch.npu.mem_get_info()
+         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+@@ -247,6 +249,8 @@ class NPUWorker(WorkerBase):
+             )
+         allocator = CaMemAllocator.get_instance()
+         allocator.wake_up(tags=tags)
++        if tags is None or "kv_cache" in tags:
++            global_te.reregister_buffer()
+ 
+         hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
+         model = self.model_runner.model

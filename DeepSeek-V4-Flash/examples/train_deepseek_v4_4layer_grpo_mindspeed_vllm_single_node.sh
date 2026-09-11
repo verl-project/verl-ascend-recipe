@@ -3,11 +3,6 @@
 
 #Envs
 ray stop --force
-rm -rf /tmp/ray
-rm -rf /root/.triton/cache/
-rm -rf /root/.triton/dump/
-rm -rf /tmp/torchinductor_root/*
-rm -rf /root/.cache/torch_extensions
 
 # vllm路径
 export PYTHONPATH="/workspace-verl/vllm:$PYTHONPATH"
@@ -17,22 +12,16 @@ CANN_DIR=/usr/local/Ascend
 source $CANN_DIR/ascend-toolkit/set_env.sh
 source $CANN_DIR/nnal/atb/set_env.sh
 
-# 关闭训练图模式，待修复训练走入图模式
-export TORCHDYNAMO_VERBOSE=1
-export TORCH_COMPILE_DEBUG=1
-export TORCHDYNAMO_DISABLE=1
-
 export PYTORCH_NPU_ALLOC_CONF="max_split_size_mb:2048"
 
 export HCCL_CONNECT_TIMEOUT=1500
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export HCCL_SOCKET_IFNAME=enp23s0f3
-export GLOO_SOCKET_IFNAME=enp23s0f3
 
 export VLLM_USE_V1=1
 export HCCL_BUFFSIZE=500
 export VLLM_VERSION=0.23.0
 export HCCL_OP_EXPANSION_MODE="AIV" 
+export VLLM_ASCEND_TASK_QUEUE_ENABLE=0
 
 # Project Configuration
 project_name='DeepSeek-V4-Flash-4layer'
@@ -156,10 +145,6 @@ ACTOR_CONFIG=(
     # Model Weights Management
     actor_rollout_ref.actor.mindspeed.use_dist_checkpointing=False
     actor_rollout_ref.actor.mindspeed.use_mbridge=True
-    # Mcore Model Settings
-    # +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
-    # +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
-	# +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
 
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.enable_dsa_indexer=True
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.index_n_heads=64
@@ -217,7 +202,6 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.fix_router=False  
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.moe_router_dtype=fp32
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.n_hash_layers=3
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.moe_permute_fusion=True
 
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.mtp_num_layers=0
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.mtp_loss_scaling_factor=0.3 
@@ -266,10 +250,10 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.attention_dropout=0.0
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.init_method_std=0.02
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.hidden_dropout=0.0
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.position_embedding_type=g2
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.position_embedding_type=deepseek4
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.normalization=RMSNorm
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_rotary_pos_emb=True
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_rotary_position_embeddings=True
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_rotary_pos_emb=False
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_rotary_position_embeddings=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_swiglu=True
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_rmsnorm=True
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.swiglu=True
