@@ -1,0 +1,27 @@
+# Validated software versions for Qwen3-8B LoRA merge (100 steps, 2026-09-11).
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+# Exact upstream verl commit used in the validation run.
+COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bc72e38edba78e778bfbd462638f9634b9140a76
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout bc72e38edba78e778bfbd462638f9634b9140a76
+RECIPE_FOLDER=lora_rl_merge
+NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch to reproduce the measured source. It adds automatic physical-card discovery before the existing ASCEND_VISIBLE_DEVICES fallback; see README.md.
+REFRESH=Recompute COMMIT from the validated checkout: (cd verl && git rev-parse HEAD)
+
+# Apply the sampler fix to the installed vLLM-Ascend source; see README.md.
+VLLM_ASCEND_COMMIT=a43c8cc8057f490ed1df2c6ed66253e2d7817da4
+VLLM_COMMIT=bcf2be96120005e9aea171927f85055a6a5c0cf6
+VLLM_ASCEND_PATCH=patches/vllm-ascend/0001-record-sampler-stream.patch
+
+# Reproduction requires these software versions and patches, not a matching Docker image.
+CANN_VERSION=9.0.0
+TORCH_VERSION=2.9.0
+TORCH_NPU_VERSION=2.9.0.post2
+VLLM_VERSION=0.18.0
+VLLM_ASCEND_VERSION=0.18.1.dev44
+TRANSFORMERS_VERSION=5.10.4
+PEFT_VERSION=0.20.0
+RAY_VERSION=2.56.1
+# The host driver must support CANN; this is the observed driver version, not an image requirement.
+VALIDATED_DRIVER_VERSION=26.0.rc1

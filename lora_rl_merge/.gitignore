@@ -1,0 +1,2 @@
+# Keep the complete training log as reproducible evidence.
+!evidence/910b3-100step/training_100step.log
