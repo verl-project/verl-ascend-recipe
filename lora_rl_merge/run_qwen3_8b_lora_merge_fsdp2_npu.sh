@@ -17,7 +17,7 @@ NNODES=${NNODES:-1}
 NPROC_PER_NODE=${NPROC_PER_NODE:-4}      # Four-card validation; rollout_tp must divide it
 
 # Ascend: container-logical NPU ids are 0..N-1. PHYS_CARDS records physical card IDs (e.g. "4,5,6,7").
-# The validated get_npu_versions() patch queries npu-smi; ASCEND_VISIBLE_DEVICES cannot replace that patch.
+# The validated patch discovers a physical card via npu-smi before the existing ASCEND_VISIBLE_DEVICES fallback.
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((NPROC_PER_NODE-1)))}
 export ASCEND_VISIBLE_DEVICES=${PHYS_CARDS:-$ASCEND_RT_VISIBLE_DEVICES}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-5400}

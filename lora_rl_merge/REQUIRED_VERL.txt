@@ -6,7 +6,7 @@ COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
 PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bc72e38edba78e778bfbd462638f9634b9140a76
 GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout bc72e38edba78e778bfbd462638f9634b9140a76
 RECIPE_FOLDER=lora_rl_merge
-NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch on COMMIT when the container mounts only a subset of the NPUs (verl hard-codes 'npu-smi info -t board -i 1'); see README.md.
+NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch to reproduce the measured source. It adds automatic physical-card discovery before the existing ASCEND_VISIBLE_DEVICES fallback; see README.md.
 REFRESH=Recompute COMMIT from the validated checkout: (cd verl && git rev-parse HEAD)
 
 # Apply the sampler fix to the installed vLLM-Ascend source; see README.md.

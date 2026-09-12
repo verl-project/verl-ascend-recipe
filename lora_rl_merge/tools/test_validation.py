@@ -27,9 +27,9 @@ def trajectory() -> str:
 
 
 class ValidationTest(unittest.TestCase):
-    def test_bundled_metric_log_reproduces_the_published_summary(self):
+    def test_bundled_training_log_reproduces_the_published_summary(self):
         evidence = Path(__file__).resolve().parents[1] / "evidence/910b3-100step"
-        raw = (evidence / "metrics.log").read_bytes()
+        raw = (evidence / "training_100step.log").read_bytes()
         result = check_validation(raw.decode(), 100, 4)
         result["log_sha256"] = hashlib.sha256(raw).hexdigest()
         self.assertEqual(result, json.loads((evidence / "summary.json").read_text()))

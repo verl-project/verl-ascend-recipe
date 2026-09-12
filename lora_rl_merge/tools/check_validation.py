@@ -5,9 +5,10 @@ import argparse
 import hashlib
 import json
 import math
-import re
 import statistics
 from pathlib import Path
+
+from log_metrics import parse_metrics
 
 ROLLOUT_KEYS = (
     "rollout_corr/kl",
@@ -32,34 +33,13 @@ REQUIRED_KEYS = (
 VALIDATION_KEY = "val-core/openai/gsm8k/acc/mean@1"
 
 
-def parse_metrics(text: str) -> list[dict]:
-    rows = []
-    for line in re.sub(r"\x1b\[[0-9;]*m", "", text).splitlines():
-        match = re.search(r"\bstep:(\d+) - (.*)", line)
-        if not match:
-            continue
-        row = {"step": int(match[1])}
-        for part in match[2].split(" - "):
-            if ":" not in part:
-                continue
-            key, value = part.rsplit(":", 1)
-            value = value.strip()
-            scalar = re.fullmatch(r"np\.(?:float|int)(?:32|64)\(([^()]+)\)", value)
-            try:
-                row[key.strip()] = float(scalar[1] if scalar else value)
-            except ValueError as exc:
-                raise ValueError(f"Non-numeric metric {key.strip()} at step {row['step']}") from exc
-        rows.append(row)
-    return rows
-
-
 def check_validation(text: str, expected_steps: int, devices: int) -> dict:
     if expected_steps < 20 or devices < 1:
         raise ValueError("Require at least 20 steps for disjoint reward windows and a positive device count")
     metrics = parse_metrics(text)
     rows = [r for r in metrics if "training/global_step" in r and "timing_s/update_actor" in r]
     if [r["step"] for r in rows] != list(range(1, expected_steps + 1)):
-        raise ValueError("Require exactly one contiguous training trajectory from step 1 to the expected final step")
+        raise ValueError("Require exactly one contiguous training sequence from step 1 to the expected final step")
     for row in rows:
         for key in REQUIRED_KEYS:
             if key not in row:

@@ -15,6 +15,10 @@ class TrainingCompletionTest(unittest.TestCase):
             with self.subTest(start=start):
                 self.assertEqual(check_completion(training_lines(range(start, 101)), 100), list(range(start, 101)))
 
+    def test_numpy_global_step_and_ansi_log_prefix(self):
+        text = "\x1b[32mstep:100 - training/global_step:np.int64(100) - timing_s/update_actor:np.float64(1.2)\x1b[0m"
+        self.assertEqual(check_completion(text, 100), [100])
+
     def test_epoch_limit_does_not_count_as_completion(self):
         with self.assertRaisesRegex(ValueError, "observed 58"):
             check_completion(training_lines(range(1, 59)), 100)

@@ -23,11 +23,11 @@
 
 ```bash
 python3 lora_rl_merge/tools/check_validation.py \
-  lora_rl_merge/evidence/910b3-100step/metrics.log --devices 4
+  lora_rl_merge/evidence/910b3-100step/training_100step.log --devices 4
 python3 -m unittest discover -s lora_rl_merge/tools -v
 ```
 
-[证据目录](evidence/910b3-100step/README.md)保存[完整训练日志](evidence/910b3-100step/training_100step.log)、指标摘录、版本和检查点记录。
+[证据目录](evidence/910b3-100step/README.md)保存[完整训练日志](evidence/910b3-100step/training_100step.log)、指标摘要、版本和检查点记录。
 检查项目：
 
 - 训练步连续，指标有限，梯度非零。
@@ -112,7 +112,7 @@ Parquet 文件也可能仅因序列化版本不同而产生字节差异。
 
 两个补丁的作用：
 
-- **设备探测**：查询首个可见物理卡，修复硬编码卡1导致的失败。原函数不读取 `ASCEND_VISIBLE_DEVICES`，设置该变量不能替代补丁。
+- **设备探测**：优先从 `npu-smi info -m` 自动发现物理卡。原版在卡1查询失败后已有 `ASCEND_VISIBLE_DEVICES` 回退；补丁减少对手工设置物理卡编号的依赖，并保留原回退逻辑。为复现实测环境，此处仍应用该补丁。
 - **采样器**：调用 `q.record_stream(...)`，回移上游 [PR #13394](https://github.com/vllm-project/vllm-ascend/pull/13394) 的张量生命周期修复。
 
 ## 运行完整100步

@@ -2,25 +2,20 @@
 """Reject successful trainer exits that did not reach the requested training step."""
 
 import argparse
-import re
 from pathlib import Path
+
+from log_metrics import parse_metrics
 
 
 def check_completion(text: str, expected_step: int) -> list[int]:
     steps = []
-    for line in re.sub(r"\x1b\[[0-9;]*m", "", text).splitlines():
-        match = re.search(r"\bstep:(\d+) - (.*)", line)
-        if not match:
+    for row in parse_metrics(text):
+        # Validation-only records cannot prove a training update.
+        if "training/global_step" not in row or "timing_s/update_actor" not in row:
             continue
-        values = dict(part.rsplit(":", 1) for part in match[2].split(" - ") if ":" in part)
-        values = {key.strip(): value.strip() for key, value in values.items()}
-        # Validation-only lines have a step too; they cannot prove a training update.
-        if "training/global_step" not in values or "timing_s/update_actor" not in values:
-            continue
-        step = int(match[1])
-        if float(values["training/global_step"]) != step:
+        if row["training/global_step"] != row["step"]:
             raise ValueError("Console step disagrees with training/global_step")
-        steps.append(step)
+        steps.append(row["step"])
     if not steps or steps[-1] != expected_step:
         raise ValueError(f"Expected training step {expected_step}; observed {steps[-1] if steps else 'none'}")
     if steps != list(range(steps[0], expected_step + 1)):

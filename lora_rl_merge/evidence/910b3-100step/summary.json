@@ -36,5 +36,5 @@
     }
   ],
   "limitations": "Checks logged metrics only; excludes process exit, checkpoint restore and external acceptance.",
-  "log_sha256": "88d92b320a89c5dc4c3b1f3067ccfcbe97769a047a617d244f2a2bac4e167c3c"
+  "log_sha256": "c164af433b5671c83519c5ac9dacf4b65be6c30ba86697e52191745a3c070adc"
 }

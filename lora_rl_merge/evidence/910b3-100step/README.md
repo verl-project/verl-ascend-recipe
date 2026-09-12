@@ -1,54 +1,36 @@
 # 四张 Ascend 910B3 的100步训练记录
 
-`metrics.log` 保留 TaskRunner 日志中以 `step:<整数> -` 开始的完整指标行。
-原顺序和数值不变，仅省略非指标文本。
-
-- 训练记录：第1–100步。
-- 验证记录：第0、20、40、60、80、100步。
-- 原始日志大小：443069字节。
-- 原始日志 SHA256：`b4273bb72860b9833fea873783acb833ea09f9f0f003e871adcb5a4d612ac95d`。
+完整 TaskRunner 日志包含第1–100步训练，以及第0、20、40、60、80、100步验证。
+只将两处内部 IP 替换为 `[REDACTED_INTERNAL_IP]`，992行全部保留，101个指标行与原始记录一致。
+该文件不包含其他分布式进程的单独日志；容器退出状态另行保存。
 
 | 文件 | 内容 |
 | --- | --- |
-| [training_100step.log](training_100step.log) | 完整 TaskRunner 日志，保留配置、初始化、全部训练步和最终验证 |
-| [log_sanitization.json](log_sanitization.json) | 脱敏规则、原始与公开文件哈希、行数及指标一致性检查 |
-| `metrics.log` | 原始指标行 |
-| `summary.json` | 指标复算结果 |
-| `provenance.json` | 源码和依赖版本；日志、脚本和补丁哈希 |
-| `inputs.sha256` | 模型、分词器和数据哈希；路径相对于复现工作目录 |
-| `process.json` | 容器退出状态、起止时间 |
-| `checkpoint100.json` | 第100步检查点的文件及元数据；未测试恢复训练 |
-| `image.json` | 实测镜像的历史记录；镜像一致性不作为复现要求 |
-| `training-curves.png` / `.svg` | 训练曲线 |
+| [training_100step.log](training_100step.log) | 配置、初始化、全部训练步和最终验证。 |
+| [log_sanitization.json](log_sanitization.json) | 脱敏规则、原始与公开日志哈希、行数和指标一致性。 |
+| [summary.json](summary.json) | 从完整日志计算的指标摘要。 |
+| [training-curves.png](training-curves.png) | 奖励、验证准确率、吞吐量、梯度范数和步时曲线。 |
+| [provenance.json](provenance.json) | 实测源码、依赖版本及文件哈希。 |
+| [inputs.sha256](inputs.sha256) | 模型、分词器和数据哈希，路径相对于复现工作目录。 |
+| [process.json](process.json) | 容器退出状态和起止时间。 |
+| [checkpoint100.json](checkpoint100.json) | 第100步检查点文件及元数据；不代表恢复训练已验证。 |
 
-完整日志只将两处内部 IP 替换为 `[REDACTED_INTERNAL_IP]`，992行全部保留。
-101个指标行与 `metrics.log` 逐字一致。该文件是 TaskRunner 的完整输出，不包含其他分布式进程的单独日志。
-容器退出状态另见 `process.json`。
-
-在仓库根目录执行以下命令，即可复算并比较结果。
+在仓库根目录复算并比较摘要，只需要 Python 标准库：
 
 ```bash
 python3 lora_rl_merge/tools/check_validation.py \
-  lora_rl_merge/evidence/910b3-100step/metrics.log --devices 4 --output /tmp/lora-summary.json
+  lora_rl_merge/evidence/910b3-100step/training_100step.log --devices 4 --output /tmp/lora-summary.json
 diff -u lora_rl_merge/evidence/910b3-100step/summary.json /tmp/lora-summary.json
 ```
 
-如需重新绘图，请先安装 Matplotlib，再执行以下命令。数值检查不需要 Matplotlib。
+安装 Matplotlib 后，可重新绘图。绘图不要求奖励上升或吞吐量达标，也可以用于检查未完成的实验：
 
 ```bash
 python3 lora_rl_merge/tools/plot_validation.py \
-  lora_rl_merge/evidence/910b3-100step/metrics.log /tmp/lora-curves \
+  lora_rl_merge/evidence/910b3-100step/training_100step.log /tmp/lora-curves.png \
   --devices 4 --hardware 'Ascend 910B3'
 ```
 
-实测代码版本见 `provenance.json` 的 `validated_recipe_commit`。此后只更正了训练脚本注释，
-可执行命令、超参数和两份依赖补丁均未改变。后期准确率下降及实验限制见[验证报告](../../ALGORITHM_TUNING_REPORT.md)。
-
-完整日志也可直接复算：
-
-```bash
-python3 lora_rl_merge/tools/check_validation.py \
-  lora_rl_merge/evidence/910b3-100step/training_100step.log --devices 4
-```
-
-两份日志的 `log_sha256` 不同，其余复算结果一致。
+实测版本见 `provenance.json` 的 `validated_recipe_commit`。其中的指标摘录哈希保留历史提取记录，
+提交材料仅保留完整日志。后续修改涉及文档和日志工具，训练命令、超参数和两份补丁未改变。
+后期准确率下降及其他实验限制见[验证报告](../../ALGORITHM_TUNING_REPORT.md)。

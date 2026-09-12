@@ -41,7 +41,7 @@
 
 实验在新检查点目录中运行，没有中断或跨主机续训。完整准备和运行命令见 [README](README.md)。
 训练后保存 TaskRunner 原始日志、容器退出状态和检查点文件记录，再抽取完整指标行进行复算。
-后续整理仅修改训练脚本注释，两份依赖补丁保持不变。
+后续整理修订了文档和日志检查工具；训练命令、超参数及两份依赖补丁保持不变。
 
 ## 适配实现
 
@@ -57,8 +57,10 @@
 
 ### 设备探测
 
-设备探测补丁修复 `get_npu_versions()` 硬编码查询物理卡1的问题，改为从 `npu-smi info -m`
-取得首个可见物理卡。原函数不读取 `ASCEND_VISIBLE_DEVICES`，因此设置该变量不能替代补丁。
+原版 `get_npu_versions()` 先查询物理卡1，失败后读取 `ASCEND_VISIBLE_DEVICES`，并保留 A3 物理卡编号回退。
+补丁在查询前从 `npu-smi info -m` 自动取得首个可见物理卡，减少对手工设置编号的依赖，原回退逻辑仍保留。
+当环境变量已正确设置时，原版也可能成功；不能把该补丁描述为所有部分设备映射环境的必要修复。
+本次实测使用了该补丁，复现时继续保留。
 
 ### 采样器
 
@@ -82,8 +84,7 @@
 ## 实测结果
 
 [完整日志](evidence/910b3-100step/training_100step.log)保留配置、初始化、训练和最终验证。
-[metrics.log](evidence/910b3-100step/metrics.log)提取全部训练和验证指标行，
-[summary.json](evidence/910b3-100step/summary.json)保存复算结果。
+[summary.json](evidence/910b3-100step/summary.json)直接从完整日志计算，保存训练和验证指标摘要。
 
 | 检查项 | 结果 |
 | --- | --- |
@@ -127,7 +128,6 @@
 不等于 actor 进程的常驻内存或锁页内存；本次未采集锁页内存峰值。
 
 复现按 [REQUIRED_VERL.txt](REQUIRED_VERL.txt) 核对软件版本、源码提交和补丁，不要求使用同一镜像。
-本次使用的镜像信息保留在[原始记录](evidence/910b3-100step/image.json)中，仅用于追溯实验环境。
 版本核对不代替训练验证；接收方仍按 README 执行训练并检查指标。
 实践文档已提交至 [issue #78 的验收申请](https://github.com/verl-project/verl-ascend-recipe/issues/78#issuecomment-5633188810)。
 评审与合入状态见 [PR #116](https://github.com/verl-project/verl-ascend-recipe/pull/116)。
