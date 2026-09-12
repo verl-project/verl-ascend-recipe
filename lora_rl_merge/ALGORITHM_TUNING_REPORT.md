@@ -129,4 +129,5 @@
 复现按 [REQUIRED_VERL.txt](REQUIRED_VERL.txt) 核对软件版本、源码提交和补丁，不要求使用同一镜像。
 本次使用的镜像信息保留在[原始记录](evidence/910b3-100step/image.json)中，仅用于追溯实验环境。
 版本核对不代替训练验证；接收方仍按 README 执行训练并检查指标。
-PR 合入和向 issue 提交实践文档尚未完成。
+实践文档已提交至 [issue #78 的验收申请](https://github.com/verl-project/verl-ascend-recipe/issues/78#issuecomment-5633188810)。
+评审与合入状态见 [PR #116](https://github.com/verl-project/verl-ascend-recipe/pull/116)。
