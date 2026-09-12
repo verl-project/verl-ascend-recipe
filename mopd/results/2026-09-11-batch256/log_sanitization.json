@@ -1,0 +1,10 @@
+{
+  "original_sha256": "207cf0d90c1ce6eaa0c71939ec6b9cc5f21410e5924e4aee8f77e631669dc156",
+  "published_sha256": "9878e8d26777dec2f0613feb701463bf95273092b057739d20e4d65a13b968da",
+  "replacement": "Private container IPv4 address replaced with [REDACTED_INTERNAL_IP].",
+  "replacement_count": 2,
+  "line_count": 1022,
+  "metric_line_count": 101,
+  "metric_lines_identical": true,
+  "original_log_retained": "Original experiment evidence retains the unmodified source log."
+}

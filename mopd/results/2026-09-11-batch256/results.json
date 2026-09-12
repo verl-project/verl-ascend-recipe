@@ -1,0 +1,170 @@
+{
+  "expected_steps": 100,
+  "training_length_complete": true,
+  "physical_device_count": 4,
+  "nonfinite_metric_step_counts": {},
+  "zero_gradient_steps": [],
+  "reward": {
+    "first_10_mean": 0.399609375,
+    "final_10_mean": 0.47734375,
+    "increased": true
+  },
+  "reward_windows": [
+    {
+      "first_step": 1,
+      "last_step": 10,
+      "mean": 0.399609375
+    },
+    {
+      "first_step": 11,
+      "last_step": 20,
+      "mean": 0.396484375
+    },
+    {
+      "first_step": 21,
+      "last_step": 30,
+      "mean": 0.4109375
+    },
+    {
+      "first_step": 31,
+      "last_step": 40,
+      "mean": 0.433203125
+    },
+    {
+      "first_step": 41,
+      "last_step": 50,
+      "mean": 0.4203125
+    },
+    {
+      "first_step": 51,
+      "last_step": 60,
+      "mean": 0.442578125
+    },
+    {
+      "first_step": 61,
+      "last_step": 70,
+      "mean": 0.443359375
+    },
+    {
+      "first_step": 71,
+      "last_step": 80,
+      "mean": 0.443359375
+    },
+    {
+      "first_step": 81,
+      "last_step": 90,
+      "mean": 0.467578125
+    },
+    {
+      "first_step": 91,
+      "last_step": 100,
+      "mean": 0.47734375
+    }
+  ],
+  "throughput": {
+    "total_tokens": 13434084.0,
+    "sum_timed_step_seconds": 21880.460205162177,
+    "weighted_tokens_per_second_per_device": 153.49407501070917,
+    "arithmetic_mean_tokens_per_second_per_device": 153.4326406524357,
+    "minimum_tokens_per_second_per_device": 131.48019518155334,
+    "weighted_exceeds_100": true
+  },
+  "wall_clock_seconds": 27216.630907,
+  "max_actor_distillation_loss_difference": 2.9802322387695312e-08,
+  "validation": {
+    "openai/gsm8k": {
+      "values": [
+        {
+          "step": 0,
+          "correct": 499,
+          "count": 1319,
+          "reward": 0.378316906747536
+        },
+        {
+          "step": 20,
+          "correct": 593,
+          "count": 1319,
+          "reward": 0.4495830174374526
+        },
+        {
+          "step": 40,
+          "correct": 641,
+          "count": 1319,
+          "reward": 0.48597422289613346
+        },
+        {
+          "step": 60,
+          "correct": 629,
+          "count": 1319,
+          "reward": 0.47687642153146326
+        },
+        {
+          "step": 80,
+          "correct": 640,
+          "count": 1319,
+          "reward": 0.4852160727824109
+        },
+        {
+          "step": 100,
+          "correct": 652,
+          "count": 1319,
+          "reward": 0.4943138741470811
+        }
+      ],
+      "change_from_initial_percentage_points": 11.599696739954513,
+      "change_from_step80_percentage_points": 0.9097801364670199
+    },
+    "DigitalLearningGmbH/MATH-lighteval": {
+      "values": [
+        {
+          "step": 0,
+          "correct": 2505,
+          "count": 4998,
+          "reward": 0.5012004801920769
+        },
+        {
+          "step": 20,
+          "correct": 2530,
+          "count": 4998,
+          "reward": 0.506202480992397
+        },
+        {
+          "step": 40,
+          "correct": 2522,
+          "count": 4998,
+          "reward": 0.5046018407362945
+        },
+        {
+          "step": 60,
+          "correct": 2581,
+          "count": 4998,
+          "reward": 0.51640656262505
+        },
+        {
+          "step": 80,
+          "correct": 2589,
+          "count": 4998,
+          "reward": 0.5180072028811524
+        },
+        {
+          "step": 100,
+          "correct": 2561,
+          "count": 4998,
+          "reward": 0.5124049619847939
+        }
+      ],
+      "change_from_initial_percentage_points": 1.1204481792717047,
+      "change_from_step80_percentage_points": -0.5602240896358524
+    }
+  },
+  "raw_log_sha256": "9878e8d26777dec2f0613feb701463bf95273092b057739d20e4d65a13b968da",
+  "limitations": [
+    "Only explicitly selected updates are included; excluded updates are listed per source.",
+    "Timed-step throughput is not whole-job wall-clock throughput or pure generation throughput.",
+    "Startup, checkpoint restoration, inter-run downtime and some evaluation time can be outside step timing.",
+    "This summary cannot prove checkpoint identity, process success, sampler correctness or external acceptance.",
+    "Only one trajectory was measured; the validation curves are not monotonic.",
+    "Actual checkpoint restoration and a GPU baseline were not tested."
+  ],
+  "original_raw_log_sha256": "207cf0d90c1ce6eaa0c71939ec6b9cc5f21410e5924e4aee8f77e631669dc156"
+}
