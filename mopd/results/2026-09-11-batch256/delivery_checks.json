@@ -1,0 +1,43 @@
+{
+  "purpose": "Relate the measured run to the reviewer-facing recipe without rewriting historical provenance.",
+  "measured_run": {
+    "training_recipe_commit": "22d70948c954311e109684228bb91c48e9031f0c",
+    "run_script_sha256": "ac55273781be8c213599a42805828e579829a3940331630eb0f1370f71d56fe2",
+    "preflight_sha256": "ff321128ec280256660d6ecd605404da962336d3c08c757ec0bbcadb18b6b826",
+    "data_preparation_sha256": "cc21ec98224fbb5adb5d3f75e744e73feb1c06e4ce3a50f81b3939b4bfc1405f"
+  },
+  "delivered_files": {
+    "run_script_sha256": "53d3a41977fa7f20ff12e3ca8f0361b7eb262d39403873765acbc5c34c9dc57a",
+    "preflight_sha256": "63eb25b1496898aa922bfe264ee6186a3b8774ebf2f3b8262db74db4c4688315",
+    "data_preparation_sha256": "d383d4f20f3776837e6aae0d5f3d898b064f4d21a2f2f2d40a609b1d208922a5",
+    "summary_tool_sha256": "360e2542c27534145d33cf9cb4351264f43852e8089e773056aac14fe45e0552",
+    "summary_test_sha256": "22384497df1ea27a8e1e1b74953c129648a2526beb228e17505f7020fd7899d1",
+    "preflight_test_sha256": "20906c9d9f2c0c3d4cca3a0e8b89d93cb097f930afe3c0b293bffe8c2a7c7ef9"
+  },
+  "equivalence": {
+    "effective_hydra_overrides_equal": true,
+    "effective_hydra_override_count": 77,
+    "description": "The measured batch256 and non-thinking command and the delivered default command produce the same Hydra overrides. The delivered script changes where those values are specified, adds fail-fast topology checks, and leaves the training implementation unchanged.",
+    "data_transformation_unchanged": true,
+    "data_check_change": "Assertions were replaced with explicit errors so validation remains active under Python optimization. The successful-input transformation is unchanged."
+  },
+  "offline_verification": {
+    "ruff_version": "0.14.10",
+    "repository_lint_passed": true,
+    "repository_format_passed": true,
+    "pytest_command": "pytest tests/ mopd/tools/ -q",
+    "pytest_passed": 342,
+    "subtests_passed": 5,
+    "mopd_unittest_passed": 11,
+    "bash_syntax_passed": true,
+    "invalid_topology_checks_passed": true,
+    "full_log_summary_matches_published_results": true,
+    "both_patches_roundtrip_passed": true,
+    "recorded_resolved_config_profile_passed": true
+  },
+  "limitations": [
+    "These changes were validated offline and did not rerun NPU training.",
+    "The measured run identity and file hashes remain authoritative for the published training result.",
+    "External review, CI approval and maintainer acceptance are separate from this local verification."
+  ]
+}

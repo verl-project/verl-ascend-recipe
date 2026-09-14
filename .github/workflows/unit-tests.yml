@@ -30,4 +30,4 @@ jobs:
         run: pip install pytest
 
       - name: Run unit tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ mopd/tools/ -v --tb=short

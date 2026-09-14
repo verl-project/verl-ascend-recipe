@@ -1,0 +1,26 @@
+# Fixed environment completed 100-step batch256 non-thinking MOPD on four NPUs (2026-09-11): reward and throughput criteria passed; actual checkpoint restoration remains untested. Use the validated script defaults and prepared data in README.md.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bc72e38edba78e778bfbd462638f9634b9140a76
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout bc72e38edba78e778bfbd462638f9634b9140a76
+IMAGE=quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm
+RECIPE_FOLDER=mopd
+NOTES=Apply patches/0001-get_npu_versions-first-visible-npu-id.patch when only a subset of the host NPUs is mapped into the container.
+
+# Apply the sampler fix in /vllm-ascend, not in /verl; see README.md.
+VLLM_ASCEND_COMMIT=a43c8cc8057f490ed1df2c6ed66253e2d7817da4
+VLLM_ASCEND_PATCH=patches/vllm-ascend/0001-record-sampler-stream.patch
+# Actual image on host 46 for the default 100-step and non-thinking trials.
+IMAGE_ID=sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c
+# The earlier two-step functional run used sha256:b25fae72319d0c16451fb27afd6391f97e8734452ce369901082dd5b8956ae91.
+
+# Complete software pins for the measured environment; see README.md for setup.
+VLLM_COMMIT=bcf2be96120005e9aea171927f85055a6a5c0cf6
+CANN_VERSION=9.0.0
+DRIVER_VERSION=26.0.rc1
+TORCH_VERSION=2.9.0
+TORCH_NPU_VERSION=2.9.0.post2
+TRANSFORMERS_VERSION=5.10.4
+PEFT_VERSION=0.20.0
+RAY_VERSION=2.56.1

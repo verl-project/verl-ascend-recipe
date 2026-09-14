@@ -1,0 +1,215 @@
+{
+  "training_recipe_commit": "22d70948c954311e109684228bb91c48e9031f0c",
+  "verl_commit": "bc72e38edba78e778bfbd462638f9634b9140a76",
+  "vllm_commit": "bcf2be96120005e9aea171927f85055a6a5c0cf6",
+  "vllm_ascend_commit": "a43c8cc8057f490ed1df2c6ed66253e2d7817da4",
+  "image_id": "sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c",
+  "hardware": "4 x Ascend 910B3, 64 GB HBM per NPU",
+  "physical_device_ids": [
+    2,
+    3,
+    6,
+    7
+  ],
+  "student_device_count": 2,
+  "teacher_device_count": 2,
+  "container_id": "96b11bca2690148ebc00afe1585c1f8e5db7411848c188aab86268e0f18cb4ea",
+  "container_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-09-11T13:38:17.094449531Z",
+    "FinishedAt": "2026-09-11T21:11:53.725356501Z"
+  },
+  "restart_count": 0,
+  "parameters": {
+    "student": "Qwen3-0.6B",
+    "teachers": {
+      "openai/gsm8k": "Qwen3-4B",
+      "DigitalLearningGmbH/MATH-lighteval": "Qwen3-8B"
+    },
+    "train_batch_size": 256,
+    "ppo_mini_batch_size": 256,
+    "ppo_epochs": 1,
+    "rollout_n": 1,
+    "learning_rate": 1e-06,
+    "model_dtype": "bf16",
+    "loss_mode": "k1",
+    "use_policy_gradient": true,
+    "use_task_rewards": false,
+    "enable_thinking": false,
+    "max_prompt_length": 1024,
+    "max_response_length": 2048,
+    "save_freq": 10,
+    "test_freq": 20,
+    "val_before_train": true,
+    "resume_mode": "auto",
+    "training_temperature": 1.0,
+    "validation_do_sample": false
+  },
+  "retained_dataset_counts": {
+    "train": 14966,
+    "validation_gsm8k": 1319,
+    "validation_math": 4998
+  },
+  "recipe_file_sha256": {
+    "run_qwen3_06b_mopd_fsdp_npu.sh": "ac55273781be8c213599a42805828e579829a3940331630eb0f1370f71d56fe2",
+    "tools/prepare_nonthinking_data.py": "cc21ec98224fbb5adb5d3f75e744e73feb1c06e4ce3a50f81b3939b4bfc1405f",
+    "tools/preflight.py": "ff321128ec280256660d6ecd605404da962336d3c08c757ec0bbcadb18b6b826",
+    "patches/0001-get_npu_versions-first-visible-npu-id.patch": "de8893b56da2bf650942c5a8cce0028c879ba5e7305a5218a485be2e11dcc386",
+    "patches/vllm-ascend/0001-record-sampler-stream.patch": "739c4b07f13ffeb6a2dbf7e0488579e730e10bbb671068cb547c3b717a920276"
+  },
+  "runtime_file_sha256": {
+    "training.N3qiDrEO.log": "28cda1143e09c570034fadcfa4ffb87023e09fd1f6f999361b431014683adcc7",
+    "runtime.patch": "de8893b56da2bf650942c5a8cce0028c879ba5e7305a5218a485be2e11dcc386",
+    "vllm-ascend-runtime.patch": "2075b3f4583b245c14efb82ca343d73871ec9665c92ae1661b4d2df50674df66",
+    "resolved-config.yaml": "6c5ec06ce17d163a36600001f27998f590c8cfc3017a2c3c5e5e39a35336e18e",
+    "resolved-config.raw.stdout": "6c5ec06ce17d163a36600001f27998f590c8cfc3017a2c3c5e5e39a35336e18e",
+    "packages.txt": "bf240a214078c92da4ce99e00cff4137f3a2133f918988b540c4f7725227d1a6",
+    "worker-3e3a839c8dd9ae0e4ff3efdc8e633c77c5bb1fdf1ebd4bb643a62246-01000000-11560.out": "207cf0d90c1ce6eaa0c71939ec6b9cc5f21410e5924e4aee8f77e631669dc156",
+    "run_qwen3_06b_mopd_fsdp_npu.sh": "ac55273781be8c213599a42805828e579829a3940331630eb0f1370f71d56fe2"
+  },
+  "checkpoints": [
+    {
+      "step": 10,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 20,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 30,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 40,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 50,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 60,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 70,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 80,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 90,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    },
+    {
+      "step": 100,
+      "file_count": 13,
+      "total_bytes": 3899538184
+    }
+  ],
+  "checkpoint100_files": [
+    {
+      "path": "actor/extra_state_world_size_2_rank_0.pt",
+      "bytes": 15141,
+      "sha256": "9e58fb884743d128be3932d33cd6c6842fd53cea14b7a8a5487f46d6b5eb34a0",
+      "archive_entries": 8
+    },
+    {
+      "path": "actor/extra_state_world_size_2_rank_1.pt",
+      "bytes": 15077,
+      "sha256": "5b799bbb1bba9120691690b52d7eeb9470f7a8f4f138663cc01ba7ac1aa4a5de",
+      "archive_entries": 8
+    },
+    {
+      "path": "actor/fsdp_config.json",
+      "bytes": 46,
+      "sha256": "1df34c1f433cd641f48d99b3981b311f0362bfcfd4c4e1f727301e3b50cf03bf",
+      "archive_entries": null
+    },
+    {
+      "path": "actor/huggingface/chat_template.jinja",
+      "bytes": 4168,
+      "sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+      "archive_entries": null
+    },
+    {
+      "path": "actor/huggingface/config.json",
+      "bytes": 1417,
+      "sha256": "00b04148b34a2fd2fd549a865c24b2ef9bf5ef1beaddac1042372e713a46af99",
+      "archive_entries": null
+    },
+    {
+      "path": "actor/huggingface/generation_config.json",
+      "bytes": 214,
+      "sha256": "2585eee7d29d56bdab70d8b186328803039d8ce58b1d947dbe95a4b3b3461a59",
+      "archive_entries": null
+    },
+    {
+      "path": "actor/huggingface/tokenizer.json",
+      "bytes": 11422650,
+      "sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506",
+      "archive_entries": null
+    },
+    {
+      "path": "actor/huggingface/tokenizer_config.json",
+      "bytes": 693,
+      "sha256": "2e3bd3cb5055f7a903a54e7062b2fd14d21b70f4174c3ffcd9fc81ec50a25631",
+      "archive_entries": null
+    },
+    {
+      "path": "actor/model_world_size_2_rank_0.pt",
+      "bytes": 751900395,
+      "sha256": "87488ef4eadb183b85b62a2d1b66b23d214b54fa056f1cb539a9c72d547f5876",
+      "archive_entries": 318
+    },
+    {
+      "path": "actor/model_world_size_2_rank_1.pt",
+      "bytes": 751900395,
+      "sha256": "fa2e69408833d0df2cdd7ed93405e9dbda6d074d9eea385790e39a603cc64967",
+      "archive_entries": 318
+    },
+    {
+      "path": "actor/optim_world_size_2_rank_0.pt",
+      "bytes": 1192135336,
+      "sha256": "3e6e3917533a573ca2b348657358fc63d1b3be947a402d856e421ba0be1b41b8",
+      "archive_entries": 93
+    },
+    {
+      "path": "actor/optim_world_size_2_rank_1.pt",
+      "bytes": 1192135336,
+      "sha256": "aa0a10d05bbd2fe5f405cbbc6c1e8a99a26c84719b464d69b19adc625915a132",
+      "archive_entries": 93
+    },
+    {
+      "path": "data.pt",
+      "bytes": 7316,
+      "sha256": "6967d5aa4a13dc662be5dcc32c2a4e206c8700153c2f8c6b93530242114ec788",
+      "archive_entries": 7
+    }
+  ],
+  "checkpoint_limitations": [
+    "File identities and ZIP directory structure do not prove optimizer or dataloader restoration.",
+    "The inspection does not load tensor values or execute checkpoint contents.",
+    "This command does not stop, restart, or reconfigure the training process."
+  ]
+}
