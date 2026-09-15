@@ -25,8 +25,8 @@
 
 ```bash
 
-# verl日构建开源镜像
-docker pull quay.io/ascend/verl:verl-9.0.0-a3-ubuntu22.04-py3.11-latest
+# verl日构建开源镜像（A2 即 Atlas 910B 系列，tag 为 latest-vllm-910b-ubuntu；勿用 a3 镜像）
+docker pull quay.io/ascend/verl:latest-vllm-910b-ubuntu
 
 # 创建容器
 docker run -dit --ipc=host --network host --name 'rl_test' --privileged -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware -v /usr/local/sbin/:/usr/local/sbin/ -v /home/:/home/ -v /data/:/data 镜像名:标签 /bin/bash
@@ -40,6 +40,8 @@ cd /workspace-verl
 ./Ascend-cann-toolkit_9.1.0_linux-aarch64.run --install
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ./Ascend-cann-nnal_9.1.0_linux-aarch64.run --install
+
+安装依赖前请先确认基础镜像中 torch / torch_npu 版本与上文环境版本表一致（torch 2.10.0、torch_npu 2.10.0.post2），不一致说明基础镜像不符，请勿继续安装。
 
 # 安装环境依赖（A2 使用 A2_patch/，与 patch/ 为替代关系，禁止与 install.sh 混用叠加）
 # 注意：install_A2.sh 会把各仓库克隆到当前工作目录，请固定在一个统一目录下执行（示例为 /workspace-verl），
