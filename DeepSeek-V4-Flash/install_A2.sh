@@ -66,6 +66,7 @@ git clone https://gitcode.com/ascend/MindSpeed-LLM.git
 cd MindSpeed-LLM
 git checkout ${MINDSPEED_LLM_COMMIT}
 cp pretrain_deepseek4.py mindspeed_llm
+git apply --whitespace=nowarn ${PATCH_DIR}/mindspeed-llm-fix-get-transformer-layer-offset.patch
 pip3 install -r requirements.txt
 cd ..
 

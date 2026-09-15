@@ -1,0 +1,16 @@
+# Against image pin 4afa739149dc3a275e5516df044f0a63b9076cf0 (Dockerfile MINDSPEED_LLM_COMMIT).
+# Upstream file has no trailing newline.
+#
+diff --git a/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py b/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py
+index 6979e473..0cb4050b 100644
+--- a/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py
++++ b/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py
+@@ -55,5 +55,7 @@ class NumLayerListFeature(MindSpeedFeature):
+                                          get_num_layers_to_build)
+             patch_manager.register_patch('megatron.core.transformer.transformer_layer.TransformerLayer._get_layer_offset',
+                                          get_layer_offset_wrapper)
++            patch_manager.register_patch('megatron.core.transformer.transformer_layer.get_transformer_layer_offset',
++                                         get_layer_offset_wrapper)
+             patch_manager.register_patch('megatron.training.arguments.core_transformer_config_from_args',
+                                          core_transformer_config_from_args_wrapper)
+\ No newline at end of file

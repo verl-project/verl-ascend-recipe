@@ -66,6 +66,7 @@ A2_patch 说明：
 | vllm-ascend-camem-sleep-sync.git.patch | vllm-ascend | sleep unmap 前 torch.npu.synchronize，规避 SMMU/MTE 507011 |
 | vllm-ascend-dsv4-gate-fp32-inplace.patch | vllm-ascend | RL 更新权重时 gate fp32 权重原地 copy |
 | verl.patch | verl | seqlen 2048 对齐 / NPU sleep level=1 / bucket 传输对齐等 |
+| mindspeed-llm-fix-get-transformer-layer-offset.patch | MindSpeed-LLM | 修复 num_layer_list 自定义 PP 切分时 get_transformer_layer_offset 未同步 patch 导致的层偏移错误 |
 
 注意：A2_patch 与 patch/ 为替代关系，禁止与 install.sh(A3) / install_A5.sh 的 patch 叠加混用。
 
