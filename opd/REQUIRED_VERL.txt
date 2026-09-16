@@ -1,0 +1,10 @@
+# Ascend Megatron + vLLM OPD on the official verl release branch.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_tag
+TAG=release/v0.8.0
+COMMIT=release/v0.8.0
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@release/v0.8.0
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout release/v0.8.0 && git submodule update --init --recursive recipe && git apply --unidiff-zero ../opd/patch/verl_opd_ascend.patch
+PATCH_BASE=release/v0.8.0
+RECIPE_FOLDER=opd
+NOTES=Use the git installation method so the bundled Ascend compatibility patch is applied before the editable install.
