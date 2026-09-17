@@ -56,7 +56,7 @@ ln -s ../Megatron-LM/megatron megatron
 python /verl-ascend-recipe/low_precision/Qwen3-30B-A3B/tool/smart_create_mxfp8_weight_dir.py /model/Qwen3-30B-A3B /model/Qwen3-30B-A3B-MXFP8
 ```
 
-就会生成一个Qwen3-30B-MoE-MXFP8文件夹以及需要的quant_model_description.json
+就会生成一个Qwen3-30B-A3B-MXFP8文件夹以及需要的quant_model_description.json
 
 
 ### 启动训练
@@ -66,4 +66,19 @@ python /verl-ascend-recipe/low_precision/Qwen3-30B-A3B/tool/smart_create_mxfp8_w
 ```bash
 cd verl
 bash ../verl-ascend-recipe/low_precision/Qwen3-30B-A3B/examples/ray_start.sh
+```
+
+并在上述脚本训练开始第一步时进行绑核操作，可提高性能
+```bash
+cd /msboost_1088/affinity-sched
+export PYTHONPATH=$PWD
+
+# 1. 执行 -d 观察调度策略是否正确
+python examples/affinity_verl.py -tp-size 2 -dp-size 4 -d
+
+# 2. 执行 -r 使能自适应亲和调度
+python examples/affinity_verl.py -tp-size 2 -dp-size 4 -r
+
+# 3. 若不符合预期，可执行 -restore 重置绑核操作，恢复亲和性到初始状态
+python examples/affinity_verl.py -tp-size 2 -dp-size 4 -restore
 ```
