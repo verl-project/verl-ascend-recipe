@@ -1,0 +1,71 @@
+working_dir: ./
+excludes: ["/.git/"]
+# 八节点 Ascend A2 (910B) runtime env — 配合 train_deepseek_v4_grpo_mindspeed_vllm_8node_A2.sh 使用，
+# 通过 RUNTIME_ENV 环境变量指定本文件后启动（默认值是 verl 自带 runtime_env.yaml，仅少量通用变量）：
+#   RUNTIME_ENV=/path/to/runtime_env_A2.yaml bash train_deepseek_v4_grpo_mindspeed_vllm_8node_A2.sh
+#
+# 使用前确认：
+#   1. 各节点仓库安装路径一致（默认 /workspace-verl，对应 readme_A2.md 的安装目录），
+#      不一致时修改下方 PYTHONPATH / LD_LIBRARY_PATH / ASCEND_CUSTOM_OPP_PATH。
+#   2. 确认 CANN 安装路径（默认 /usr/local/Ascend/cann-9.1.0）。
+#   3. 注意 ray 不展开 $HOME 等 shell 变量，所有路径必须写绝对路径（容器默认 root 用 /root，
+#      非 root 用户请把 /root 替换为实际 HOME）。
+#
+# 勿混用 ascend-toolkit/latest 与 cann-9.1.0 的 lib64，否则会触发
+# libruntime_common.so undefined symbol (ErrorManager::ATCReportErrMessage)。
+env_vars:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+
+  # CANN — 统一 9.1.0，不混 ascend-toolkit/latest 的 lib
+  CANN_DIR: "/usr/local/Ascend"
+  ASCEND_HOME: "/usr/local/Ascend/cann-9.1.0"
+  ASCEND_TOOLKIT_HOME: "/usr/local/Ascend/cann-9.1.0"
+  ASCEND_OPP_PATH: "/usr/local/Ascend/cann-9.1.0/opp"
+  ASCEND_AICPU_PATH: "/usr/local/Ascend/cann-9.1.0"
+  # vllm-ascend 自编译 custom ops（COMPILE_CUSTOM_KERNELS=1 安装产物）
+  ASCEND_CUSTOM_OPP_PATH: "/workspace-verl/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
+  ATB_HOME_PATH: "/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1"
+  PATH: "/root/.local/bin:/usr/local/Ascend/cann-9.1.0/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/bishengir/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  LD_LIBRARY_PATH: "/workspace-verl/vllm-ascend/vllm_ascend:/workspace-verl/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/cann-9.1.0/lib64:/usr/local/Ascend/cann-9.1.0/x86_64-linux/devlib"
+
+  TORCHDYNAMO_VERBOSE: "1"
+  TORCHDYNAMO_DISABLE: "1"
+
+  PYTHONPATH: "/workspace-verl/MindSpeed-LLM:/workspace-verl/MindSpeed:/workspace-verl/Megatron-LM:/workspace-verl/vllm:/workspace-verl/vllm-ascend"
+
+  TASK_QUEUE_ENABLE: "1"
+  HCCL_ASYNC_ERROR_HANDLING: "0"
+  # 八机跨节点建连更慢，适当加大 timeout
+  HCCL_EXEC_TIMEOUT: "900"
+  HCCL_CONNECT_TIMEOUT: "900"
+  HCCL_HOST_SOCKET_PORT_RANGE: "auto"
+  HCCL_NPU_SOCKET_PORT_RANGE: "auto"
+  HCCL_IF_BASE_PORT: "48890"
+  RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES: "1"
+  RAY_DEDUP_LOGS: "0"
+  HYDRA_FULL_ERROR: "1"
+  STREAMS_PER_DEVICE: "32"
+
+  CPU_AFFINITY_CONF: "1"
+  USE_MULTI_BLOCK_POOL: "1"
+  OMP_PROC_BIND: "false"
+  OMP_NUM_THREADS: "10"
+  VLLM_USE_V1: "1"
+  HCCL_BUFFSIZE: "300"
+  ACL_OP_INIT_MODE: "1"
+  VLLM_VERSION: "0.23.0"
+  HCCL_OP_EXPANSION_MODE: "AIV"
+  PYTORCH_NPU_ALLOC_CONF: "max_split_size_mb:2048"
+  TRANSFORMERS_VERBOSITY: "error"
+
+  ASCEND_PROCESS_LOG_PATH: "/root/my_plog/"
+
+  # 节点内走 A2 HCCS/SDMA（默认行为，不显式设置）。
+  # 设为 "0" 会导致节点内 NPU 通信走 TCP socket，纯 IPv6 环境下连自己都连不上 (EI0006)。
+  # HCCL_INTRA_PCIE_ENABLE: "0"
+  # HCCL_INTRA_ROCE_ENABLE: "0"
+
+  # 节点内 loopback；跨节点 vLLM DP master 由 verl vLLMHttpServer 自动选 rank0 节点 IP
+  VLLM_LOOPBACK_IP: "127.0.0.1"
+  VLLM_LOGGING_LEVEL: "INFO"

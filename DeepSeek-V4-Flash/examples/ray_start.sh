@@ -10,9 +10,10 @@ export TORCHDYNAMO_VERBOSE=1
 export TORCH_COMPILE_DEBUG=1
 export TORCHDYNAMO_DISABLE=1
 
-# vllm路径
-export PYTHONPATH="/workspace-verl/vllm:$PYTHONPATH"
-export PYTHONPATH="/workspace-verl/vllm-ascend:$PYTHONPATH"
+# vllm路径（VERL_WORKSPACE 为 install 脚本执行时的工作目录，默认 /workspace-verl 对齐 readme）
+VERL_WORKSPACE=${VERL_WORKSPACE:-/workspace-verl}
+export PYTHONPATH="${VERL_WORKSPACE}/vllm:$PYTHONPATH"
+export PYTHONPATH="${VERL_WORKSPACE}/vllm-ascend:$PYTHONPATH"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export CPU_AFFINITY_CONF=1
@@ -24,9 +25,14 @@ export HCCL_BUFFSIZE=500
 export HCCL_OP_EXPANSION_MODE="AIV" 
 export PYTORCH_NPU_ALLOC_CONF="max_split_size_mb:2048"
 
-# 修改为当前需要跑的用例路径
+# 修改为当前需要跑的用例路径；支持通过第一个参数指定其他训练脚本（如 A2 的 8node 脚本），
+# 不传参时默认使用 A3 的 train_deepseek_v4_grpo_mindspeed_vllm.sh
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-DEFAULT_SH=$SCRIPT_DIR/train_deepseek_v4_grpo_mindspeed_vllm.sh
+DEFAULT_SH=${1:-$SCRIPT_DIR/train_deepseek_v4_grpo_mindspeed_vllm.sh}
+# 相对路径基于当前执行目录转绝对路径，避免后续执行受 cwd 影响
+if [[ "$DEFAULT_SH" != /* ]]; then
+    DEFAULT_SH="$(pwd)/$DEFAULT_SH"
+fi
 echo "Use $DEFAULT_SH"
 
 ulimit -n 32768

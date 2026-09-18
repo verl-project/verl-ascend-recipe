@@ -1,0 +1,267 @@
+diff --git a/verl/models/mcore/util.py b/verl/models/mcore/util.py
+index d58514d7..b0bccca8 100644
+--- a/verl/models/mcore/util.py
++++ b/verl/models/mcore/util.py
+@@ -567,6 +567,10 @@ def preprocess_bshd_engine(
+     batch_size = input_ids.shape[0]
+     seqlens_in_batch = input_ids.offsets().diff()
+     max_seqlen = seqlens_in_batch.max().item()
++    align_value = 2048
++    if max_seqlen % align_value != 0:
++        old_seqlen = max_seqlen
++        max_seqlen = ((max_seqlen + align_value - 1) // align_value) * align_value
+     tp_size = mpu.get_tensor_model_parallel_world_size()
+     # For CP, sequence length must be divisible by (2 * cp_size), and for SP by tp_size.
+     align_size = math.lcm(tp_size, 2 * cp_size) if cp_size > 1 else tp_size
+diff --git a/verl/trainer/config/engine/mindspeed.yaml b/verl/trainer/config/engine/mindspeed.yaml
+index af1e9cab..04439196 100644
+--- a/verl/trainer/config/engine/mindspeed.yaml
++++ b/verl/trainer/config/engine/mindspeed.yaml
+@@ -4,42 +4,6 @@ _target_: verl.workers.config.MindSpeedEngineConfig
+ # mindspeed_llm or mindspeed_mm
+ strategy: mindspeed_llm
+ 
+-llm_kwargs:
+-  # mindspeed_llm model config
+-  use_mcore_models: true
+-  spec: []
+-  qk_layernorm: true
+-  position_embedding_type: rope
+-  normalization: RMSNorm
+-  disable_bias_linear: true
+-  swiglu: true
+-  attention_softmax_in_fp32: true  
+-  no_gradient_accumulation_fusion: true
+-  group_query_attention: true
+-
+-  # only support transformer_engine for now
+-  transformer_impl: transformer_engine
+-
+-  no_pad_to_seq_lengths: true
+-  reset_attention_mask: true
+-  context_parallel_algo: ulysses_cp_algo
+-  attention_mask_type: general
+-
+-  # mindspeed_llm optimizer config
+-  use_flash_attn: true
+-  use_fused_rotary_pos_emb: true
+-  sequence_parallel: true
+-  use_rotary_position_embeddings: true
+-  use_fused_swiglu: true
+-  use_fused_rmsnorm: true
+-  no_masked_softmax_fusion: true
+-  use_distributed_optimizer: true
+-
+-  # mindspeed_llm train config
+-  seq_length: 10240
+-  micro_batch_size: 1
+-  initial_loss_scale: 4096
+-  init_method_std: 0.01
+-  hidden_dropout: 0.0
++llm_kwargs: {}
+ 
+ mm_kwargs: {}
+diff --git a/verl/utils/vllm/npu_vllm_patch.py b/verl/utils/vllm/npu_vllm_patch.py
+index c22647ce..627f4c20 100644
+--- a/verl/utils/vllm/npu_vllm_patch.py
++++ b/verl/utils/vllm/npu_vllm_patch.py
+@@ -193,13 +193,16 @@ if is_torch_npu_available(check_device=False):
+     import vllm
+     from packaging import version
+ 
+-    _VLLM_VERSION = version.parse(vllm.__version__)
++    try:
++        _VLLM_VERSION = version.parse(vllm.__version__)
++    except:
++        _VLLM_VERSION = version.parse("0.23.0")
+     if _VLLM_VERSION >= version.parse("0.13.0") and _VLLM_VERSION <= version.parse("0.14.0"):
+         # Disable flash_attn in RotaryEmbedding (NPU) when VLLM >= 0.13
+         from vllm.model_executor.layers.fused_moe import FusedMoE
+ 
+         patch_vllm013_rotary_emb()
+-        FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
++        #FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
+ 
+     VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2 = bool(int(os.getenv("VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2", "1")))
+     if VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2:
+diff --git a/verl/utils/vllm/patch.py b/verl/utils/vllm/patch.py
+index 951c5cad..7635039c 100644
+--- a/verl/utils/vllm/patch.py
++++ b/verl/utils/vllm/patch.py
+@@ -118,7 +118,8 @@ def patch_vllm_moe_model_weight_loader(model):
+         raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
+ 
+     if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model, tuple(SUPPORTED_MOE_MODELS)):
+-        return
++        print(f"Warning! The model is not in SUPPORTED_MOE_MODELS{SUPPORTED_MOE_MODELS}")
++        #return
+ 
+     # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,
+     # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index cbb7be48..9a00c96e 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -677,30 +677,10 @@ class MegatronEngine(BaseEngine):
+                     losses_reduced[0]["metrics"] = {}
+                 losses_reduced[0]["metrics"].update(metrics)
+ 
+-        if RouterReplayHelper.is_r2_record_action(self.tf_config):
+-            if self.tf_config.virtual_pipeline_model_parallel_size is not None:
+-                # config = self.actor_module[0].module.module.config
+-                vp_size = len(self.module)
+-                microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
+-                bs = n_micro_batch
+-                topk_idx_td = reorder_and_merge_vpp_layers(
+-                    self.mini_layer_topk_idx_list, bs, vp_size, microbatch_group_size_per_vp_stage
+-                )
+-            else:
+-                tensors = [tensor for nt in self.mini_layer_topk_idx_list for tensor in nt.unbind()]
+-                topk_idx_td = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+-            self.mini_layer_topk_idx_list = []
+-
+-            layers_topk_idx = pp_gather(topk_idx_td.to(torch.uint8), self.tf_config)
+-            use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+-            if use_dynamic_bsz and indices is not None:
+-                layers_topk_idx = restore_dynamic_batch(layers_topk_idx, indices)
+ 
+         output = {}
+         if mpu.is_pipeline_last_stage(ignore_virtual=True):
+             output = postprocess_batch_func(output_lst=losses_reduced, indices=indices, data=data)
+-            if RouterReplayHelper.is_r2_record_action(self.tf_config):
+-                output["model_output"]["routed_experts"] = layers_topk_idx
+         if enable_routing_replay:
+             RouterReplay.clear_global_indices()
+             RouterReplay.clear_global_router_replay_action()
+@@ -833,15 +813,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         else:
+             vp_rank = 0
+ 
+-        if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
+-            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
+-            for router in router_instance_list:
+-                router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+-
+-        if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
+-            layers_topk_idx = model_inputs["routed_experts"]
+-            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
+-
+         if pad_mode == DatasetPadMode.NO_PADDING:
+             label = input_ids.clone()
+         else:
+@@ -932,15 +903,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 local_cp_size=local_cp_size,
+             )
+ 
+-        # Router replay: record routing decisions for R2 mode
+-        if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
+-            merge_router_topk_indices(None, input_ids, self.mini_layer_topk_idx_list, self.tf_config, vp_rank)
+-
+-        # Router replay: switch to backward replay mode for next backward pass
+-        if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
+-            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
+-            for router in router_instance_list:
+-                router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+ 
+         return output, partial(postprocess_micro_batch_func, data=batch, local_cp_size=local_cp_size)
+ 
+diff --git a/verl/workers/engine/mindspeed/transformer_impl.py b/verl/workers/engine/mindspeed/transformer_impl.py
+index acbdcf63..1be56d30 100644
+--- a/verl/workers/engine/mindspeed/transformer_impl.py
++++ b/verl/workers/engine/mindspeed/transformer_impl.py
+@@ -93,15 +93,14 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
+         import torch.distributed
+         from megatron.core.enums import ModelType
+         from megatron.training.training import get_model
+-
++        from mindspeed_llm.pretrain_deepseek4 import model_provider
++        gpt_model_provider=model_provider
+         # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
+         if self.engine_config.forward_only:
+-            module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)
+-            return module
+-
++            module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)      
+         module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=True)
+         if self.vanilla_bridge:
+-            self.bridge.load_weights(module, self.model_config.local_path)
++            self.bridge.load_weights(module, self.model_config.local_path,memory_efficient=True)
+         else:
+             raise ValueError(f"vanilla_bridge should be true now, but got {self.vanilla_bridge}")
+ 
+diff --git a/verl/workers/engine/mindspeed/utils.py b/verl/workers/engine/mindspeed/utils.py
+index 9b600e30..ecb9de4c 100644
+--- a/verl/workers/engine/mindspeed/utils.py
++++ b/verl/workers/engine/mindspeed/utils.py
+@@ -153,10 +153,11 @@ def add_mcore_arguments(all_config: dict) -> dict:
+ 
+ 
+ def apply_patch(model_config, engine_config, optimizer_config):
+-    model_config = get_base_mcore_config_from_model_config(model_config)
+-    optimizer_config = get_base_mcore_config_from_optim_config(optimizer_config)
++    # model_config = get_base_mcore_config_from_model_config(model_config)
++    # optimizer_config = get_base_mcore_config_from_optim_config(optimizer_config)
+     engine_config = get_base_mcore_config_from_engine_config(engine_config)
+-    all_config = {**model_config, **optimizer_config, **engine_config}
++    #all_config = {**model_config, **optimizer_config, **engine_config}
++    all_config = {**engine_config}
+     mcore_config = add_mcore_arguments(all_config)
+     from mindspeed_llm.tasks.megatron_adaptor_v2 import repatch
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+index eb337939..81ac0ea1 100644
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -137,6 +137,11 @@ class BucketedWeightSender:
+                     f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
+                     f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
+                 )
++                if offset % 8 != 0 and "tid2eid" in name and weight.dtype == torch.int64:
++                    offset = (offset + 8 - 1) // 8 * 8
++
++                if offset % 4 != 0 and weight.dtype == torch.bfloat16:
++                    offset = (offset + 4 - 1) // 4 * 4
+                 bucket_meta[name] = {
+                     "name": name,
+                     "shape": weight.shape,
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 23c8594f..25aabbc1 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -53,7 +53,10 @@ from verl.workers.rollout.vllm_rollout.utils import (
+     get_vllm_max_lora_rank,
+ )
+ 
+-_VLLM_VERSION = version.parse(vllm.__version__)
++try:
++    _VLLM_VERSION = version.parse(vllm.__version__)
++except:
++    _VLLM_VERSION = version.parse("0.23.0")
+ 
+ if _VLLM_VERSION > version.parse("0.11.0"):
+     from vllm.utils.argparse_utils import FlexibleArgumentParser
+@@ -541,7 +544,6 @@ class vLLMHttpServer:
+ 
+         if hasattr(final_res.outputs[0], "num_preempted"):
+             num_preempted = final_res.outputs[0].num_preempted
+-
+         return TokenOutput(
+             token_ids=token_ids,
+             log_probs=log_probs,
+@@ -780,6 +782,7 @@ class vLLMHttpServer:
+ 
+             check_vllm_ascend_before_server_launch()
+ 
++
+         # Handle QAT (Quantization-Aware Training) configuration
+         qat_config_dict = getattr(self.config, "qat", {}) or {}
+         if qat_config_dict.get("enable", False):
+@@ -855,7 +858,7 @@ class vLLMHttpServer:
+         """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
+         # Don't use engine.sleep(level=2) here
+         # lora only update adapter weights, so set sleep level to 1
+-        if self.lora_as_adapter:
++        if self.lora_as_adapter or is_torch_npu_available(check_device=False):
+             sleep_level = 1
+         else:
+             sleep_level = 2
