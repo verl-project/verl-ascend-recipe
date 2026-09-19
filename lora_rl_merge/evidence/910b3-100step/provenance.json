@@ -1,0 +1,16 @@
+{
+  "validated_recipe_commit": "84142b1934539b1d14600cbe87a8ce92e709260f",
+  "verl_commit": "bc72e38edba78e778bfbd462638f9634b9140a76",
+  "vllm_commit": "bcf2be96120005e9aea171927f85055a6a5c0cf6",
+  "vllm_ascend_commit": "a43c8cc8057f490ed1df2c6ed66253e2d7817da4",
+  "hardware": "4 x Ascend 910B3",
+  "raw_worker_log_sha256": "b4273bb72860b9833fea873783acb833ea09f9f0f003e871adcb5a4d612ac95d",
+  "raw_worker_log_size_bytes": 443069,
+  "metrics_log_sha256": "88d92b320a89c5dc4c3b1f3067ccfcbe97769a047a617d244f2a2bac4e167c3c",
+  "extraction": "Every unmodified substring starting at step:<integer> - in the raw worker log, in original order; all training and validation metric lines are retained. Non-metric text is omitted.",
+  "validated_files": {
+    "run_qwen3_8b_lora_merge_fsdp2_npu.sh": "df53e380fdd5f4d4fcdfa934d2ab06180f8b1aed51f8e2ff42ebc1e663848a52",
+    "patches/0001-get_npu_versions-first-visible-npu-id.patch": "de8893b56da2bf650942c5a8cce0028c879ba5e7305a5218a485be2e11dcc386",
+    "patches/vllm-ascend/0001-record-sampler-stream.patch": "739c4b07f13ffeb6a2dbf7e0488579e730e10bbb671068cb547c3b717a920276"
+  }
+}

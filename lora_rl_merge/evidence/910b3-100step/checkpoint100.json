@@ -1,0 +1,138 @@
+{
+  "checkpoint": "global_step_100",
+  "latest_checkpoint": 100,
+  "files": [
+    {
+      "path": "actor/extra_state_world_size_4_rank_0.pt",
+      "bytes": 15141
+    },
+    {
+      "path": "actor/extra_state_world_size_4_rank_1.pt",
+      "bytes": 15141
+    },
+    {
+      "path": "actor/extra_state_world_size_4_rank_2.pt",
+      "bytes": 15141
+    },
+    {
+      "path": "actor/extra_state_world_size_4_rank_3.pt",
+      "bytes": 15077
+    },
+    {
+      "path": "actor/fsdp_config.json",
+      "bytes": 46
+    },
+    {
+      "path": "actor/huggingface/chat_template.jinja",
+      "bytes": 4168
+    },
+    {
+      "path": "actor/huggingface/config.json",
+      "bytes": 1595
+    },
+    {
+      "path": "actor/huggingface/generation_config.json",
+      "bytes": 214
+    },
+    {
+      "path": "actor/huggingface/tokenizer.json",
+      "bytes": 11422650
+    },
+    {
+      "path": "actor/huggingface/tokenizer_config.json",
+      "bytes": 693
+    },
+    {
+      "path": "actor/lora_train_meta.json",
+      "bytes": 67
+    },
+    {
+      "path": "actor/model_world_size_4_rank_0.pt",
+      "bytes": 4139848875
+    },
+    {
+      "path": "actor/model_world_size_4_rank_1.pt",
+      "bytes": 4139848875
+    },
+    {
+      "path": "actor/model_world_size_4_rank_2.pt",
+      "bytes": 4139848875
+    },
+    {
+      "path": "actor/model_world_size_4_rank_3.pt",
+      "bytes": 4139848875
+    },
+    {
+      "path": "actor/optim_world_size_4_rank_0.pt",
+      "bytes": 88010556
+    },
+    {
+      "path": "actor/optim_world_size_4_rank_1.pt",
+      "bytes": 88010556
+    },
+    {
+      "path": "actor/optim_world_size_4_rank_2.pt",
+      "bytes": 88010556
+    },
+    {
+      "path": "actor/optim_world_size_4_rank_3.pt",
+      "bytes": 88010556
+    },
+    {
+      "path": "data.pt",
+      "bytes": 7316
+    }
+  ],
+  "extra_state": {
+    "0": {
+      "scheduler_last_epoch": 100,
+      "rng_keys": [
+        "cpu",
+        "npu",
+        "numpy",
+        "random"
+      ],
+      "sha256": "22d82a3406ee69cdd2a2dfe3c6125d4d84a4c278bc0b97506d70ad7f1b69e6dc"
+    },
+    "1": {
+      "scheduler_last_epoch": 100,
+      "rng_keys": [
+        "cpu",
+        "npu",
+        "numpy",
+        "random"
+      ],
+      "sha256": "8bbc2ff3429665dcb35faa6c494a13124ae7ecc36b87567dd0ed5d01194a22a1"
+    },
+    "2": {
+      "scheduler_last_epoch": 100,
+      "rng_keys": [
+        "cpu",
+        "npu",
+        "numpy",
+        "random"
+      ],
+      "sha256": "0b738900e6dc7f02bc211587eafa9711885f13fb49c7cf70a0f562309803897a"
+    },
+    "3": {
+      "scheduler_last_epoch": 100,
+      "rng_keys": [
+        "cpu",
+        "npu",
+        "numpy",
+        "random"
+      ],
+      "sha256": "ce19825860591892fc6375f9885a54079566d14c0d9b9ea4fbc446a54afb6938"
+    }
+  },
+  "fsdp_config": {
+    "FSDP_version": 2,
+    "world_size": 4
+  },
+  "lora_train_meta": {
+    "r": 32,
+    "lora_alpha": 64,
+    "task_type": "CAUSAL_LM"
+  },
+  "limitation": "Model and optimizer shards were not loaded; this is not a restoration test."
+}

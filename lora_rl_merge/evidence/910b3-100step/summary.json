@@ -1,0 +1,40 @@
+{
+  "training_steps": 100,
+  "physical_device_count": 4,
+  "all_logged_training_metrics_finite": true,
+  "zero_gradient_steps": [],
+  "reward_first_10_mean": 0.3916015625,
+  "reward_final_10_mean": 0.835546875,
+  "total_training_step_tokens": 71621758.0,
+  "total_timed_step_seconds": 27315.25477820309,
+  "weighted_tokens_per_second_per_npu": 655.5106165177748,
+  "minimum_tokens_per_second_per_npu": 565.1711475341843,
+  "validation": [
+    {
+      "step": 0,
+      "gsm8k_accuracy": 0.24715693707354056
+    },
+    {
+      "step": 20,
+      "gsm8k_accuracy": 0.7012888551933283
+    },
+    {
+      "step": 40,
+      "gsm8k_accuracy": 0.8021228203184231
+    },
+    {
+      "step": 60,
+      "gsm8k_accuracy": 0.866565579984837
+    },
+    {
+      "step": 80,
+      "gsm8k_accuracy": 0.8908263836239575
+    },
+    {
+      "step": 100,
+      "gsm8k_accuracy": 0.8066717210007581
+    }
+  ],
+  "limitations": "Checks logged metrics only; excludes process exit, checkpoint restore and external acceptance.",
+  "log_sha256": "c164af433b5671c83519c5ac9dacf4b65be6c30ba86697e52191745a3c070adc"
+}
