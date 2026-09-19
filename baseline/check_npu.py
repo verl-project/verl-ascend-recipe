@@ -113,32 +113,33 @@ def check(A, B):
     fail = []
     print("\n==================== 指标校验结果 ====================")
 
-    # 1. 内存：绝对值差值 <=1
+    # 1. 内存：单向，超出基线 >1GB 才失败（内存回退 = 占用升高；占用降低是好事，
+    #    不应因 rollout token 抽样的夜间波动（~3GB）而失败）
     key = MEMORY_KEY
     a = A[key]
     b = B[key]
     diff = a - b
-    print(f"【内存，绝对值差值<=1】{key:<40} | A={a:.6f} B={b:.6f} | 差值={diff:.6f}")
-    if abs(diff) > 1:
-        fail.append(f"{key} 差值 {diff:.6f}，超出阈值1")
+    print(f"【内存，超出基线>1GB】{key:<42} | A={a:.6f} B={b:.6f} | 差值={diff:.6f}")
+    if diff > 1:
+        fail.append(f"{key} 差值 {diff:.6f}，超出基线1GB")
 
-    # 2. perf/throughput：变化率 <=5%
+    # 2. perf/throughput：单向，下降超过5%才失败（吞吐回退 = 变慢；变快不失败）
     key = PERF_KEYS[0]
     a = A[key]
     b = B[key]
     pct = (a - b) / b * 100
-    print(f"【性能，变化率<=5%】{key:<44} | A={a:.6f} B={b:.6f} | 变化={pct:.2f}%")
-    if abs(pct) > 5:
-        fail.append(f"{key} 变化率 {pct:.2f}%，超出阈值5%")
+    print(f"【性能，下降幅度<=5%】{key:<43} | A={a:.6f} B={b:.6f} | 变化={pct:.2f}%")
+    if pct < -5:
+        fail.append(f"{key} 变化率 {pct:.2f}%，下降超过阈值5%")
 
-    # 3. timing_s/step：变化率 <=5%
+    # 3. timing_s/step：单向，上升超过5%才失败（耗时回退 = 变慢；变快不失败）
     key = PERF_KEYS[1]
     a = A[key]
     b = B[key]
     pct = (a - b) / b * 100
-    print(f"【性能，变化率<=5%】{key:<44} | A={a:.6f} B={b:.6f} | 变化={pct:.2f}%")
-    if abs(pct) > 5:
-        fail.append(f"{key} 变化率 {pct:.2f}%，超出阈值5%")
+    print(f"【性能，上升幅度<=5%】{key:<43} | A={a:.6f} B={b:.6f} | 变化={pct:.2f}%")
+    if pct > 5:
+        fail.append(f"{key} 变化率 {pct:.2f}%，上升超过阈值5%")
 
     # 4. critic/rewards/mean：绝对值差值 <=0.05
     key = ACC_KEYS[0]
