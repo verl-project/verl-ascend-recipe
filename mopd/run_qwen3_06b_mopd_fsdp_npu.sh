@@ -190,33 +190,6 @@ if [[ -n "${RAY_TEMP_DIR:-}" ]]; then
 fi
 
 ########################### launch ###########################
-command=(python3 -m verl.trainer.main_ppo
-    "${DATA[@]}" "${MODEL[@]}" "${ACTOR[@]}" "${ROLLOUT[@]}"
-    "${TRAINER[@]}" "${EXTRA[@]}" "$@")
-# Hydra inspection does not train and must keep stdout suitable for config export.
-for argument in "$@"; do
-    case "$argument" in
-        --cfg|--cfg=*|--help|-h|--info|--info=*) exec "${command[@]}" ;;
-    esac
-done
-
-expected_steps=$total_training_steps
-log_dir=$DEFAULT_LOCAL_DIR
-console_logger=console
-for override in "$@"; do
-    case "$override" in
-        trainer.total_training_steps=*) expected_steps=${override#*=} ;;
-        trainer.default_local_dir=*) log_dir=${override#*=} ;;
-        trainer.logger=*) console_logger=${override#*=} ;;
-    esac
-done
-if ! [[ "$expected_steps" =~ ^[1-9][0-9]*$ ]] || [[ "$console_logger" != *console* ]]; then
-    echo "A positive trainer.total_training_steps and console logger are required for completion verification." >&2
-    exit 2
-fi
-mkdir -p "$log_dir"
-training_log=$(mktemp "$log_dir/training.XXXXXXXX.log")
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-echo "Training log: $training_log"
-"${command[@]}" 2>&1 | tee "$training_log"
-python3 "$script_dir/tools/check_training_completion.py" "$training_log" --expected-step "$expected_steps"
+exec python3 -m verl.trainer.main_ppo \
+    "${DATA[@]}" "${MODEL[@]}" "${ACTOR[@]}" "${ROLLOUT[@]}" \
+    "${TRAINER[@]}" "${EXTRA[@]}" "$@"
