@@ -15,6 +15,7 @@
 | 算法 | ReMax，采样 response 与 greedy baseline 的 reward 差作为 advantage |
 | 训练后端 | FSDP actor/reference |
 | Rollout 后端 | vLLM-Ascend |
+| VeRL / Docker 镜像 | v0.8.0 / `quay.io/ascend/verl:verl-9.0.0-910b-ubuntu22.04-py3.11-v0.8.0` |
 | 验证平台 | Atlas 800T A2，8 x Ascend 910B3 64 GB |
 | 验证规模 | Qwen3-8B 连续 60 steps，另含 smoke、稳定性和长序列压力测试 |
 | 运行脚本 | `verl_ascend_practice/run_qwen3_8b_remax_fsdp_npu.sh` |
@@ -83,7 +84,6 @@ rollout 使用 full-decode-only ACL Graph，并开启 cache engine 释放。
 | 组件 | 版本 |
 | --- | --- |
 | 硬件 | Atlas 800T A2，8 x Ascend 910B3 64 GB |
-| VeRL / Docker 镜像 | v0.8.0 / `quay.io/ascend/verl:verl-9.0.0-910b-ubuntu22.04-py3.11-v0.8.0` |
 | CANN | 25.5.1 |
 | torch-npu | 2.9.0.post2 |
 | vLLM | 0.18 |
