@@ -16,6 +16,7 @@
 | 训练后端 | FSDP actor/reference |
 | Rollout 后端 | vLLM-Ascend |
 | VeRL / Docker 镜像 | v0.8.0 / `quay.io/ascend/verl:verl-9.0.0-910b-ubuntu22.04-py3.11-v0.8.0` |
+| VeRL commit id | `7311fe825fb847c87c6d696afb4318fdbaab0259` |
 | 验证平台 | Atlas 800T A2，8 x Ascend 910B3 64 GB |
 | 验证规模 | Qwen3-8B 连续 60 steps，另含 smoke、稳定性和长序列压力测试 |
 | 运行脚本 | `verl_ascend_practice/run_qwen3_8b_remax_fsdp_npu.sh` |
