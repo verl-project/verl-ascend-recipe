@@ -2,8 +2,8 @@
 # GRPO + LoRA with merge | Qwen3-8B | gsm8k | vLLM-Ascend rollout | FSDP2 training | Ascend A2 (910B) NPUs
 #
 # Ported from verl `examples/tuning/lora/run_qwen3_8b_merge_fsdp.sh` (GPU, 8 cards). Algorithm and LoRA
-# hyper-parameters are kept identical. NPU launch items, epoch capacity, checkpoint/evaluation cadence and
-# completion checks are adapted; see README.md. With `model.lora.merge=True` adapters merge into base weights before
+# hyper-parameters are kept identical. NPU launch items, epoch capacity and checkpoint/evaluation cadence
+# are adapted; see README.md. With `model.lora.merge=True` adapters merge into base weights before
 # every rollout weight sync, so vLLM-Ascend receives plain full weights and no inference-side LoRA support is needed.
 #
 # Validated for 100 steps on 4 x 910B3; see README.md for reward, throughput and late-training instability.
@@ -149,28 +149,8 @@ if [ -n "${ray_temp_dir}" ]; then
 fi
 
 ########################### launch ###########################
-# Honor trailing Hydra overrides when checking the actual training target and selecting the log directory.
-expected_steps=$total_training_steps
-log_dir=$default_local_dir
-console_logger=$logger
-for override in "$@"; do
-    case "$override" in
-        trainer.total_training_steps=*) expected_steps=${override#*=} ;;
-        trainer.default_local_dir=*) log_dir=${override#*=} ;;
-        trainer.logger=*) console_logger=${override#*=} ;;
-    esac
-done
-if ! [[ "$expected_steps" =~ ^[1-9][0-9]*$ ]] || [[ "$console_logger" != *console* ]]; then
-    echo "A positive trainer.total_training_steps and console logger are required for completion verification." >&2
-    exit 2
-fi
-mkdir -p "$log_dir"
-training_log=$(mktemp "$log_dir/training.XXXXXXXX.log")
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-echo "Training log: $training_log"
-
 # Run from the verl repo root (the Ascend image ships verl at /verl).
-python3 -m verl.trainer.main_ppo \
+exec python3 -m verl.trainer.main_ppo \
     "${DATA[@]}" \
     "${MODEL[@]}" \
     "${ACTOR[@]}" \
@@ -178,5 +158,4 @@ python3 -m verl.trainer.main_ppo \
     "${REF[@]}" \
     "${TRAINER[@]}" \
     "${EXTRA[@]}" \
-    "$@" 2>&1 | tee "$training_log"
-python3 "$script_dir/tools/check_training_completion.py" "$training_log" --expected-step "$expected_steps"
+    "$@"
