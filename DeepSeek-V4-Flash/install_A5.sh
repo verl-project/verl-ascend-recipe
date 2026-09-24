@@ -50,7 +50,10 @@ pip install transformers==5.8.1
 
 echo "7.apply patch"
 cd Megatron-LM
-git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/megatron.patch && cd ..
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/megatron_A5.patch && cd ..
+
+cd MindSpeed-LLM
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/mindspeed-llm_A5.patch && cd ..
 
 cd mbridge
 git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/mbridge_A5.patch && cd ..

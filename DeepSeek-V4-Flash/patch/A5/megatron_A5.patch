@@ -1,0 +1,114 @@
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index a00d1a35e..c8020bd9c 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -385,7 +385,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+ 
+                 # fp32 params.
+                 elif model_param.type() == 'torch.cuda.FloatTensor':
+-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
++                    shard_model_param = model_param.detach().view(-1)[
++                        param_range.start : param_range.end
++                    ]
+                     model_fp32_params_this_group.append(model_param)
+                     shard_fp32_params_this_group.append(shard_model_param)
+                     tensor_parallel.copy_tensor_model_parallel_attributes(
+diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
+index 26a96f457..f8cbc5fd4 100644
+--- a/megatron/core/pipeline_parallel/p2p_communication.py
++++ b/megatron/core/pipeline_parallel/p2p_communication.py
+@@ -43,11 +43,11 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
+     send_next_shape_tensor = None
+     if recv_prev:
+         recv_prev_shape_tensor = torch.empty(
+-            (3), device=torch.cuda.current_device(), dtype=torch.int64
++            (4), device=torch.cuda.current_device(), dtype=torch.int64
+         )
+     if recv_next:
+         recv_next_shape_tensor = torch.empty(
+-            (3), device=torch.cuda.current_device(), dtype=torch.int64
++            (4), device=torch.cuda.current_device(), dtype=torch.int64
+         )
+     if tensor_send_prev is not None:
+         send_prev_shape_tensor = torch.tensor(
+@@ -105,11 +105,11 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
+         # should take this out once the bug with batch_isend_irecv is resolved.
+         torch.cuda.synchronize()
+ 
+-    recv_prev_shape = [0, 0, 0]
++    recv_prev_shape = [0, 0, 0, 0]
+     if recv_prev_shape_tensor is not None:
+         recv_prev_shape = recv_prev_shape_tensor.tolist()
+ 
+-    recv_next_shape = [0, 0, 0]
++    recv_next_shape = [0, 0, 0, 0]
+     if recv_next_shape_tensor is not None:
+         recv_next_shape = recv_next_shape_tensor.tolist()
+ 
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 2b68a5a5f..e6cf2469b 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -568,8 +568,8 @@ class TransformerConfig(ModelParallelConfig):
+         if self.kv_channels is None:
+             self.kv_channels = self.hidden_size // self.num_attention_heads
+ 
+-        if self.num_query_groups is None:
+-            self.num_query_groups = self.num_attention_heads
++        #if self.num_query_groups is None:
++        self.num_query_groups = self.num_attention_heads
+ 
+         if self.num_query_groups % self.tensor_model_parallel_size != 0:
+             raise ValueError(
+diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+index 3d62de572..2ef72db24 100644
+--- a/megatron/core/transformer/transformer_layer.py
++++ b/megatron/core/transformer/transformer_layer.py
+@@ -29,6 +29,47 @@ def get_transformer_layer_offset(config: TransformerConfig):
+         if pp_decoder_start is not None:
+             pipeline_rank = pipeline_rank - pp_decoder_start
+ 
++    # MindSpeed-LLM supports an explicit, uneven number of transformer layers
++    # per pipeline stage through ``num_layer_list``.  The model builder already
++    # uses that list to decide how many local layers to construct, so the
++    # global layer-number offset must use the same prefix sum.  Falling through
++    # to Megatron's uniform ``num_layers // pp_size`` calculation creates
++    # duplicate global layer ids and drops the final layers (for example,
++    # 43 layers with PP4 10,11,11,11 becomes 0..9, 10..20, 20..30, 30..40).
++    raw_num_layer_list = getattr(config, "num_layer_list", None)
++    if raw_num_layer_list:
++        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
++            raise ValueError("num_layer_list does not support virtual pipeline parallelism")
++
++        if isinstance(raw_num_layer_list, str):
++            num_layer_list = [
++                int(value.strip())
++                for value in raw_num_layer_list.strip("'\"").replace(";", ",").split(",")
++                if value.strip()
++            ]
++        else:
++            num_layer_list = [int(value) for value in raw_num_layer_list]
++
++        pp_size = config.pipeline_model_parallel_size
++        if len(num_layer_list) != pp_size:
++            raise ValueError(
++                "num_layer_list length must equal pipeline_model_parallel_size: "
++                f"num_layer_list={num_layer_list}, pp_size={pp_size}"
++            )
++        if any(num_layers < 0 for num_layers in num_layer_list):
++            raise ValueError(f"num_layer_list must contain non-negative values: {num_layer_list}")
++        if sum(num_layer_list) != config.num_layers:
++            raise ValueError(
++                "num_layer_list must sum to config.num_layers: "
++                f"num_layer_list={num_layer_list}, sum={sum(num_layer_list)}, "
++                f"num_layers={config.num_layers}"
++            )
++        if not 0 <= pipeline_rank < pp_size:
++            raise ValueError(f"pipeline rank {pipeline_rank} is outside PP size {pp_size}")
++
++        return sum(num_layer_list[:pipeline_rank])
++
++
+     if config.pipeline_model_parallel_size > 1:
+ 
+         if (
