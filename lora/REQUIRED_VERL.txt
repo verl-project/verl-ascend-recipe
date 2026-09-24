@@ -1,0 +1,8 @@
+# Qwen3-8B LoRA from adapter on Ascend NPU
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=rolling
+BRANCH=main
+VERL_COMMIT=8f8b122195ecf43475679fb6ee0204ee33f387c5
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@8f8b122195ecf43475679fb6ee0204ee33f387c5
+RECIPE_FOLDER=lora
+NOTES=The recipe uses the native FSDP LoRA adapter loading and vLLM weight synchronization available on this revision.
