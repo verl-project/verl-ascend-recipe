@@ -54,6 +54,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | opd | [`opd/REQUIRED_VERL.txt`](opd/REQUIRED_VERL.txt) |
 | dapo | [`recipe/dapo/REQUIRED_VERL.txt`](dapo/REQUIRED_VERL.txt) |
 | dppo | [`recipe/dppo/REQUIRED_VERL.txt`](dppo/REQUIRED_VERL.txt) |
+| [Qwen3-8B LoRA merge](grpo/lora_rl_merge/README.md) | [grpo/lora_rl_merge/REQUIRED_VERL.txt](grpo/lora_rl_merge/REQUIRED_VERL.txt) |
 | deepeyes | [`recipe/deepeyes/REQUIRED_VERL.txt`](deepeyes/REQUIRED_VERL.txt) |
 | flash_rl_ascend | [`recipe/flash_rl_ascend/REQUIRED_VERL.txt`](flash_rl_ascend/REQUIRED_VERL.txt) |
 | r1_ascend | [`recipe/r1_ascend/REQUIRED_VERL.txt`](r1_ascend/REQUIRED_VERL.txt) |

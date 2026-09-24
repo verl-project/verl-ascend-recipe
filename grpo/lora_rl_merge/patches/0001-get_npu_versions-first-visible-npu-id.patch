@@ -1,0 +1,173 @@
+diff --git a/tests/utils/test_check_ipc_version_support_on_npu.py b/tests/utils/test_check_ipc_version_support_on_npu.py
+index d0b89005..4751832e 100644
+--- a/tests/utils/test_check_ipc_version_support_on_npu.py
++++ b/tests/utils/test_check_ipc_version_support_on_npu.py
+@@ -16,7 +16,7 @@ import logging
+ import unittest
+ from unittest.mock import Mock, mock_open, patch
+ 
+-from verl.utils.device import check_ipc_version_support, get_npu_versions
++from verl.utils.device import check_ipc_version_support, get_first_visible_npu_id, get_npu_versions
+ 
+ 
+ class TestCheckIPCVersionSupport(unittest.TestCase):
+@@ -236,5 +236,106 @@ class TestGetNPUVersions(unittest.TestCase):
+         self.assertIn("Could not find version in CANN toolkit info file", str(context.exception))
+ 
+ 
++NPU_SMI_INFO_M_A2_SUBSET = (
++    "\tNPU ID                         Chip ID                        Chip Logic ID                  Chip Name\n"
++    "\t4                              0                              0                              Ascend 910B1\n"
++    "\t4                              1                              -                              Mcu\n"
++    "\t5                              0                              1                              Ascend 910B1\n"
++    "\t5                              1                              -                              Mcu\n"
++)
++
++NPU_SMI_INFO_M_A3_TWO_DIES = (
++    "\tNPU ID                         Chip ID                        Chip Logic ID                  Chip Name\n"
++    "\t2                              0                              0                              Ascend 910_9392\n"
++    "\t2                              1                              1                              Ascend 910_9392\n"
++    "\t2                              2                              -                              Mcu\n"
++)
++
++
++class TestGetFirstVisibleNpuId(unittest.TestCase):
++    """Test cases for get_first_visible_npu_id (npu-smi info -m parsing)."""
++
++    @patch("subprocess.run")
++    def test_subset_container_returns_first_physical_id(self, mock_run):
++        mock_run.return_value = Mock(stdout=NPU_SMI_INFO_M_A2_SUBSET)
++        self.assertEqual(get_first_visible_npu_id(), 4)
++        mock_run.assert_called_once_with(["npu-smi", "info", "-m"], capture_output=True, text=True, check=True)
++
++    @patch("subprocess.run")
++    def test_a3_two_dies_returns_card_id(self, mock_run):
++        mock_run.return_value = Mock(stdout=NPU_SMI_INFO_M_A3_TWO_DIES)
++        self.assertEqual(get_first_visible_npu_id(), 2)
++
++    @patch("subprocess.run")
++    def test_returns_none_when_no_logic_chip_rows(self, mock_run):
++        mock_run.return_value = Mock(stdout="Software Version : 25.5.0\n")
++        self.assertIsNone(get_first_visible_npu_id())
++
++    @patch("subprocess.run")
++    def test_returns_none_when_npu_smi_fails(self, mock_run):
++        import subprocess
++
++        mock_run.side_effect = subprocess.CalledProcessError(215, ["npu-smi", "info", "-m"])
++        self.assertIsNone(get_first_visible_npu_id())
++
++
++class TestGetNpuVersionsProbeDevice(unittest.TestCase):
++    """get_npu_versions must query the first visible card instead of a hardcoded NPU ID."""
++
++    @patch("subprocess.run")
++    @patch("platform.machine")
++    @patch("os.path.exists")
++    @patch("builtins.open", new_callable=mock_open, read_data="version=9.0.0\n")
++    def test_uses_first_visible_npu_id(self, mock_file, mock_exists, mock_machine, mock_run):
++        def fake_run(cmd, **kwargs):
++            if cmd[:3] == ["npu-smi", "info", "-m"]:
++                return Mock(stdout=NPU_SMI_INFO_M_A2_SUBSET)
++            if cmd[:4] == ["npu-smi", "info", "-t", "board"]:
++                # Only cards 4 and 5 exist in this container; anything else fails like real npu-smi (exit 215).
++                if cmd[5] in ("4", "5"):
++                    return Mock(stdout="Software Version : 26.0.rc1\n")
++                import subprocess
++
++                raise subprocess.CalledProcessError(215, cmd)
++            raise AssertionError(f"unexpected command {cmd}")
++
++        mock_run.side_effect = fake_run
++        mock_machine.return_value = "aarch64"
++        mock_exists.return_value = True
++
++        software_version, cann_version = get_npu_versions()
++
++        self.assertEqual(software_version, "26.0.rc1")
++        self.assertEqual(cann_version, "9.0.0")
++        board_calls = [
++            c.args[0] for c in mock_run.call_args_list if c.args[0][:4] == ["npu-smi", "info", "-t", "board"]
++        ]
++        self.assertEqual(board_calls, [["npu-smi", "info", "-t", "board", "-i", "4"]])
++
++    @patch("subprocess.run")
++    @patch("platform.machine")
++    @patch("os.path.exists")
++    @patch("builtins.open", new_callable=mock_open, read_data="version=9.0.0\n")
++    def test_falls_back_to_legacy_id_when_mapping_unavailable(self, mock_file, mock_exists, mock_machine, mock_run):
++        def fake_run(cmd, **kwargs):
++            if cmd[:3] == ["npu-smi", "info", "-m"]:
++                import subprocess
++
++                raise subprocess.CalledProcessError(1, cmd)
++            return Mock(stdout="Software Version : 25.5.0\n")
++
++        mock_run.side_effect = fake_run
++        mock_machine.return_value = "x86_64"
++        mock_exists.return_value = True
++
++        software_version, _ = get_npu_versions()
++
++        self.assertEqual(software_version, "25.5.0")
++        board_calls = [
++            c.args[0] for c in mock_run.call_args_list if c.args[0][:4] == ["npu-smi", "info", "-t", "board"]
++        ]
++        self.assertEqual(board_calls, [["npu-smi", "info", "-t", "board", "-i", "1"]])
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/verl/utils/device.py b/verl/utils/device.py
+index 33f0743f..f388c8ec 100644
+--- a/verl/utils/device.py
++++ b/verl/utils/device.py
+@@ -182,6 +182,28 @@ def get_device_capability(device_id: int = 0) -> tuple[int | None, int | None]:
+     return get_platform().get_device_capability(device_id)
+ 
+ 
++def get_first_visible_npu_id() -> int | None:
++    """Return the NPU ID of the first card visible to ``npu-smi``, or None if it cannot be determined.
++
++    ``npu-smi info -m`` lists one row per chip as ``NPU ID | Chip ID | Chip Logic ID | Chip Name``.
++    Rows whose ``Chip Logic ID`` is ``-`` are auxiliary chips (e.g. Mcu) and are skipped. Containers
++    that only mount a subset of cards (e.g. ``/dev/davinci4``-``/dev/davinci7``) keep the physical
++    NPU IDs, so the first logical chip's NPU ID is the correct argument for ``npu-smi info -i``.
++    """
++    try:
++        result = subprocess.run(["npu-smi", "info", "-m"], capture_output=True, text=True, check=True)
++    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
++        return None
++    for line in str(result.stdout).splitlines():
++        parts = line.split()
++        if len(parts) < 4 or not parts[0].isdigit() or not parts[1].isdigit():
++            continue
++        if parts[2] == "-":
++            continue
++        return int(parts[0])
++    return None
++
++
+ def get_npu_versions() -> tuple[str, str]:
+     """Get the software version and CANN toolkit version for NPU devices.
+ 
+@@ -191,13 +213,16 @@ def get_npu_versions() -> tuple[str, str]:
+     Raises:
+         RuntimeError: If unable to retrieve version information
+     """
+-    # Check npu-smi software version
++    # Check npu-smi software version. Query the first card that npu-smi can actually see; fall back to
++    # the historical default "1" when the mapping table is unavailable (e.g. older npu-smi, mocked runs).
++    first_npu_id = get_first_visible_npu_id()
++    probe_npu_id = str(first_npu_id) if first_npu_id is not None else "1"
+     try:
+         result = subprocess.run(
+-            ["npu-smi", "info", "-t", "board", "-i", "1"], capture_output=True, text=True, check=True
++            ["npu-smi", "info", "-t", "board", "-i", probe_npu_id], capture_output=True, text=True, check=True
+         )
+     except subprocess.CalledProcessError:
+-        # Card 1 not found (common in K8s with non-consecutive device IDs)
++        # Probed card not found (common in K8s with non-consecutive device IDs)
+         # Try first device from ASCEND_VISIBLE_DEVICES env var
+         visible_devices = os.environ.get("ASCEND_VISIBLE_DEVICES")
+         if not visible_devices:
