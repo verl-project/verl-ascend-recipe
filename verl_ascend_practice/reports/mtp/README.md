@@ -18,7 +18,6 @@
 | 验证平台 | Atlas 800T A2，4 x Ascend 910B |
 | 训练规模 | 100 global steps |
 | 运行脚本 | `verl_ascend_practice/run_mimo_7b_mtp_megatron_npu.sh` |
-| 必要补丁 | `verl_ascend_practice/patches/mtp_checkpoint_engine_reoffload.patch` |
 
 ## 2. 适配方案
 
@@ -37,8 +36,8 @@ model_engine=megatron
 
 MiMo-7B-RL 的 MTP head 参与 Megatron actor 训练，rollout 仍使用主模型生成。SGLang 在生成
 阶段计算 rollout log probability，`rollout_correction.bypass_mode` 将其复用为 PPO old-policy
-log probability。权重更新复用 verl 通用 checkpoint engine；必要补丁在同步完成后恢复已启用
-的 actor parameter offload。
+log probability。权重更新复用 verl 通用 checkpoint engine；参数同步完成后的 actor parameter
+offload 恢复由 [verl #7631](https://github.com/verl-project/verl/pull/7631) 跟踪。
 
 ```text
 MATH prompts
@@ -121,11 +120,10 @@ python3 examples/data_preprocess/math_dataset.py \
 
 ## 4. 运行与恢复
 
-在 verl 根目录应用必要补丁并启动训练：
+使用包含 [verl #7631](https://github.com/verl-project/verl/pull/7631) 对应修复的 verl 版本，
+在 verl 根目录启动训练：
 
 ```bash
-git apply /path/to/verl-ascend-recipe/verl_ascend_practice/patches/mtp_checkpoint_engine_reoffload.patch
-
 DEVICE=npu \
 MODEL_PATH=/path/to/MiMo-7B-RL \
 DATA_ROOT=/path/to/math \
@@ -189,7 +187,7 @@ moving average；reward 使用 `critic/score/mean`，MTP loss 使用
 | reward 上升 | 首 10 步均值 -0.808044，末 10 步均值 0.089099 |
 | MTP loss 有效下降 | 首 10 步均值 0.597910，末 10 步均值 0.355875 |
 | 无 GPU 标杆时 TPS > 100 | 4 NPU 端到端吞吐 533.286 token/s |
-| 提供可复现 recipe | 提供模型、数据、环境、补丁、启动、checkpoint/resume 和日志配置 |
+| 提供可复现 recipe | 提供模型、数据、环境、启动、checkpoint/resume 和日志配置 |
 
 本次结果覆盖 Issue #20 的长跑、reward、MTP loss 和性能验收项，并提供了 MiMo-7B-RL
 MTP 在 Megatron + SGLang-Ascend 组合上的完整复现入口。

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 # MTP | MiMo-7B | Megatron training | SGLang-Ascend rollout | Ascend NPUs by default
-# With OFFLOAD=True, apply verl_ascend_practice/patches/mtp_checkpoint_engine_reoffload.patch to verl
-# until the equivalent generic checkpoint-engine fix is available upstream.
 
 set -xeuo pipefail
 
