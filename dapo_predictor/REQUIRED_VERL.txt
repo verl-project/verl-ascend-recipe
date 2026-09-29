@@ -1,0 +1,7 @@
+# DAPO predictor + EPWS — tested against the rolling DAPO pin
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=bcb638649a50e58494a8ddd92085ad1174f674b8
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bcb638649a50e58494a8ddd92085ad1174f674b8
+RECIPE_FOLDER=dapo_predictor
+NOTES=Uses actor_rollout_ref.rollout.agent.agent_loop_manager_class from this pinned verl commit.

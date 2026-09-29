@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 from codetiming import Timer
@@ -15,10 +17,13 @@ from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, u
 from verl.utils.device import get_device_id
 from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.utils.profiler import DistProfiler
-from verl.utils.seqlen_balancing import prepare_dynamic_batch
+from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
+
+from .length_scheduler.calibration import MonotoneCalibration, fit_pava
+from .length_scheduler.predictor import CensoredLogNormalPredictor
 
 
 class PredictorDataParallelPPOActor(DataParallelPPOActor):
@@ -35,6 +40,10 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
             hidden_size = getattr(getattr(actor_module.module, "config", None), "hidden_size", None)
         hidden_size = hidden_size or 4096
         self.predictor_scorer = nn.Linear(hidden_size, 1, bias=False).to(next(actor_module.parameters()).device)
+        self.predictor_calibration: MonotoneCalibration | None = None
+        self.predictor_calibration_hidden = torch.empty((0, hidden_size), dtype=torch.float32)
+        self.predictor_calibration_tokens = torch.empty((0,), dtype=torch.float32)
+        self.distribution_predictor: CensoredLogNormalPredictor | None = None
         if torch.distributed.is_initialized():
             for param in self.predictor_scorer.parameters():
                 torch.distributed.broadcast(param.data, src=0)
@@ -70,12 +79,51 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
                 # hidden_states = self. _forward_micro_batch(model_inputs, temperature)
                 hidden_states_list.append(hidden_states)
 
-        # Concatenate hidden states from all micro batches
+        # Concatenate hidden states from all micro batches. Dynamic batching
+        # rearranges rows by sequence length, so restore the caller's row order
+        # before returning prompt-aligned predictions.
         all_hidden_states = torch.concat(hidden_states_list, dim=0)  # [total_batch_size, hidden_size]
+        if use_dynamic_bsz:
+            all_hidden_states = restore_dynamic_batch(all_hidden_states, batch_idx_list)
 
         return all_hidden_states
 
-    def _forward_predictor_micro_batch(self, micro_batch, temperature):
+    def extract_hidden_taps(self, data: DataProto, layer_indices: tuple[int, ...]) -> dict[int, torch.Tensor]:
+        """Extract last-token hidden states for the configured D2 decoder taps."""
+        if not layer_indices or len(set(layer_indices)) != len(layer_indices):
+            raise ValueError("layer_indices must be non-empty and unique")
+        self.actor_module.eval()
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        data = data.select(
+            batch_keys=["input_ids", "attention_mask", "position_ids"],
+            non_tensor_batch_keys=["multi_modal_inputs"] if has_multi_modal_inputs else [],
+        )
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(
+                data,
+                max_token_len=max_token_len,
+                dp_group=torch.distributed.group.WORLD,
+            )
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        by_layer: dict[int, list[torch.Tensor]] = {index: [] for index in layer_indices}
+        for micro_batch in micro_batches:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            with torch.no_grad():
+                hidden = self._forward_predictor_micro_batch(model_inputs, temperature, layer_indices=layer_indices)
+            for index in layer_indices:
+                by_layer[index].append(hidden[index])
+        result = {index: torch.cat(rows, dim=0) for index, rows in by_layer.items()}
+        if use_dynamic_bsz:
+            result = {index: restore_dynamic_batch(rows, batch_idx_list) for index, rows in result.items()}
+        return result
+
+    def _forward_predictor_micro_batch(self, micro_batch, temperature, layer_indices: tuple[int, ...] | None = None):
         """Process a single micro batch following the full dp_actor forward pass."""
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
@@ -154,26 +202,23 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
                     use_cache=False,
                     **extra_args,
                 )
-                full_hidden_states = output.hidden_states[-1]
-
-                if hasattr(output, "hidden_states") and output.hidden_states is not None:
-                    last_hidden_states = output.hidden_states[-1].squeeze(0)  # (total_nnz, hidden_size)
-
+                selected_layers = layer_indices or (-1,)
+                full_hidden_by_layer = {}
+                for layer_index in selected_layers:
+                    layer_hidden = output.hidden_states[layer_index].squeeze(0)
                     if self.use_ulysses_sp:
-                        last_hidden_states = gather_outputs_and_unpad(
-                            last_hidden_states,
+                        layer_hidden = gather_outputs_and_unpad(
+                            layer_hidden,
                             gather_dim=0,
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
-
-                    full_hidden_states = pad_input(
-                        hidden_states=last_hidden_states.unsqueeze(-1),
+                    full_hidden_by_layer[layer_index] = pad_input(
+                        hidden_states=layer_hidden.unsqueeze(-1),
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
-                    )
-                    full_hidden_states = full_hidden_states.squeeze(-1)  # [batch_size, seq_len, hidden_size]
+                    ).squeeze(-1)
             else:
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -183,14 +228,20 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
                     output_hidden_states=True,
                     use_cache=False,
                 )
-                full_hidden_states = output.hidden_states[-1]
-                if hasattr(output, "hidden_states") and output.hidden_states is not None:
-                    full_hidden_states = output.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
-            # extract the hidden states of last token
-            eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (batch_size,)
-            last_token_hidden = full_hidden_states[torch.arange(batch_size), eos_mask_idx]
-
-            return last_token_hidden
+                selected_layers = layer_indices or (-1,)
+                full_hidden_by_layer = {index: output.hidden_states[index] for index in selected_layers}
+            # Select the last non-padding token by tensor position. This works
+            # for both ordinary 2-D position ids and multi-axis MRoPE ids.
+            token_positions = torch.arange(seqlen, device=attention_mask.device).unsqueeze(0)
+            eos_mask_idx = torch.argmax(token_positions * attention_mask, dim=-1)
+            last_token_by_layer = {
+                index: hidden[
+                    torch.arange(batch_size, device=hidden.device),
+                    eos_mask_idx.to(hidden.device),
+                ]
+                for index, hidden in full_hidden_by_layer.items()
+            }
+            return last_token_by_layer if layer_indices is not None else last_token_by_layer[-1]
 
     @staticmethod
     def listmle_loss(
@@ -235,6 +286,15 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 actor_module=self.actor_module_fsdp,
                 actor_optimizer=self.actor_optimizer,
             )
+            cfg = self._predictor_cfg()
+            backend = str(cfg.get("backend", "linear_listmle"))
+            if backend == "censored_lognormal":
+                checkpoint = cfg.get("d2_checkpoint")
+                if not checkpoint:
+                    raise ValueError("predictor_reorder.d2_checkpoint is required for censored_lognormal")
+                self.actor.distribution_predictor = CensoredLogNormalPredictor.from_checkpoint(checkpoint)
+            elif backend != "linear_listmle":
+                raise ValueError("predictor_reorder.backend must be 'linear_listmle' or 'censored_lognormal'")
 
     def _predictor_cfg(self):
         """Resolve predictor config from worker or trainer level."""
@@ -254,6 +314,55 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         actor_device = next(self.actor_module_fsdp.parameters()).device
         if next(self.actor.predictor_scorer.parameters()).device != actor_device:
             self.actor.predictor_scorer = self.actor.predictor_scorer.to(actor_device)
+
+    def _finish_predictor_actor_access(self) -> None:
+        """Restore configured actor offload state after predictor work."""
+        if self._pending_offload_param_restore is not None:
+            self._is_offload_param = self._pending_offload_param_restore
+            self._pending_offload_param_restore = None
+        if self._is_offload_param and not self._actor_params_are_offloaded():
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_predictor(self, path: str) -> None:
+        """Persist the small predictor/calibration state beside a verl checkpoint."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            calibration = self.actor.predictor_calibration
+            torch.save(
+                {
+                    "weight": self.actor.predictor_scorer.weight.detach().cpu(),
+                    "length_calibration": (
+                        None if calibration is None else {"scores": calibration.scores, "tokens": calibration.tokens}
+                    ),
+                    "calibration_hidden": self.actor.predictor_calibration_hidden,
+                    "calibration_tokens": self.actor.predictor_calibration_tokens,
+                    "schema_version": 1,
+                },
+                path,
+            )
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_predictor(self, path: str) -> None:
+        """Restore predictor state on every actor rank."""
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        self._sync_predictor_scorer_device()
+        self.actor.predictor_scorer.weight.data.copy_(
+            checkpoint["weight"].to(self.actor.predictor_scorer.weight.device)
+        )
+        calibration = checkpoint.get("length_calibration")
+        self.actor.predictor_calibration = (
+            None
+            if calibration is None
+            else MonotoneCalibration(tuple(calibration["scores"]), tuple(calibration["tokens"]))
+        )
+        self.actor.predictor_calibration_hidden = checkpoint.get(
+            "calibration_hidden", torch.empty((0, self.actor.predictor_scorer.in_features))
+        ).float()
+        self.actor.predictor_calibration_tokens = checkpoint.get("calibration_tokens", torch.empty(0)).float()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
@@ -309,16 +418,59 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             non_tensors=sampled_non_tensors,
         )
         sampled_data.meta_info = data.meta_info.copy()
+        cfg = self._predictor_cfg()
+        backend = str(cfg.get("backend", "linear_listmle"))
         with self.ulysses_sharding_manager:
-            sampled_hidden_states = self.actor.extract_hidden_states(data=sampled_data)
+            if backend == "censored_lognormal":
+                predictor = self.actor.distribution_predictor
+                if predictor is None:
+                    raise RuntimeError("censored_lognormal predictor was not initialized")
+                feature_keys = predictor.prior.feature_keys
+                try:
+                    layer_indices = tuple(int(key.removeprefix("layer_")) for key in feature_keys)
+                except ValueError as error:
+                    raise ValueError("D2 feature keys must use the layer_<index> schema") from error
+                hidden_by_index = self.actor.extract_hidden_taps(sampled_data, layer_indices)
+                predictions = predictor.predict_distribution_batch(
+                    {key: hidden_by_index[index] for key, index in zip(feature_keys, layer_indices, strict=True)}
+                )
+                risk_weight = float(cfg.get("risk_weight", 0.5))
+                actor_device = next(self.actor_module_fsdp.parameters()).device
+                predicted_work_per_prompt = torch.tensor(
+                    [row.as_length_prediction().risk(risk_weight) for row in predictions],
+                    device=actor_device,
+                    dtype=torch.float32,
+                )
+                scores = predicted_work_per_prompt
+                predictor_ready = True
+            else:
+                sampled_hidden_states = self.actor.extract_hidden_states(data=sampled_data)
+                scores = self.actor.predictor_scorer(sampled_hidden_states).squeeze(-1)
+                if self.actor.predictor_calibration is None:
+                    predicted_work_per_prompt = torch.full_like(scores, float("nan"))
+                else:
+                    predicted_work_per_prompt = torch.tensor(
+                        [self.actor.predictor_calibration(float(score)) for score in scores.detach().cpu()],
+                        device=scores.device,
+                        dtype=scores.dtype,
+                    )
+                predictor_ready = self.actor.predictor_calibration is not None
 
-        scores = self.actor.predictor_scorer(sampled_hidden_states).squeeze(-1)
+        if backend == "linear_listmle" and self.actor.predictor_calibration is None:
+            predicted_work_per_prompt = torch.full_like(scores, float("nan"))
+        else:
+            predicted_work_per_prompt = predicted_work_per_prompt.to(scores.device, dtype=scores.dtype)
 
         predictor_scores = torch.zeros(batch_size, device=scores.device, dtype=scores.dtype)
+        predicted_work = torch.zeros(batch_size, device=scores.device, dtype=scores.dtype)
         for i, sample_idx in enumerate(sample_indices):
             predictor_scores[sample_idx : min(sample_idx + n, batch_size)] = scores[i]
+            predicted_work[sample_idx : min(sample_idx + n, batch_size)] = predicted_work_per_prompt[i]
 
-        output = DataProto.from_dict(tensors={"predictor_scores": predictor_scores}).to("cpu")
+        output = DataProto.from_dict(
+            tensors={"predictor_scores": predictor_scores, "epws_predicted_work": predicted_work},
+            meta_info={"predictor_ready": predictor_ready, "predictor_backend": backend},
+        ).to("cpu")
         if self._pending_offload_param_restore is not None:
             self._is_offload_param = self._pending_offload_param_restore
             self._pending_offload_param_restore = None
@@ -338,6 +490,26 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         cfg = self._predictor_cfg()
         if not cfg.get("enable", False):
             return DataProto(meta_info={"metrics": {}})
+
+        if str(cfg.get("backend", "linear_listmle")) == "censored_lognormal":
+            n = self.config.rollout.n
+            local_prompts = len(response_batch) // n
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            sp_size = self.config.actor.ulysses_sequence_parallel_size
+            global_prompts = local_prompts * (world_size // sp_size)
+            output = DataProto(
+                meta_info={
+                    "metrics": {
+                        "predictor/total_samples": global_prompts,
+                        "predictor/observed_rollouts": global_prompts * n,
+                        "predictor/calibration_samples": global_prompts,
+                        "predictor/calibration_ready": 1.0,
+                        "predictor/update_time_s": 0.0,
+                    }
+                }
+            )
+            self._finish_predictor_actor_access()
+            return output
 
         loaded_actor_for_predictor = self._is_offload_param and self._actor_params_are_offloaded()
         if loaded_actor_for_predictor:
@@ -394,6 +566,7 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 response_lengths = reshaped_response[:, 0, :].flatten()
                 hidden_states = reshaped_hidden[:, 0, :, :].flatten(0, 1)
 
+        token_lengths = response_lengths.detach().cpu().float()
         label_group_size = max(1, self.config.rollout.response_length // 40)
         response_lengths = response_lengths // label_group_size
 
@@ -457,11 +630,31 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                     metrics[f"predictor/epoch_{epoch}_kendall_tau"] = avg_kendall_tau
 
                 metrics["predictor/final_loss"] = epoch_loss / max(num_batches, 1)
+
+        calibration_max_samples = int(cfg.get("calibration_max_samples", 4096))
+        if calibration_max_samples < 2:
+            raise ValueError("predictor_reorder.calibration_max_samples must be at least 2")
+        replay_hidden = torch.cat(
+            [self.actor.predictor_calibration_hidden, hidden_states.detach().cpu().float()], dim=0
+        )[-calibration_max_samples:]
+        replay_tokens = torch.cat([self.actor.predictor_calibration_tokens, token_lengths], dim=0)[
+            -calibration_max_samples:
+        ]
+        if len(replay_tokens) >= 2:
+            predictor_device = next(predictor.parameters()).device
+            with torch.inference_mode():
+                replay_scores = predictor(replay_hidden.to(predictor_device)).squeeze(-1).detach().cpu().tolist()
+            self.actor.predictor_calibration = fit_pava(replay_scores, replay_tokens.tolist())
+        self.actor.predictor_calibration_hidden = replay_hidden
+        self.actor.predictor_calibration_tokens = replay_tokens
+
         metrics["predictor/epochs"] = epochs
         metrics["predictor/update_time_s"] = timer.last
         metrics["predictor/total_samples"] = len(dataset)
+        metrics["predictor/observed_rollouts"] = len(dataset) * n
+        metrics["predictor/calibration_samples"] = len(replay_tokens)
+        metrics["predictor/calibration_ready"] = float(self.actor.predictor_calibration is not None)
 
         output = DataProto(meta_info={"metrics": metrics}).to("cpu")
-        if loaded_actor_for_predictor:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        self._finish_predictor_actor_access()
         return output
