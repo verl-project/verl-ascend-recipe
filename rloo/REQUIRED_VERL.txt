@@ -1,0 +1,9 @@
+# Qwen3-8B RLOO with FSDP2 training and vLLM Ascend rollout.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=1a8a0f5ffd9d3f169ae4432b68526233ba028102
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@1a8a0f5ffd9d3f169ae4432b68526233ba028102
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout 1a8a0f5ffd9d3f169ae4432b68526233ba028102 && git submodule update --init --recursive recipe && git apply ../rloo/patch/verl_qwen3_8b_rloo_model.patch
+PATCH_BASE=1a8a0f5ffd9d3f169ae4432b68526233ba028102
+RECIPE_FOLDER=rloo
+NOTES=Use the git installation method so the bundled Qwen3-8B model compatibility patch is applied before the editable install.
