@@ -348,7 +348,7 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_predictor(self, path: str) -> None:
         """Restore predictor state on every actor rank."""
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         self._sync_predictor_scorer_device()
         self.actor.predictor_scorer.weight.data.copy_(
             checkpoint["weight"].to(self.actor.predictor_scorer.weight.device)

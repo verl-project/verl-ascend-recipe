@@ -27,7 +27,7 @@ async def event_driven_map(
     if not items:
         return []
 
-    results: list[_Result | None] = [None] * len(items)
+    results: dict[int, _Result] = {}
     active: dict[asyncio.Task[_Result], int] = {}
     next_index = 0
 
@@ -53,4 +53,4 @@ async def event_driven_map(
             await asyncio.gather(*active, return_exceptions=True)
         raise
 
-    return [result for result in results if result is not None]
+    return [results[index] for index in range(len(items))]

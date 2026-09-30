@@ -88,7 +88,7 @@ class PrefillDistributionPrior:
 
     @classmethod
     def from_checkpoint(cls, path: str | Path) -> PrefillDistributionPrior:
-        return cls(torch.load(path, map_location="cpu", weights_only=False))
+        return cls(torch.load(path, map_location="cpu", weights_only=True))
 
     def project(self, hidden_by_tap: Mapping[str, torch.Tensor]) -> torch.Tensor:
         parts = []

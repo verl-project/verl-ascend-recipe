@@ -179,7 +179,7 @@ class LinearListMLEPredictor:
     def from_checkpoint(
         cls, path: str | Path, *, provenance: PredictionProvenance | None = None
     ) -> LinearListMLEPredictor:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         calibration = checkpoint["length_calibration"]
         feature_key = checkpoint.get("feature_key")
         envelope = _checkpoint_provenance(
@@ -249,7 +249,7 @@ class CensoredLogNormalPredictor:
     def from_checkpoint(
         cls, path: str | Path, *, provenance: PredictionProvenance | None = None
     ) -> CensoredLogNormalPredictor:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         prior = PrefillDistributionPrior(checkpoint)
         envelope = _checkpoint_provenance(
             checkpoint,

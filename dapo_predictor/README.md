@@ -5,13 +5,42 @@ This recipe adds two orthogonal components to DAPO rollout generation:
 1. a prompt-side response-length predictor; and
 2. an event-driven pending/waiting-pool scheduler (EPWS).
 
-EPWS is always safe to enable. Before the selected predictor passes its activation gates, EPWS admits requests in stable FCFS order. After activation it admits the longest predicted work first and refills the bounded rollout window whenever one request completes. Actual inference-server placement remains owned by verl's existing `GlobalRequestLoadBalancer`.
+EPWS has a deterministic fail-closed mode. Before the selected predictor passes its activation gates, EPWS admits requests in stable FCFS order. After activation it admits the longest predicted work first and refills the bounded rollout window whenever one request completes. Actual inference-server placement remains owned by verl's existing `GlobalRequestLoadBalancer`.
 
 The implementation uses verl's public `agent_loop_manager_class` extension point. It does not patch vLLM or vLLM-Ascend and does not require either project as a Python dependency of the scheduler package.
 
 ## Required `verl` version
 
 See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt). The tested pin is `bcb638649a50e58494a8ddd92085ad1174f674b8`.
+
+## Tested environment and dependency boundary
+
+| Component | Tested value | Dependency role |
+| --- | --- | --- |
+| Python | 3.10 / 3.11 | Provided by the selected verl runtime image. |
+| verl | commit `bcb638649a50e58494a8ddd92085ad1174f674b8` (`0.8.0.dev`) | Required and machine-pinned in `REQUIRED_VERL.txt`. |
+| PyTorch / torch-npu | The versions bundled by the tested Ascend runtime | Inherited from verl; this recipe does not repin them. |
+| vLLM | `0.19.1` | Tested rollout runtime, not imported by this package. |
+| vLLM-Ascend | `0.19.1rc1` | Tested Ascend rollout runtime, not imported by this package. |
+| Ascend image | `quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler` | End-to-end evaluation environment. |
+| Hardware | Ascend 910 | End-to-end evaluation hardware. |
+
+The scheduler package intentionally has no direct Python dependency on vLLM or vLLM-Ascend. Runtime compatibility with newer rollout stacks is therefore expected to follow verl's public agent-loop contract, but only the versions above are claimed as tested. Core Python dependencies (`torch`, `numpy`, `ray`, Hydra/OmegaConf, and verl utilities) come from the pinned verl environment. SciPy is optional and is used only to emit the Kendall-tau training metric; training and scheduling continue without it.
+
+## Source-tree placement
+
+This is a recipe overlay, not a standalone wheel. Install or clone the pinned verl revision (including its `recipe` submodule), then place this directory at `recipe/dapo_predictor` in that source checkout:
+
+```bash
+git clone --recurse-submodules https://github.com/verl-project/verl.git
+cd verl
+git checkout bcb638649a50e58494a8ddd92085ad1174f674b8
+git submodule update --init --recursive recipe
+cp -a /path/to/verl-ascend-recipe/dapo_predictor recipe/dapo_predictor
+pip install -e .
+```
+
+Run the commands below from the verl checkout with that checkout on `PYTHONPATH`. The upstream DAPO recipe remains the owner of the base trainer configuration; this overlay adds predictor and EPWS behavior through the documented extension point.
 
 ## Product boundary
 

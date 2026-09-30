@@ -50,6 +50,14 @@ def test_event_loop_rejects_invalid_concurrency() -> None:
         asyncio.run(event_driven_map([1], submit, max_concurrency=0))
 
 
+def test_event_loop_preserves_none_results() -> None:
+    async def submit(item: int) -> None:
+        del item
+        return None
+
+    assert asyncio.run(event_driven_map([1, 2], submit, max_concurrency=1)) == [None, None]
+
+
 def test_event_loop_propagates_failure() -> None:
     async def submit(item: int) -> int:
         if item == 1:
