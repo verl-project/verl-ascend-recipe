@@ -51,7 +51,7 @@ Included in the first contribution:
 - train-history-only PAVA calibration from ranking score to token-scale work;
 - a two-part activation gate (`min_epoch` and `min_samples`);
 - predictor-only checkpoint save/resume;
-- D2 right-censored LogNormal inference as an opt-in experimental backend;
+- D2 right-censored LogNormal inference as an optional frozen backend;
 - strict finite/range/schema checks and prediction provenance.
 
 Not enabled or submitted as product behavior:
@@ -85,6 +85,7 @@ Not enabled or submitted as product behavior:
 | `length_scheduler/calibration.py` | Weighted PAVA and monotone score-to-token interpolation. |
 | `length_scheduler/scheduler.py` | Stable FCFS / longest-predicted-work-first waiting pool. |
 | `length_scheduler/predictor.py` | Backend-neutral prediction API, D1/D2 adapters, provenance, and validation. |
+| `length_scheduler/checkpoint.py` | Backend-aware lifecycle metadata and frozen-D2 checkpoint binding. |
 | `length_scheduler/distribution.py` | Right-censored LogNormal inference primitives. |
 | `predictor_utils.py` | Legacy static-snake helper retained for backward compatibility. |
 
@@ -94,7 +95,7 @@ Not enabled or submitted as product behavior:
 
 D1 is a bias-free linear ranking head over the final prompt-token hidden state. It is trained online with ListMLE. Since a ranking score has no token unit, the worker retains a bounded training-history replay and refits a monotone PAVA map after each update. PAVA sees only already-completed training rows. Until at least two valid calibration observations exist, the predictor reports not ready and EPWS remains FCFS.
 
-### D2: censored LogNormal (experimental)
+### D2: censored LogNormal (optional)
 
 D2 consumes the hidden-state tap schema declared by a frozen checkpoint and exposes unstandardized `mu`, `sigma`, expected length, median, p90, p95, and exceedance probability. It is useful when downstream systems need a distribution rather than only an ordering. D2 checkpoints must be produced independently and supplied with `d2_checkpoint`; this recipe does not train D2 online.
 
@@ -159,7 +160,8 @@ PYTHONPATH=/workspace/verl python recipe/dapo_predictor/main_dapo_predictor_reor
 - Dynamic micro-batch reordering is reversed before predictions are attached to prompts.
 - Generated outputs are restored to original batch order before the trainer unions them with training rows.
 - D1 calibration never reads the completion lengths of the rollout batch currently being scheduled.
-- Predictor state is stored beside the normal trainer checkpoint. If it is absent on resume, the scheduler restarts in FCFS fallback mode instead of using stale predictions.
+- D1 weights and calibration are stored beside the normal trainer checkpoint. D2 remains external and frozen; its SHA-256 is stored with the shared lifecycle state and verified on resume.
+- If lifecycle state is absent on resume, the scheduler restarts in FCFS fallback mode instead of using stale predictions. A backend or D2 checkpoint mismatch fails explicitly.
 - D2 validates hidden tap names/dimensions, finite inputs, positive sigma, monotone quantiles, and checkpoint provenance.
 
 ## Validation scope

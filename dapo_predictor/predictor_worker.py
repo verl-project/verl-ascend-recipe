@@ -325,7 +325,9 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_predictor(self, path: str) -> None:
-        """Persist the small predictor/calibration state beside a verl checkpoint."""
+        """Persist the online D1 weights and calibration beside a verl checkpoint."""
+        if str(self._predictor_cfg().get("backend", "linear_listmle")) != "linear_listmle":
+            raise RuntimeError("save_predictor is only valid for the online linear_listmle backend")
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if rank == 0:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -347,7 +349,9 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_predictor(self, path: str) -> None:
-        """Restore predictor state on every actor rank."""
+        """Restore online D1 state on every actor rank."""
+        if str(self._predictor_cfg().get("backend", "linear_listmle")) != "linear_listmle":
+            raise RuntimeError("load_predictor is only valid for the online linear_listmle backend")
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         self._sync_predictor_scorer_device()
         self.actor.predictor_scorer.weight.data.copy_(

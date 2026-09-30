@@ -27,6 +27,12 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
 
+from .length_scheduler.checkpoint import (
+    DISTRIBUTION_BACKEND,
+    LINEAR_BACKEND,
+    build_lifecycle_state,
+    validate_lifecycle_state,
+)
 from .predictor_utils import snake_sort_indices
 
 
@@ -45,36 +51,58 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
         return os.path.join(folder, "predictor.pt"), os.path.join(folder, "predictor_state.json")
 
+    def _predictor_backend(self) -> str:
+        backend = str(self._predictor_cfg().get("backend", LINEAR_BACKEND))
+        if backend not in (LINEAR_BACKEND, DISTRIBUTION_BACKEND):
+            raise ValueError(f"unsupported predictor backend: {backend!r}")
+        return backend
+
+    def _d2_checkpoint(self) -> str | None:
+        checkpoint = self._predictor_cfg().get("d2_checkpoint")
+        return None if checkpoint is None else str(checkpoint)
+
     def _save_checkpoint(self):
         super()._save_checkpoint()
         if not self._predictor_enabled():
             return
         predictor_path, state_path = self._predictor_checkpoint_paths()
-        self.actor_rollout_wg.save_predictor(predictor_path)
-        with open(state_path, "w", encoding="utf-8") as stream:
-            json.dump(
-                {
-                    "observed_rollouts": self._predictor_observed_rollouts,
-                    "ready": self._predictor_ready,
-                    "schema_version": 1,
-                },
-                stream,
-                sort_keys=True,
-            )
+        backend = self._predictor_backend()
+        if backend == LINEAR_BACKEND:
+            self.actor_rollout_wg.save_predictor(predictor_path)
+        state = build_lifecycle_state(
+            backend=backend,
+            observed_rollouts=self._predictor_observed_rollouts,
+            ready=self._predictor_ready,
+            d2_checkpoint=self._d2_checkpoint(),
+        )
+        temporary_state_path = f"{state_path}.tmp-{uuid.uuid4().hex}"
+        with open(temporary_state_path, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, sort_keys=True)
+        os.replace(temporary_state_path, state_path)
 
     def _load_checkpoint(self):
         result = super()._load_checkpoint()
         if not self._predictor_enabled() or self.global_steps == 0:
             return result
         predictor_path, state_path = self._predictor_checkpoint_paths()
-        if not os.path.exists(predictor_path) or not os.path.exists(state_path):
+        if not os.path.exists(state_path):
             print("Predictor checkpoint is missing; predictor lifecycle restarts in FCFS fallback mode")
             return result
-        self.actor_rollout_wg.load_predictor(predictor_path)
         with open(state_path, encoding="utf-8") as stream:
             state = json.load(stream)
-        self._predictor_observed_rollouts = int(state.get("observed_rollouts", 0))
-        self._predictor_ready = bool(state.get("ready", False))
+        backend = self._predictor_backend()
+        observed_rollouts, ready = validate_lifecycle_state(
+            state,
+            backend=backend,
+            d2_checkpoint=self._d2_checkpoint(),
+        )
+        if backend == LINEAR_BACKEND:
+            if not os.path.exists(predictor_path):
+                print("D1 predictor checkpoint is missing; predictor lifecycle restarts in FCFS fallback mode")
+                return result
+            self.actor_rollout_wg.load_predictor(predictor_path)
+        self._predictor_observed_rollouts = observed_rollouts
+        self._predictor_ready = ready
         return result
 
     def _predictor_enabled(self) -> bool:
