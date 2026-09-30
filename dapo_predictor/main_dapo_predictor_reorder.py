@@ -48,6 +48,13 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
                 config.actor_rollout_ref.predictor_reorder = OmegaConf.create(
                     OmegaConf.to_container(trainer_predictor_cfg, resolve=True)
                 )
+            if str(trainer_predictor_cfg.get("scheduler", "static_snake")) == "epws":
+                with open_dict(config.actor_rollout_ref.rollout):
+                    if config.actor_rollout_ref.rollout.get("agent") is None:
+                        config.actor_rollout_ref.rollout.agent = OmegaConf.create({})
+                    config.actor_rollout_ref.rollout.agent.agent_loop_manager_class = (
+                        "recipe.dapo_predictor.epws_manager.EPWSAgentLoopManager"
+                    )
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
         self.add_reward_model_resource_pool(config)
