@@ -1,0 +1,17 @@
+diff --git a/examples/rloo_trainer/run_qwen3_8b_fsdp.sh b/examples/rloo_trainer/run_qwen3_8b_fsdp.sh
+--- a/examples/rloo_trainer/run_qwen3_8b_fsdp.sh
++++ b/examples/rloo_trainer/run_qwen3_8b_fsdp.sh
+@@ -49,4 +49,6 @@ DATA=(
+     data.max_response_length=${max_response_length}
+     data.filter_overlong_prompts=True
+     data.truncation='error'
++    data.trust_remote_code=True
++    +data.apply_chat_template_kwargs.enable_thinking=False
+ )
+@@ -54,5 +56,6 @@ DATA=(
+ MODEL=(
+     actor_rollout_ref.model.path="$MODEL_PATH"
+     actor_rollout_ref.model.use_remove_padding=True
+     actor_rollout_ref.model.enable_gradient_checkpointing=True
++    actor_rollout_ref.model.trust_remote_code=True
+ )
