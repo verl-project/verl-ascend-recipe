@@ -56,6 +56,7 @@ export PYTHONUNBUFFERED=1
 project_name='dsv4'
 exp_name='dsv4-a5'
 
+# 按需修改节点数
 NNODES=8
 NPUS_PER_NODE=8
 MASTER_ADDR="IP FOR MASTER NODE"

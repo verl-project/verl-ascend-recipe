@@ -1,8 +1,12 @@
 #!/bin/bash
 #set -xeuo pipefail
 
- 
-NNODES=8
+# DeepSeek-V4-Flash GRPO 训练脚本（Ascend A5 集群，32K 上下文长度）
+# 需通过 ../ray_start_A5.sh 启动 Ray 集群，
+# 并修改 ../ray_start_A5.sh 中的 NNODES 和 DEFAULT_SH 配置，
+# 使其与本脚本中的 NNODES、NPUS_PER_NODE 保持一致。
+
+NNODES=16
 NPUS_PER_NODE=8
 
 
@@ -20,10 +24,10 @@ TRAIN_FILE=/data/math-17k/dapo-math-17k.parquet
 TEST_FILE=/data/math-17k/dapo-math-17k.parquet
 # Data Length Configuration 
 max_prompt_length=$((1024*2))
-max_response_length=$((1024*6))
+max_response_length=$((1024*32))
 
 # Training Batch Configuration
-train_prompt_bsz=64 
+train_prompt_bsz=64
 train_prompt_mini_bsz=64
 n_resp_per_prompt=8
 
@@ -49,9 +53,10 @@ train_cp=1
 
 
 # Generation Configuration
-gen_tp=1
+gen_tp=1 
 gen_dp=32
 gen_ep=32
+
 gpu_memory_utilization=0.5
 max_model_len=$((max_prompt_length + max_response_length))
 max_num_batched_tokens=$(((max_prompt_length + max_response_length) * 1))
@@ -101,9 +106,6 @@ ACTOR_CONFIG=(
     # Core Runtime Settings
     actor_rollout_ref.actor.use_torch_compile=False
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz}
-    # 全层定位实验：actor 重算 logprob 时复用 rollout/vLLM 返回的逐层专家路由。
-    # 与 rollout.enable_rollout_routing_replay 配对，用于隔离 MoE 路由分叉的贡献。
-    actor_rollout_ref.actor.mindspeed.router_replay.mode=R3
     # Loss Function Configuration
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss}
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
@@ -190,6 +192,7 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_factor=16
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_mscale=1.0
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_mscale_all_dim=1.0
+    ###  超过64k要改这个参数  =  prompt + response + (2048 余量) 
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_original_max_position_embeddings=65536
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_theta=10000.0
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_type=yarn
@@ -203,7 +206,7 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_mcore_models=True
 
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.num_layers=43
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.num_layer_list=\'21,22\'
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.num_layer_list=\'10,11,11,11\'
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.hidden_size=4096
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.ffn_hidden_size=4096
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.num_attention_heads=64
@@ -256,7 +259,11 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.masked_softmax_fusion=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.moe_shared_expert_overlap=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.indexer_loss_coeff=0.0
-    +actor_rollout_ref.actor.mindspeed.llm_kwargs.swap_optimizer=True
+
+    +actor_rollout_ref.actor.mindspeed.llm_kwargs.swap_optimizer=False
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
+    +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
+	+actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_lightning_indexer=True
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_fused_lightning_indexer_loss=True
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_sparse_flash_attn=True
@@ -296,7 +303,6 @@ ROLLOUT_CONFIG=(
     +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=bfloat16
     actor_rollout_ref.rollout.max_model_len=${max_model_len}
     actor_rollout_ref.rollout.calculate_log_probs=True   
-    actor_rollout_ref.rollout.enable_rollout_routing_replay=True
     actor_rollout_ref.rollout.name=vllm
     # Generation Parameters
     actor_rollout_ref.rollout.load_format="safetensors"
@@ -336,7 +342,7 @@ TRAINER_CONFIG=(
     trainer.total_epochs=15
     trainer.val_before_train=False
     trainer.test_freq=-1
-    trainer.save_freq=80
+    trainer.save_freq=-1
     actor_rollout_ref.actor.checkpoint.save_contents="['model']" 
     # Checkpoint Directory
     trainer.default_local_dir="${CKPTS_DIR}"
