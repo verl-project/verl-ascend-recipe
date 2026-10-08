@@ -2,7 +2,7 @@
 #set -xeuo pipefail
 
 # DeepSeek-V4-Flash GRPO 训练脚本（Ascend A5 集群，32K 上下文长度）
-# 使用前执行 ../ray_start_A5.sh 启动 Ray 集群，
+# 需通过 ../ray_start_A5.sh 启动 Ray 集群，
 # 并修改 ../ray_start_A5.sh 中的 NNODES 和 DEFAULT_SH 配置，
 # 使其与本脚本中的 NNODES、NPUS_PER_NODE 保持一致。
 
