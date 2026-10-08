@@ -53,6 +53,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | --- | --- |
 | opd | [`opd/REQUIRED_VERL.txt`](opd/REQUIRED_VERL.txt) |
 | dapo | [`recipe/dapo/REQUIRED_VERL.txt`](dapo/REQUIRED_VERL.txt) |
+| dapo predictor + EPWS | [`recipe/dapo_predictor/REQUIRED_VERL.txt`](dapo_predictor/REQUIRED_VERL.txt) |
 | dppo | [`recipe/dppo/REQUIRED_VERL.txt`](dppo/REQUIRED_VERL.txt) |
 | deepeyes | [`recipe/deepeyes/REQUIRED_VERL.txt`](deepeyes/REQUIRED_VERL.txt) |
 | flash_rl_ascend | [`recipe/flash_rl_ascend/REQUIRED_VERL.txt`](flash_rl_ascend/REQUIRED_VERL.txt) |
