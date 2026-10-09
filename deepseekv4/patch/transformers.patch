@@ -1,0 +1,3944 @@
+diff --git a/src/transformers/models/auto/configuration_auto.py b/src/transformers/models/auto/configuration_auto.py
+index f6a12e7cef..16d6444e2f 100644
+--- a/src/transformers/models/auto/configuration_auto.py
++++ b/src/transformers/models/auto/configuration_auto.py
+@@ -106,6 +106,7 @@ CONFIG_MAPPING_NAMES = OrderedDict[str, str](
+         ("decision_transformer", "DecisionTransformerConfig"),
+         ("deepseek_v2", "DeepseekV2Config"),
+         ("deepseek_v3", "DeepseekV3Config"),
++        ("deepseek_v4", "DeepseekV4Config"),
+         ("deepseek_vl", "DeepseekVLConfig"),
+         ("deepseek_vl_hybrid", "DeepseekVLHybridConfig"),
+         ("deformable_detr", "DeformableDetrConfig"),
+@@ -541,6 +542,7 @@ MODEL_NAMES_MAPPING = OrderedDict[str, str](
+         ("decision_transformer", "Decision Transformer"),
+         ("deepseek_v2", "DeepSeek-V2"),
+         ("deepseek_v3", "DeepSeek-V3"),
++        ("deepseek_v4", "DeepSeek-V4"),
+         ("deepseek_vl", "DeepseekVL"),
+         ("deepseek_vl_hybrid", "DeepseekVLHybrid"),
+         ("deformable_detr", "Deformable DETR"),
+@@ -1077,8 +1079,8 @@ class _LazyConfigMapping(OrderedDict[str, type[PretrainedConfig]]):
+         """
+         Register a new configuration in this mapping.
+         """
+-        if key in self._mapping and not exist_ok:
+-            raise ValueError(f"'{key}' is already used by a Transformers config, pick another name.")
++        # if key in self._mapping and not exist_ok:
++        #     raise ValueError(f"'{key}' is already used by a Transformers config, pick another name.")
+         self._extra_content[key] = value
+ 
+ 
+diff --git a/src/transformers/models/auto/modeling_auto.py b/src/transformers/models/auto/modeling_auto.py
+index 298834bebe..dd2bc6f72e 100644
+--- a/src/transformers/models/auto/modeling_auto.py
++++ b/src/transformers/models/auto/modeling_auto.py
+@@ -111,6 +111,7 @@ MODEL_MAPPING_NAMES = OrderedDict(
+         ("decision_transformer", "DecisionTransformerModel"),
+         ("deepseek_v2", "DeepseekV2Model"),
+         ("deepseek_v3", "DeepseekV3Model"),
++        ("deepseek_v4", "DeepseekV4Model"),
+         ("deepseek_vl", "DeepseekVLModel"),
+         ("deepseek_vl_hybrid", "DeepseekVLHybridModel"),
+         ("deformable_detr", "DeformableDetrModel"),
+diff --git a/src/transformers/models/auto/tokenization_auto.py b/src/transformers/models/auto/tokenization_auto.py
+index 163aba1cb1..c9de4d09ed 100644
+--- a/src/transformers/models/auto/tokenization_auto.py
++++ b/src/transformers/models/auto/tokenization_auto.py
+@@ -195,6 +195,13 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, tuple[Optional[str], Optional[str]]](
+                 "LlamaTokenizerFast" if is_tokenizers_available() else None,
+             ),
+         ),
++        (
++            "deepseek_v4",
++            (
++                "LlamaTokenizer" if is_sentencepiece_available() else None,
++                "LlamaTokenizerFast" if is_tokenizers_available() else None,
++            ),
++        ),
+         (
+             "deepseek_vl",
+             (
+diff --git a/src/transformers/models/deepseek_v4/__init__.py b/src/transformers/models/deepseek_v4/__init__.py
+new file mode 100644
+index 0000000000..9794a63f40
+--- /dev/null
++++ b/src/transformers/models/deepseek_v4/__init__.py
+@@ -0,0 +1,27 @@
++# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from typing import TYPE_CHECKING
++
++from ...utils import _LazyModule
++from ...utils.import_utils import define_import_structure
++
++
++if TYPE_CHECKING:
++    from .configuration_deepseek import *
++    from .modeling_deepseek import *
++else:
++    import sys
++
++    _file = globals()["__file__"]
++    sys.modules[__name__] = _LazyModule(__name__, _file, define_import_structure(_file), module_spec=__spec__)
+diff --git a/src/transformers/models/deepseek_v4/configuration_deepseek.py b/src/transformers/models/deepseek_v4/configuration_deepseek.py
+new file mode 100644
+index 0000000000..214f8ae8b4
+--- /dev/null
++++ b/src/transformers/models/deepseek_v4/configuration_deepseek.py
+@@ -0,0 +1,293 @@
++# coding=utf-8
++# Copyright 2025 bzantium and the HuggingFace Inc. team. All rights reserved.
++#
++# This code is based on the DeepSeekV3 implementations from the DeepSeek AI team. (https://huggingface.co/deepseek-ai/DeepSeek-V3)
++
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""DeepSeekV3 model configuration"""
++
++from transformers.configuration_utils import PretrainedConfig
++from transformers.modeling_rope_utils import rope_config_validation
++
++
++DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
++
++
++class DeepseekV4Config(PretrainedConfig):
++    r"""
++    This is the configuration class to store the configuration of a [`DeepseekV3Model`]. It is used to instantiate an DeepSeek
++    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
++    defaults will yield a similar configuration to that of the DeepSeek-V3.
++    e.g. [bzantium/tiny-deepseek-v3](https://huggingface.co/bzantium/tiny-deepseek-v3)
++    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
++    documentation from [`PretrainedConfig`] for more information.
++
++
++    Args:
++        vocab_size (`int`, *optional*, defaults to 129280):
++            Vocabulary size of the Deep model. Defines the number of different tokens that can be represented by the
++            `inputs_ids` passed when calling [`DeepseekV3Model`]
++        hidden_size (`int`, *optional*, defaults to 7168):
++            Dimension of the hidden representations.
++        intermediate_size (`int`, *optional*, defaults to 18432):
++            Dimension of the MLP representations.
++        moe_intermediate_size (`int`, *optional*, defaults to 2048):
++            Dimension of the MoE representations.
++        num_hidden_layers (`int`, *optional*, defaults to 61):
++            Number of hidden layers in the Transformer decoder.
++        num_attention_heads (`int`, *optional*, defaults to 128):
++            Number of attention heads for each attention layer in the Transformer decoder.
++        num_key_value_heads (`int`, *optional*, defaults to 128):
++            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
++            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
++            `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
++            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
++            by meanpooling all the original heads within that group. For more details, check out [this
++            paper](https://huggingface.co/papers/2305.13245). If it is not specified, will default to
++            `num_attention_heads`.
++        n_shared_experts (`int`, *optional*, defaults to 1):
++            Number of shared experts.
++        n_routed_experts (`int`, *optional*, defaults to 256):
++            Number of routed experts.
++        routed_scaling_factor (`float`, *optional*, defaults to 2.5):
++            Scaling factor or routed experts.
++        kv_lora_rank (`int`, *optional*, defaults to 512):
++            Rank of the LoRA matrices for key and value projections.
++        q_lora_rank (`int`, *optional*, defaults to 1536):
++            Rank of the LoRA matrices for query projections.
++        qk_rope_head_dim (`int`, *optional*, defaults to 64):
++            Dimension of the query/key heads that use rotary position embeddings.
++        v_head_dim (`int`, *optional*, defaults to 128):
++            Dimension of the value heads.
++        qk_nope_head_dim (`int`, *optional*, defaults to 128):
++            Dimension of the query/key heads that don't use rotary position embeddings.
++        n_group (`int`, *optional*, defaults to 8):
++            Number of groups for routed experts.
++        topk_group (`int`, *optional*, defaults to 4):
++            Number of selected groups for each token(for each token, ensuring the selected experts is only within `topk_group` groups).
++        num_experts_per_tok (`int`, *optional*, defaults to 8):
++            Number of selected experts, None means dense model.
++        first_k_dense_replace (`int`, *optional*, defaults to 3):
++            Number of dense layers in shallow layers(embed->dense->dense->...->dense->moe->moe...->lm_head).
++                                                            \--k dense layers--/
++        norm_topk_prob (`bool`, *optional*, defaults to `True`):
++            Whether to normalize the weights of the routed experts.
++        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
++            The non-linear activation function (function or string) in the decoder.
++        max_position_embeddings (`int`, *optional*, defaults to 4096):
++            The maximum sequence length that this model might ever be used with.
++        initializer_range (`float`, *optional*, defaults to 0.02):
++            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
++        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
++            The epsilon used by the rms normalization layers.
++        use_cache (`bool`, *optional*, defaults to `True`):
++            Whether or not the model should return the last key/values attentions (not used by all models). Only
++            relevant if `config.is_decoder=True`.
++        pad_token_id (`int`, *optional*):
++            Padding token id.
++        bos_token_id (`int`, *optional*, defaults to 0):
++            Beginning of stream token id.
++        eos_token_id (`int`, *optional*, defaults to 1):
++            End of stream token id.
++        pretraining_tp (`int`, *optional*, defaults to 1):
++            Experimental feature. Tensor parallelism rank used during pretraining. Please refer to [this
++            document](https://huggingface.co/docs/transformers/parallelism) to understand more about it. This value is
++            necessary to ensure exact reproducibility of the pretraining results. Please refer to [this
++            issue](https://github.com/pytorch/pytorch/issues/76232).
++        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
++            Whether to tie weight embeddings
++        rope_theta (`float`, *optional*, defaults to 10000.0):
++            The base period of the RoPE embeddings.
++        rope_scaling (`Dict`, *optional*):
++            Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
++            strategies: linear and dynamic. Their scaling factor must be a float greater than 1. The expected format is
++            `{"type": strategy name, "factor": scaling factor}`. When using this flag, don't update
++            `max_position_embeddings` to the expected new maximum.
++        rope_interleave (`bool`, *optional*, defaults to `True`):
++            Whether to interleave the rotary position embeddings.
++        attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
++            Whether to use a bias in the query, key, value and output projection layers during self-attention.
++        attention_dropout (`float`, *optional*, defaults to 0.0):
++            The dropout ratio for the attention probabilities.
++
++    ```python
++    >>> from transformers import DeepseekV3Model, DeepseekV3Config
++
++    >>> # Initializing a Deepseek-V3 style configuration
++    >>> configuration = DeepseekV3Config()
++
++    >>> # Accessing the model configuration
++    >>> configuration = model.config
++    ```"""
++
++    model_type = "deepseek_v4"
++    keys_to_ignore_at_inference = ["past_key_values"]
++    base_model_tp_plan = {  # TODO: only replicate attention layers when > first_k_dense_replace
++        "layers.*.mlp.experts.*.gate_proj": "local_colwise",
++        "layers.*.mlp.experts.*.up_proj": "local_colwise",
++        "layers.*.mlp.experts.*.down_proj": "local_rowwise",
++        "layers.*.mlp.experts.*": "local",  # each expert is wrapped in a module list
++        "layers.*.mlp.shared_experts.gate_proj": "local_colwise",
++        "layers.*.mlp.shared_experts.up_proj": "local_colwise",
++        "layers.*.mlp.shared_experts.down_proj": "local_rowwise",
++        "layers.*.mlp.shared_experts": "local",
++        "layers.*.mlp.gate_proj": "local_colwise",
++        "layers.*.mlp.up_proj": "local_colwise",
++        "layers.*.mlp.down_proj": "local_rowwise",
++        "layers.*.mlp": "gather",  # This is the only moment where results are gathered
++    }
++    base_model_pp_plan = {
++        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
++        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
++        "norm": (["hidden_states"], ["hidden_states"]),
++    }
++
++    def __init__(
++        self,
++        vocab_size=129280,
++        n_heads=64,
++        hidden_size=4096,
++        moe_intermediate_size=2048,
++        num_hidden_layers=43,
++        n_hash_layers=3,
++        num_attention_heads=64,
++        num_key_value_heads=64,
++        n_shared_experts=1,
++        n_routed_experts=256,
++        routed_scaling_factor=1.5,
++        q_lora_rank=1024,
++        o_lora_rank=1024,
++        head_dim=512,
++        rope_head_dim=64,
++        o_groups=8,
++        window_size=128,
++        original_seq_len=65536,
++        rope_theta=10000,
++        rope_factor=4,
++        beta_fast=32,
++        beta_slow=1,
++        index_n_heads=64,
++        index_head_dim=128,
++        index_topk=512,
++        hc_mult=4,
++        hc_sinkhorn_iters=20,
++        compress_rope_theta=40000,
++        compress_ratios=[1, 1, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4],
++        dim=4096,
++        # qk_rope_head_dim=64,
++        # v_head_dim=128,
++        # qk_nope_head_dim=128,
++        # n_group=8,
++        # topk_group=4,
++        # num_experts_per_tok=8,
++        hc_eps=1e-6,
++        # norm_topk_prob=True,
++        # hidden_act="silu",
++        max_position_embeddings=4096,
++        # initializer_range=0.02,
++        rms_norm_eps=1e-6,
++        norm_eps=1e-6,
++        use_cache=True,
++        pad_token_id=None,
++        bos_token_id=0,
++        eos_token_id=1,
++        # pretraining_tp=1,
++        tie_word_embeddings=False,
++        # rope_theta=10000.0,
++        rope_scaling=None,
++        # rope_interleave=True,
++        # attention_bias=False,
++        # attention_dropout=0.0,
++        scale_fmt="ue8m0",
++        **kwargs,
++    ):
++        self.vocab_size = vocab_size
++        self.hidden_size = hidden_size
++        self.q_lora_rank = q_lora_rank
++        self.moe_intermediate_size = moe_intermediate_size
++        self.num_hidden_layers = num_hidden_layers
++        self.num_attention_heads = num_attention_heads
++        self.n_shared_experts = n_shared_experts
++        self.n_routed_experts = n_routed_experts
++        self.routed_scaling_factor = routed_scaling_factor
++        self.n_hash_layers = n_hash_layers
++        self.o_lora_rank = o_lora_rank
++        self.head_dim = head_dim
++        self.dim = dim
++        self.rope_head_dim = rope_head_dim
++        self.o_groups = o_groups
++        self.window_size = window_size
++        self.original_seq_len = original_seq_len
++        self.rope_factor = rope_factor
++        self.beta_fast = beta_fast
++        self.beta_slow = beta_slow
++        self.index_n_heads = index_n_heads
++        self.index_head_dim = index_head_dim
++        self.index_topk = index_topk
++        self.hc_mult = hc_mult
++        self.norm_eps = norm_eps
++        self.hc_sinkhorn_iters = hc_sinkhorn_iters
++        self.compress_rope_theta = compress_rope_theta
++        self.compress_ratios = compress_ratios
++        self.n_heads = n_heads
++        # self.intermediate_size = intermediate_size
++        # self.kv_lora_rank = kv_lora_rank
++        self.max_position_embeddings = max_position_embeddings
++        # self.qk_rope_head_dim = qk_rope_head_dim
++        # self.v_head_dim = v_head_dim
++        # self.qk_nope_head_dim = qk_nope_head_dim
++        # self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
++        # self.head_dim = qk_rope_head_dim
++        # self.n_group = n_group
++        # self.topk_group = topk_group
++        # self.num_experts_per_tok = num_experts_per_tok
++        # self.first_k_dense_replace = first_k_dense_replace
++        # self.norm_topk_prob = norm_topk_prob
++        # self.rope_interleave = rope_interleave
++        self.hc_eps = hc_eps
++        # for backward compatibility
++        if num_key_value_heads is None:
++            num_key_value_heads = num_attention_heads
++        self.scale_fmt = scale_fmt
++        self.num_key_value_heads = num_key_value_heads
++        # self.hidden_act = hidden_act
++        # self.initializer_range = initializer_range
++        self.rms_norm_eps = rms_norm_eps
++        # self.pretraining_tp = pretraining_tp
++        self.use_cache = use_cache
++        self.rope_theta = rope_theta
++        self.rope_scaling = rope_scaling
++        # self.attention_bias = attention_bias
++        # self.attention_dropout = attention_dropout
++        # Validate the correctness of rotary position embeddings parameters
++        # BC: if there is a 'type' field, copy it it to 'rope_type'.
++        if self.rope_scaling is not None and "type" in self.rope_scaling:
++            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
++
++        if self.rope_scaling is not None:
++            for key in ["beta_fast", "beta_slow", "factor"]:
++                if key in self.rope_scaling:
++                    self.rope_scaling[key] = float(self.rope_scaling[key])
++
++        rope_config_validation(self)
++
++        super().__init__(
++            pad_token_id=pad_token_id,
++            bos_token_id=bos_token_id,
++            eos_token_id=eos_token_id,
++            tie_word_embeddings=tie_word_embeddings,
++            **kwargs,
++        )
++
++
++__all__ = ["DeepseekV4Config"]
+diff --git a/src/transformers/models/deepseek_v4/g2_attention_kernel.py b/src/transformers/models/deepseek_v4/g2_attention_kernel.py
+new file mode 100644
+index 0000000000..88cf16f6f4
+--- /dev/null
++++ b/src/transformers/models/deepseek_v4/g2_attention_kernel.py
+@@ -0,0 +1,1144 @@
++from dataclasses import dataclass
++from typing import Optional
++import math
++import os
++
++import torch
++from torch import nn
++import torch.nn.functional as F
++import torch_npu
++
++import triton
++import triton.language as tl
++import triton.extension.buffer.language as bl
++import triton.language.extra.cann.extension as al
++import triton
++# from megatron.training import get_args
++
++
++class G2CoreAttention(nn.Module):
++    def __init__(self, config=None, layer_number=None, attn_mask_type=None, attention_type=None, cp_comm_type=None):
++        args = get_args()
++        self.use_triton_sfa=args.use_triton_sfa
++        super().__init__()
++        self.mtp_idx = None
++        if self.use_triton_sfa:
++            self.attn_fn = SparseFlashAttentionTriton.apply
++        else:
++            self.attn_fn = self.sparse_flash_attn
++
++    def sparse_flash_attn(
++            self,
++            query_states: torch.Tensor,   # [S, B, N, D]
++            kv_states: torch.Tensor,      # [S, B, D]
++            attn_sink: torch.Tensor,      # [N]
++            topk_idxs: torch.Tensor,      # [S, B, K]
++            softmax_scale: float
++        ):
++            # q: [B, N, S, D]
++            q = query_states.permute(1, 2, 0, 3).contiguous()
++
++            # kv: [B, 1, S, D]
++            kv = kv_states.permute(1, 0, 2).unsqueeze(1).contiguous()
++            kv = kv.to(q.device)
++
++            # logits: [B, N, S, S]
++            attn_weights = torch.matmul(q, kv.transpose(-1, -2)) * softmax_scale
++
++            # topk: [B, S, K]
++            topk = topk_idxs.to(q.device).permute(1, 0, 2).contiguous()
++
++            neg = torch.finfo(attn_weights.dtype).min
++            index_mask = torch.full(
++                (q.size(0), 1, q.size(2), kv.size(2) + 1),
++                fill_value=neg,
++                dtype=attn_weights.dtype,
++                device=q.device,
++            )
++            index_mask.scatter_(-1, topk.unsqueeze(1), 0)
++
++            # apply topk mask (exclude the sink column)
++            attn_weights = attn_weights + index_mask[..., :-1]  # [B, N, S, S] + [B, 1, S, S]
++
++            # sinks: [B, N, S, 1]
++            sinks = attn_sink.to(q.device).reshape(1, -1, 1, 1).expand(q.size(0), -1, q.size(2), 1)
++
++            # combined: [B, N, S, S+1]
++            combined_logits = torch.cat([attn_weights, sinks], dim=-1)
++            combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
++
++            probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
++            scores = probs[..., :-1]  # [B, N, S, S]
++
++            # out: [B, N, S, D]
++            attn_output = torch.matmul(scores, kv)
++
++            # back to [S, B, N, D]
++            attn_output = attn_output.permute(2, 0, 1, 3).contiguous()
++            return attn_output
++
++    
++    def forward(
++        self,
++        q: torch.Tensor,
++        kv: torch.Tensor,
++        attn_sink: torch.Tensor,
++        topk_idxs: torch.Tensor,
++        sm_scale: float,
++    ) -> torch.Tensor:
++        return self.attn_fn(q, kv, attn_sink, topk_idxs, sm_scale)
++    
++    
++LOG2_E: tl.constexpr = 1.4426950408889634
++
++
++@dataclass(frozen=True)
++class TilingBlockConfig:
++    BLOCK_N: int
++    BLOCK_H: int
++    BLOCK_Q_BWD: int
++    BLOCK_K_BWD: int
++    BLOCK_H_BWD: int
++    extra_args: dict
++
++
++CONFIG_MAP = {
++    128: TilingBlockConfig(
++        BLOCK_N=64, BLOCK_H=32, BLOCK_Q_BWD=64, BLOCK_K_BWD=64, BLOCK_H_BWD=32,
++        extra_args={
++            "multibuffer": True,
++            "limit_auto_multi_buffer_only_for_local_buffer": False,
++            "set_workspace_multibuffer": 4,
++            "tile_mix_vector_loop": 2,
++            "tile_mix_cube_loop": 2,
++            }
++    ),
++    160: TilingBlockConfig(
++        BLOCK_N=80, BLOCK_H=32, BLOCK_Q_BWD=80, BLOCK_K_BWD=40, BLOCK_H_BWD=32,
++        extra_args={
++            "multibuffer": True,
++            "limit_auto_multi_buffer_only_for_local_buffer": False,
++            "set_workspace_multibuffer": 4,
++            "tile_mix_vector_loop": 2,
++            "tile_mix_cube_loop": 2,
++            }
++    ),
++    640: TilingBlockConfig(
++        BLOCK_N=80, BLOCK_H=32, BLOCK_Q_BWD=80, BLOCK_K_BWD=64, BLOCK_H_BWD=32,
++        extra_args={
++            "multibuffer": True,
++            "limit_auto_multi_buffer_only_for_local_buffer": False,
++            "set_workspace_multibuffer": 4,
++            "tile_mix_vector_loop": 2,
++            "tile_mix_cube_loop": 2,
++            }
++    ),
++}
++
++
++
++
++class SparseFlashAttentionTriton(torch.autograd.Function):
++    """
++    Custom Autograd Function for Sparse Flash Attention with Discrete KV and BSHD layout.
++    """
++    
++    @staticmethod
++    def forward(
++        ctx,
++        q: torch.Tensor,
++        kv: torch.Tensor,
++        attn_sink: torch.Tensor,
++        topk_idxs: torch.Tensor,
++        sm_scale: float,
++    ) -> torch.Tensor:
++        """
++        Forward pass for sparse flasha attention.
++        
++        Args:
++            q: [Seq, Batch, Head, Dim] - SBHD layout
++            kv: [Seq_kv, Batch, Dim] -  KV storage
++            topk_idxs: [Batch, Seq, TopK] - Indices map
++        """
++        n_ctx, batch, n_heads, head_dim = q.shape
++        
++        kv_ctx = kv.shape[0]
++        
++        topk = topk_idxs.shape[-1]
++        if topk not in CONFIG_MAP:
++            raise ValueError(f"Unsupported topk value: {topk}. Please add it to CONFIG_MAP.")
++        cfg = CONFIG_MAP[topk]
++        
++        topk_idxs = torch.clamp(topk_idxs, min=0, max=kv_ctx - 1)
++        
++        topk_idxs = topk_idxs.contiguous()
++        kv = kv.contiguous()
++        q = q.contiguous()
++        
++        out = torch.empty_like(q)
++
++        log_sum_exp = torch.empty(
++            (n_ctx, batch, n_heads),
++            device=q.device,
++            dtype=torch.float32
++        )
++
++        grid = (batch, n_ctx)
++        
++        K_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_N, head_dim), device=q.device, dtype=torch.bfloat16)
++        V_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_N, head_dim), device=q.device, dtype=torch.bfloat16)
++        QK_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H, cfg.BLOCK_N), device=q.device, dtype=torch.float32)
++        P_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H, cfg.BLOCK_N), device=q.device, dtype=torch.bfloat16)
++        PV_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H, head_dim), device=q.device, dtype=torch.float32)
++        _attn_fwd[grid](
++            Q_ptr=q,
++            KV_ptr=kv,
++            TopKIdx_ptr=topk_idxs,
++            Sink_ptr=attn_sink,
++            LSE_ptr=log_sum_exp,
++            Out_ptr=out,
++            K_Buffer_ptr=K_Buffer, 
++            V_Buffer_ptr=V_Buffer, 
++            QK_Buffer_ptr=QK_Buffer, 
++            P_Buffer_ptr=P_Buffer, 
++            PV_Buffer_ptr=PV_Buffer, 
++            sm_scale=sm_scale,
++            
++            stride_qz=q.stride(1),
++            stride_qs=q.stride(0),
++            stride_qh=q.stride(2),
++            stride_qd=q.stride(3),
++            
++            stride_kvz=kv.stride(1),
++            stride_kvs=kv.stride(0),
++            stride_kvd=kv.stride(2),
++            
++
++            stride_iz=topk_idxs.stride(0), # Batch 在第 0 维
++            stride_is=topk_idxs.stride(1), # Seq 在第 1 维
++            stride_in=topk_idxs.stride(2), # TopK 在第 2 维
++            
++            stride_oz=out.stride(1),
++            stride_os=out.stride(0),
++            stride_oh=out.stride(2), 
++            stride_od=out.stride(3),
++            
++            stride_sink=attn_sink.stride(0) if attn_sink is not None else 0,
++            
++            stride_mz=log_sum_exp.stride(1),
++            stride_ms=log_sum_exp.stride(0),
++            stride_mh=log_sum_exp.stride(2),
++            
++            H=n_heads,
++            HEAD_DIM=head_dim,
++            BLOCK_N=cfg.BLOCK_N,
++            TOPK=topk,
++            BLOCK_H=cfg.BLOCK_H,
++            KV_CTX=kv_ctx,
++        )
++
++        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, log_sum_exp)
++        ctx.sm_scale = sm_scale
++        ctx.kv_ctx = kv_ctx
++        return out
++    
++    @staticmethod
++    def backward(
++        ctx,
++        grad_out: torch.Tensor,
++    ):
++        q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
++        softmax_scale = ctx.sm_scale
++        kv_ctx = ctx.kv_ctx
++
++        # 🌟 核心修复 1：真正的 SBHD 解包
++        n_ctx, batch, n_heads, head_dim = q.shape
++        
++        # 智能获取 kv_ctx 的实际 Seq 所在维度 (兼容 [Seq, Batch, Dim])
++        kv_batch_dim = 0 if kv.shape[0] == batch else 1
++        kv_seq_dim = 1 - kv_batch_dim
++
++        topk = int(topk_idxs.shape[-1])
++        if topk not in CONFIG_MAP:
++            raise ValueError(f"Unsupported topk value: {topk}. Please add it to CONFIG_MAP.")
++        cfg = CONFIG_MAP[topk]
++        
++        if softmax_scale is None:
++            softmax_scale = (1.0 / head_dim) ** 0.5
++
++        # 🌟 防护：确保所有的输入梯度物理连续
++        grad_out = grad_out.contiguous()
++
++        grad_q = torch.zeros_like(q, dtype=torch.float32)
++        grad_kv = torch.zeros_like(kv, dtype=torch.float32)
++        grad_sink = torch.zeros_like(attn_sink, dtype=torch.float32) if attn_sink is not None else None
++
++        # 修复 Buffer：Grid 是 (batch, n_ctx)
++        grid = (batch, n_ctx)
++
++        # ====================== Kernel 1: dq_dsink ======================
++        K_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_Q_BWD, head_dim), device=q.device, dtype=torch.bfloat16)
++        S_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, cfg.BLOCK_Q_BWD), device=q.device, dtype=torch.float32)
++        dP_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, cfg.BLOCK_Q_BWD), device=q.device, dtype=torch.float32)
++        dS_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, cfg.BLOCK_Q_BWD), device=q.device, dtype=torch.bfloat16)
++        dQ_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, head_dim), device=q.device, dtype=torch.float32)
++
++        num_blocks_q = triton.cdiv(topk, cfg.BLOCK_Q_BWD)
++        
++        _attn_bwd_dq_dsink[grid](
++            Q_ptr=q, KV_ptr=kv, Sink_ptr=attn_sink, TopKIdx_ptr=topk_idxs, 
++            grad_out_ptr=grad_out, grad_q_ptr=grad_q, grad_sink_ptr=grad_sink,
++            LSE_ptr=lse, Out_ptr=out,
++            k_buf_ptr=K_Buffer, s_buf_ptr=S_Buffer, dp_buf_ptr=dP_Buffer,
++            ds_buf_ptr=dS_Buffer, dq_buf_ptr=dQ_Buffer, 
++            
++            # 🌟🌟🌟 核心修复 2：全面拨乱反正的 Stride 🌟🌟🌟
++            # b 代表 Batch，m/n 代表 Seq
++            
++            # q, grad_q, grad_out, out: [Seq, Batch, Head, Dim]
++            stride_qb=q.stride(1), stride_qm=q.stride(0), stride_qh=q.stride(2), stride_qd=q.stride(3),
++            stride_gqb=grad_q.stride(1), stride_gqm=grad_q.stride(0), stride_gqh=grad_q.stride(2), stride_gqd=grad_q.stride(3),
++            stride_gob=grad_out.stride(1), stride_gom=grad_out.stride(0), stride_goh=grad_out.stride(2), stride_god=grad_out.stride(3),
++            stride_ob=out.stride(1), stride_om=out.stride(0), stride_oh=out.stride(2), stride_od=out.stride(3),
++            
++            # kv: [Seq, Batch, Dim]
++            stride_kvb=kv.stride(kv_batch_dim), stride_kvn=kv.stride(kv_seq_dim), stride_kvd=kv.stride(2),
++            
++            # topk_idxs: [Batch, Seq, TopK]
++            stride_tb=topk_idxs.stride(0), stride_tm=topk_idxs.stride(1), stride_tk=topk_idxs.stride(2),
++            
++            # lse: [Seq, Batch, Head]
++            stride_lseb=lse.stride(1), stride_lsem=lse.stride(0), stride_lseh=lse.stride(2),
++            
++            stride_sink=attn_sink.stride(0) if attn_sink is not None else 0, 
++            stride_gsink=grad_sink.stride(0) if grad_sink is not None else 0,
++            
++            sm_scale=softmax_scale, TOPK=topk, n_ctx=n_ctx, n_heads=n_heads, head_dim=head_dim,
++            BLOCK_K=cfg.BLOCK_Q_BWD, NUM_BLOCKS=num_blocks_q, BLOCK_H=cfg.BLOCK_H_BWD, KV_CTX=kv_ctx,
++        )
++
++        # ====================== Kernel 2: dk_dv ======================
++        K_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_K_BWD, head_dim), device=q.device, dtype=torch.bfloat16)
++        S_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, cfg.BLOCK_K_BWD), device=q.device, dtype=torch.float32)
++        dP_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, cfg.BLOCK_K_BWD), device=q.device, dtype=torch.float32)
++        P_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, cfg.BLOCK_K_BWD), device=q.device, dtype=torch.bfloat16)
++        dS_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_H_BWD, cfg.BLOCK_K_BWD), device=q.device, dtype=torch.bfloat16)
++        dK_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_K_BWD, head_dim), device=q.device, dtype=torch.float32)
++        dV_Buffer = torch.empty((batch, n_ctx, cfg.BLOCK_K_BWD, head_dim), device=q.device, dtype=torch.float32)
++
++        num_blocks_kv = triton.cdiv(topk, cfg.BLOCK_K_BWD)
++        
++        _attn_bwd_dk_dv[grid](
++            Q_ptr=q, KV_ptr=kv, TopKIdx_ptr=topk_idxs, 
++            grad_out_ptr=grad_out, grad_kv_ptr=grad_kv, 
++            LSE_ptr=lse, Out_ptr=out,
++            k_buf_ptr=K_Buffer, s_buf_ptr=S_Buffer, dp_buf_ptr=dP_Buffer,
++            p_buf_ptr=P_Buffer, ds_buf_ptr=dS_Buffer, dk_buf_ptr=dK_Buffer, dv_buf_ptr=dV_Buffer,
++            
++            # 🌟🌟🌟 同理，全面拨乱反正的 Stride 🌟🌟🌟
++            stride_qb=q.stride(1), stride_qm=q.stride(0), stride_qh=q.stride(2), stride_qd=q.stride(3),
++            stride_kvb=kv.stride(kv_batch_dim), stride_kvn=kv.stride(kv_seq_dim), stride_kvd=kv.stride(2),
++            stride_gob=grad_out.stride(1), stride_gom=grad_out.stride(0), stride_goh=grad_out.stride(2), stride_god=grad_out.stride(3),
++            
++            # grad_kv: [Seq, Batch, Dim]
++            stride_gkvs=grad_kv.stride(kv_seq_dim), stride_gkvd=grad_kv.stride(2), # 注意：你原本的代码里没有传 stride_gkvb，如果底层内核没写就不管它
++            
++            # topk_idxs: [Batch, Seq, TopK]
++            stride_tb=topk_idxs.stride(0), stride_tm=topk_idxs.stride(1), stride_tk=topk_idxs.stride(2),
++            
++            stride_lseb=lse.stride(1), stride_lsem=lse.stride(0), stride_lseh=lse.stride(2),
++            stride_ob=out.stride(1), stride_om=out.stride(0), stride_oh=out.stride(2), stride_od=out.stride(3),
++            
++            sm_scale=softmax_scale, TOPK=topk, n_ctx=n_ctx, n_heads=n_heads, head_dim=head_dim,
++            BLOCK_K=cfg.BLOCK_K_BWD, NUM_BLOCKS=num_blocks_kv, BLOCK_H=cfg.BLOCK_H_BWD, KV_CTX=kv_ctx,
++        )
++
++        return (
++            grad_q, 
++            grad_kv,
++            grad_sink, 
++            None, 
++            None, 
++        )
++
++@triton.jit
++def _inner_fwd(
++    q_base, kv_base, idx_base, Sink_ptr, lse_base, out_base,
++    k_buf_ptr, v_buf_ptr, qk_buf_ptr, p_buf_ptr, pv_buf_ptr,
++    stride_qh, stride_qd, stride_kvs, stride_kvd, stride_in, 
++    stride_sink, stride_mh, stride_oh, stride_od,
++    off_d, sm_scale,
++    HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr, TOPK: tl.constexpr,
++    START_H: tl.constexpr, BLOCK_H: tl.constexpr, H: tl.constexpr,
++    KV_CTX: tl.constexpr,
++):
++    """
++    Ascend NPU FlashAttention compute block (1:2 Mix Mode)
++    
++    Pipeline Stages:
++    1. [Vector] Load KV (Split) -> Signal 0
++    2. [Cube]   Calc QK (Full)  -> Signal 1
++    3. [Vector] Softmax (Split) -> Signal 2
++    4. [Cube]   Calc PV (Full)  -> Signal 3
++    5. [Vector] Accumulate (Split)
++    """
++    num_steps = triton.cdiv(TOPK, BLOCK_N)
++    
++    off_h_full = START_H + tl.arange(0, BLOCK_H)
++    h_mask_full = off_h_full < H
++
++    q_ptrs = q_base + off_h_full[:, None] * stride_qh + off_d[None, :] * stride_qd
++    q_full = tl.load(q_ptrs, mask=h_mask_full[:, None], other=0.0)
++
++    sub_id = al.sub_vec_id()
++    
++    HALF_H: tl.constexpr = BLOCK_H // 2
++    row_indices = tl.arange(0, HALF_H) + sub_id * HALF_H 
++    off_h_sub = START_H + row_indices 
++    h_mask_sub = off_h_sub < H
++
++    HALF_N: tl.constexpr = BLOCK_N // 2
++    n_offset_local = sub_id * HALF_N
++    n_offset_local1 = sub_id.to(tl.float32) * HALF_N
++
++    acc = tl.zeros([HALF_H, HEAD_DIM], dtype=tl.float32)
++    m_i = tl.full([HALF_H], -10e10, dtype=tl.float32)
++    l_i = tl.zeros([HALF_H], dtype=tl.float32)
++    
++    for i in range(num_steps):
++        # Step 1: AIC load KV
++        start_n = i * BLOCK_N
++        start_n1 = i.to(tl.float32) * BLOCK_N
++
++        off_n_local = start_n + n_offset_local + tl.arange(0, HALF_N)
++        off_n_local1 = start_n1 + n_offset_local1 + tl.arange(0, HALF_N).to(tl.float32)
++        n_mask = off_n_local1 < TOPK
++        
++        k_idx = tl.load(idx_base + off_n_local * stride_in, mask=n_mask, other=-1)
++        # k_idx = tl.load(idx_base + off_n_local * stride_in)
++        # k_idx = tl.arange(0, HALF_N)
++        # load_mask = (k_idx >= 0) & n_mask
++        load_mask = (k_idx.to(tl.float32) >= 0) & n_mask
++        
++        # address conflict
++        # plan 1
++        # dummy_idx = off_n_local % TOPK + 5120
++        
++        # plan 2
++        dummy_idx = (KV_CTX - 1) - tl.arange(0, HALF_N)
++        
++        # plan3
++        # dummy_idx = (off_n_local + 2048) % 4096
++        
++        k_idx_optimized = tl.where(load_mask, k_idx, dummy_idx)
++        kv_ptrs = kv_base + k_idx_optimized[:, None] * stride_kvs + off_d[None, :] * stride_kvd
++        
++        # kv_ptrs = kv_base + k_idx[:, None] * stride_kvs + off_d[None, :] * stride_kvd
++        kv = tl.load(kv_ptrs, mask=load_mask[:, None], other=0.0)
++    
++        buf_row_idx = n_offset_local + tl.arange(0, HALF_N)
++        tl.store(k_buf_ptr + buf_row_idx[:, None] * HEAD_DIM + off_d[None, :], kv)
++
++        al.sync_block_set("vector", "cube", 0)
++
++        # Step 2: AIC 计算 QK
++        al.sync_block_wait("vector", "cube", 0)
++        
++        off_n_buf = tl.arange(0, BLOCK_N)
++        kv_load = tl.load(k_buf_ptr + off_n_buf[:, None] * HEAD_DIM + off_d[None, :])
++
++        qk_full = tl.dot(q_full, tl.trans(kv_load))
++
++        qk_store_ptr = qk_buf_ptr + tl.arange(0, BLOCK_H)[:, None] * BLOCK_N + off_n_buf[None, :]
++        tl.store(qk_store_ptr, qk_full)
++
++        # # Step 3: AIV Softmax     
++        off_n_buf = tl.arange(0, BLOCK_N)
++        qk_load_ptr = qk_buf_ptr + row_indices[:, None] * BLOCK_N + off_n_buf[None, :]
++        qk_sub = tl.load(qk_load_ptr)
++
++        qk_sub *= (sm_scale * LOG2_E)
++
++        off_n_full_global0 = start_n + off_n_buf
++        off_n_full_global1 = start_n.to(tl.float32) + off_n_buf.to(tl.float32)
++        n_mask_full = off_n_full_global1 < TOPK
++        k_idx_full = tl.load(idx_base + off_n_full_global0 * stride_in, mask=n_mask_full, other=-1).to(tl.float32)
++        mask_full = (k_idx_full >= 0) & n_mask_full
++        qk_sub = tl.where(mask_full[None, :], qk_sub, -10e10)
++
++        m_ij = tl.max(qk_sub, 1)
++        m_next = tl.maximum(m_i, m_ij)
++        alpha = tl.math.exp2(m_i - m_next)
++        p_sub = tl.math.exp2(qk_sub - m_next[:, None])
++
++        acc = acc * alpha[:, None]
++
++        p_store_ptr = p_buf_ptr + row_indices[:, None] * BLOCK_N + off_n_buf[None, :]
++        tl.store(p_store_ptr, p_sub.to(tl.float16))
++
++        al.sync_block_set("vector", "cube", 2)
++
++        # Step 4: AIC 计算 PV
++        al.sync_block_wait("vector", "cube", 2)
++
++        p_full = tl.load(p_buf_ptr + tl.arange(0, BLOCK_H)[:, None] * BLOCK_N + off_n_buf[None, :])
++
++        pv_full = tl.dot(p_full.to(kv_load.dtype), kv_load)
++
++        pv_store_ptr = pv_buf_ptr + tl.arange(0, BLOCK_H)[:, None] * HEAD_DIM + off_d[None, :]
++        tl.store(pv_store_ptr, pv_full)
++
++        # # Step 5: AIV Update
++        pv_load_ptr = pv_buf_ptr + row_indices[:, None] * HEAD_DIM + off_d[None, :]
++        pv_sub = tl.load(pv_load_ptr)
++
++        acc += pv_sub
++        l_i = l_i * alpha + tl.sum(p_sub, 1)
++        m_i = m_next
++
++    sink_ptrs = Sink_ptr + off_h_sub * stride_sink
++    attn_sink = tl.load(sink_ptrs, mask=h_mask_sub, other=0.0) * LOG2_E
++
++    p_sink = tl.math.exp2(attn_sink - m_i)
++    l_i += p_sink
++    lse = m_i + tl.math.log2(l_i)
++
++    tl.store(lse_base + off_h_sub * stride_mh, lse, mask=h_mask_sub)
++
++    out = acc / l_i[:, None]
++    out_ptrs = out_base + off_h_sub[:, None] * stride_oh + off_d[None, :] * stride_od
++    tl.store(out_ptrs, out.to(out_base.dtype.element_ty), mask=h_mask_sub[:, None])
++
++
++@triton.jit
++def _attn_fwd(
++    Q_ptr, KV_ptr, TopKIdx_ptr, Sink_ptr, LSE_ptr, Out_ptr,
++    K_Buffer_ptr, V_Buffer_ptr, QK_Buffer_ptr, P_Buffer_ptr, PV_Buffer_ptr,
++    sm_scale,
++    stride_qz, stride_qs, stride_qh, stride_qd,
++    stride_kvz, stride_kvs, stride_kvd,
++    stride_iz, stride_is, stride_in,
++    stride_oz, stride_os, stride_oh, stride_od,
++    stride_sink, stride_mz, stride_ms, stride_mh,
++    H: tl.constexpr, HEAD_DIM: tl.constexpr,
++    BLOCK_N: tl.constexpr, TOPK: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    KV_CTX: tl.constexpr,
++):
++    off_batch = tl.program_id(0).to(tl.int64)
++    off_seq = tl.program_id(1).to(tl.int64)
++    
++    q_base = Q_ptr + off_batch * stride_qz + off_seq * stride_qs
++    out_base = Out_ptr + off_batch * stride_oz + off_seq * stride_os
++    idx_base = TopKIdx_ptr + off_batch * stride_iz + off_seq * stride_is
++    lse_base = LSE_ptr + off_batch * stride_mz + off_seq * stride_ms
++    kv_base = KV_ptr + off_batch * stride_kvz
++    
++    pid = tl.program_id(0) * tl.num_programs(1) + tl.program_id(1)
++    
++    off_buf_kv = pid * (BLOCK_N * HEAD_DIM)
++    off_buf_qk = pid * (BLOCK_H * BLOCK_N)
++    off_buf_pv = pid * (BLOCK_H * HEAD_DIM)
++    
++    cur_k_buf = K_Buffer_ptr + off_buf_kv
++    cur_v_buf = V_Buffer_ptr + off_buf_kv
++    cur_qk_buf = QK_Buffer_ptr + off_buf_qk
++    cur_p_buf = P_Buffer_ptr + off_buf_qk
++    cur_pv_buf = PV_Buffer_ptr + off_buf_pv
++
++    off_d = tl.arange(0, HEAD_DIM)
++
++    for start_h in range(0, H, BLOCK_H):
++        _inner_fwd(
++            q_base, kv_base, idx_base, Sink_ptr, lse_base, out_base,
++            cur_k_buf, cur_v_buf, cur_qk_buf, cur_p_buf, cur_pv_buf,
++            stride_qh, stride_qd, stride_kvs, stride_kvd, stride_in, 
++            stride_sink, stride_mh, stride_oh, stride_od,
++            off_d, sm_scale, 
++            HEAD_DIM, BLOCK_N, TOPK,
++            START_H=start_h, BLOCK_H=BLOCK_H,
++            H=H, KV_CTX=KV_CTX,
++        )
++
++
++@triton.jit
++def _get_delta_split(
++    Out_ptr, Grad_O_ptr,
++    stride_oh, stride_od, stride_goh, stride_god,
++    off_d, 
++    row_indices, h_mask_sub, 
++    HEAD_DIM: tl.constexpr
++):
++    out_ptrs = Out_ptr + row_indices[:, None] * stride_oh + off_d[None, :] * stride_od
++    do_ptrs = Grad_O_ptr + row_indices[:, None] * stride_goh + off_d[None, :] * stride_god
++
++    out = tl.load(out_ptrs, mask=h_mask_sub[:, None], other=0.0).to(tl.float32)
++    grad_o = tl.load(do_ptrs, mask=h_mask_sub[:, None], other=0.0).to(tl.float32)
++
++    delta = tl.sum(out * grad_o, axis=1)
++    return delta
++
++
++@triton.jit
++def _inner_dq(
++    q_full, do_full, lse_sub, delta,
++    KV_ptr, TopKIdx_ptr,
++    k_buf_ptr, s_buf_ptr, dp_buf_ptr, ds_buf_ptr, dq_buf_ptr,
++    stride_kvn, stride_kvd, stride_tk, 
++    off_d, sm_scale,
++    sub_id, row_indices, n_offset_local,n_offset_local1,
++    HEAD_DIM: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_H: tl.constexpr,
++    TOPK: tl.constexpr, NUM_BLOCKS: tl.constexpr,
++    KV_CTX: tl.constexpr,
++):
++    HALF_H: tl.constexpr = BLOCK_H // 2
++    acc_dq = tl.zeros([HALF_H, HEAD_DIM], dtype=tl.float32)
++
++    HALF_K: tl.constexpr = BLOCK_K // 2
++    off_k_buf = tl.arange(0, BLOCK_K)
++    buf_range_h = tl.arange(0, BLOCK_H)
++
++    for i in range(NUM_BLOCKS):
++        start_k = i * BLOCK_K
++        start_k1 = i.to(tl.float32) * BLOCK_K
++
++        # --- Stage 1: Load K ---
++        off_k_local0 = start_k + n_offset_local + tl.arange(0, HALF_K)
++        off_k_local1 = start_k1 + n_offset_local1 + tl.arange(0, HALF_K).to(tl.float32)
++        k_mask = off_k_local1 < TOPK
++
++        idx = tl.load(TopKIdx_ptr + off_k_local0 * stride_tk, mask=k_mask, other=-1).to(tl.float32)
++        valid = k_mask & (idx >= 0)
++        # idx_safe = idx * valid
++        
++        # address conflict
++        # plan 1
++        # dummy_idx = off_n_local % TOPK + 5120
++        
++        # plan 2
++        dummy_idx = (KV_CTX - 1) - tl.arange(0, HALF_K)
++        
++        # plan3
++        # dummy_idx = (off_n_local + 2048) % 4096
++        
++        k_idx_optimized = tl.where(valid, idx, dummy_idx)
++        k_ptrs = KV_ptr + k_idx_optimized[:, None].to(tl.int64) * stride_kvn + off_d[None, :] * stride_kvd
++
++        # k_ptrs = KV_ptr + idx_safe[:, None].to(tl.int64) * stride_kvn + off_d[None, :] * stride_kvd
++        k_val = tl.load(k_ptrs, mask=valid[:, None], other=0.0)
++
++        buf_k_idx = n_offset_local + tl.arange(0, HALF_K)
++        tl.store(k_buf_ptr + buf_k_idx[:, None] * HEAD_DIM + off_d[None, :], k_val)
++
++        al.sync_block_set("vector", "cube", 0)
++
++        # --- Stage 2: S, dP ---
++        al.sync_block_wait("vector", "cube", 0)
++
++        k_load = tl.load(k_buf_ptr + off_k_buf[:, None] * HEAD_DIM + off_d[None, :])
++
++        s_res = tl.dot(q_full, tl.trans(k_load))
++        dp_res = tl.dot(do_full, tl.trans(k_load)) # Reuse K
++
++        tl.store(s_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :], s_res)
++        tl.store(dp_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :], dp_res)
++
++        # # --- Stage 3: P, dS ---  
++        s_sub = tl.load(s_buf_ptr + row_indices[:, None] * BLOCK_K + off_k_buf[None, :])
++        dp_sub = tl.load(dp_buf_ptr + row_indices[:, None] * BLOCK_K + off_k_buf[None, :])
++
++        s_sub = s_sub * (sm_scale * LOG2_E)
++        p_sub = tl.math.exp2(s_sub - lse_sub[:, None])
++
++        off_k_global = start_k + off_k_buf
++        idx_global_mask = off_k_global.to(tl.float32) < TOPK
++        idx_global = tl.load(TopKIdx_ptr + off_k_global * stride_tk, mask=idx_global_mask, other=-1).to(tl.float32)
++        valid_compute = (off_k_global.to(tl.float32) < TOPK) & (idx_global >= 0)
++
++        p_sub = tl.where(valid_compute[None, :], p_sub, 0.0)
++        ds_sub = p_sub * (dp_sub - delta[:, None])
++        ds_sub = tl.where(valid_compute[None, :], ds_sub, 0.0)
++
++        tl.store(ds_buf_ptr + row_indices[:, None] * BLOCK_K + off_k_buf[None, :], ds_sub.to(tl.bfloat16))
++
++        al.sync_block_set("vector", "cube", 2)
++
++        # --- Stage 4: dQ_part ---
++        al.sync_block_wait("vector", "cube", 2)
++
++        ds_full = tl.load(ds_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :])
++        dq_part = tl.dot(ds_full, k_load)
++
++        tl.store(dq_buf_ptr + buf_range_h[:, None] * HEAD_DIM + off_d[None, :], dq_part)
++
++        # # --- Stage 5: Accumulate dQ ---     
++        dq_load = tl.load(dq_buf_ptr + row_indices[:, None] * HEAD_DIM + off_d[None, :])
++        acc_dq += dq_load * sm_scale
++
++    return acc_dq
++
++
++@triton.jit
++def _inner_dkv(
++    q_full, do_full, lse_sub, delta,
++    KV_ptr, TopKIdx_ptr, Grad_KV_ptr,
++    k_buf_ptr, s_buf_ptr, dp_buf_ptr, p_buf_ptr, ds_buf_ptr, dk_buf_ptr, dv_buf_ptr,
++    stride_kvn, stride_kvd, stride_tk, stride_gkvs, stride_gkvd,
++    off_d, sm_scale,
++    sub_id, row_indices, n_offset_local, n_offset_local1,
++    HEAD_DIM: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_H: tl.constexpr,
++    TOPK: tl.constexpr, NUM_BLOCKS: tl.constexpr,
++    KV_CTX: tl.constexpr,
++):
++    HALF_K: tl.constexpr = BLOCK_K // 2
++    off_k_buf = tl.arange(0, BLOCK_K)
++    buf_range_h = tl.arange(0, BLOCK_H)
++
++    for i in range(NUM_BLOCKS):
++        start_k = i * BLOCK_K
++        start_k1 = i.to(tl.float32) * BLOCK_K
++
++        # --- Stage 1: Load K ---
++        off_k_local0 = start_k + n_offset_local + tl.arange(0, HALF_K)
++        off_k_local1 = start_k1 + n_offset_local1 + tl.arange(0, HALF_K).to(tl.float32)
++        k_mask = off_k_local1 < TOPK
++        idx = tl.load(TopKIdx_ptr + off_k_local0 * stride_tk, mask=k_mask, other=-1).to(tl.int32)
++        valid = k_mask & (idx.to(tl.float32) >= 0)
++        # idx_safe = tl.where(valid, idx, 0)
++        
++        # address conflict
++        # plan 1
++        # dummy_idx = off_n_local % TOPK + 5120
++        
++        # plan 2
++        dummy_idx = (KV_CTX - 1) - tl.arange(0, HALF_K)
++        
++        # plan3
++        # dummy_idx = (off_n_local + 2048) % 4096
++        
++        k_idx_optimized = tl.where(valid, idx, dummy_idx)
++        k_ptrs = KV_ptr + k_idx_optimized[:, None].to(tl.int64) * stride_kvn + off_d[None, :] * stride_kvd
++
++        # k_ptrs = KV_ptr + idx_safe[:, None].to(tl.int64) * stride_kvn + off_d[None, :] * stride_kvd
++        k_val = tl.load(k_ptrs, mask=valid[:, None], other=0.0)
++
++        buf_k_idx = n_offset_local + tl.arange(0, HALF_K)
++        tl.store(k_buf_ptr + buf_k_idx[:, None] * HEAD_DIM + off_d[None, :], k_val.to(tl.float32))
++        al.sync_block_set("vector", "cube", 0)
++
++        # --- Stage 2: S, dP ---
++        al.sync_block_wait("vector", "cube", 0)
++        k_load = tl.load(k_buf_ptr + off_k_buf[:, None] * HEAD_DIM + off_d[None, :])
++        k_load_bf16 = k_load.to(tl.bfloat16)
++        s_res = tl.dot(q_full, tl.trans(k_load_bf16))
++        dp_res = tl.dot(do_full, tl.trans(k_load_bf16))
++        tl.store(s_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :], s_res)
++        tl.store(dp_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :], dp_res)
++        al.sync_block_set("cube", "vector", 1)
++
++        # --- Stage 3: P, dS ---
++        al.sync_block_wait("cube", "vector", 1)
++        s_sub = tl.load(s_buf_ptr + row_indices[:, None] * BLOCK_K + off_k_buf[None, :]).to(tl.float32)
++        dp_sub = tl.load(dp_buf_ptr + row_indices[:, None] * BLOCK_K + off_k_buf[None, :]).to(tl.float32)
++        s_sub = s_sub * (sm_scale * LOG2_E)
++        p_sub = tl.math.exp2(s_sub - lse_sub[:, None])
++
++        off_k_global0 = start_k + off_k_buf
++        off_k_global1 = start_k.to(tl.float32) + off_k_buf.to(tl.float32)
++        idx_global_mask = off_k_global1 < TOPK
++        idx_global = tl.load(TopKIdx_ptr + off_k_global0 * stride_tk, mask=idx_global_mask, other=-1).to(tl.float32)
++        valid_compute = (off_k_global1 < TOPK) & (idx_global >= 0)
++
++        p_sub = tl.where(valid_compute[None, :], p_sub, 0.0)
++        ds_sub = p_sub * (dp_sub - delta[:, None])
++        ds_sub = tl.where(valid_compute[None, :], ds_sub, 0.0)
++
++        tl.store(p_buf_ptr + row_indices[:, None] * BLOCK_K + off_k_buf[None, :], p_sub.to(tl.bfloat16))
++        tl.store(ds_buf_ptr + row_indices[:, None] * BLOCK_K + off_k_buf[None, :], ds_sub.to(tl.bfloat16))
++        al.sync_block_set("vector", "cube", 2)
++
++        # --- Stage 4 & 5: Serial Compute ---
++        al.sync_block_wait("vector", "cube", 2)
++
++        # Prepare shared params for atomic_add
++        buf_k_idx0 = n_offset_local + tl.arange(0, HALF_K)
++        buf_k_idx1 = n_offset_local.to(tl.float32) + tl.arange(0, HALF_K).to(tl.float32)
++        idx_step_mask = (start_k.to(tl.float32) + buf_k_idx1) < TOPK
++        idx_step = tl.load(TopKIdx_ptr + (start_k + buf_k_idx0) * stride_tk, mask=idx_step_mask, other=-1).to(tl.float32)
++        valid_step = idx_step_mask & (idx_step >= 0)
++        
++        # address conflict
++        # plan 1
++        # dummy_idx_step = off_n_local % TOPK + 5120
++        
++        # plan 2
++        dummy_idx_step = (KV_CTX - 1) - tl.arange(0, HALF_K)
++        
++        # plan3
++        # dummy_idx_step = (off_n_local + 2048) % 4096
++        
++        idx_safe_step = tl.where(valid_step, idx_step, dummy_idx_step)
++        gk_ptrs = Grad_KV_ptr + idx_safe_step[:, None].to(tl.int64) * stride_gkvs + off_d[None, :] * stride_gkvd
++        # idx_safe_step = tl.where(valid_step, idx_step, 0)
++        # gk_ptrs = Grad_KV_ptr + idx_safe_step[:, None].to(tl.int64) * stride_gkvs + off_d[None, :] * stride_gkvd
++
++        # -----------------------------------------------------------
++        # [Part A] Compute dV and store
++        # -----------------------------------------------------------
++        p_full = tl.load(p_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :])
++        # compute dV (BF16 Dot -> FP32 Accum)
++        dv_part = tl.dot(tl.trans(p_full.to(tl.bfloat16)), do_full)
++        
++        # 将 dV 存入 Buffer (暂存)
++        tl.store(dv_buf_ptr + off_k_buf[:, None] * HEAD_DIM + off_d[None, :], dv_part)
++
++        # Atomic add dV
++        dv_val = tl.load(dv_buf_ptr + buf_k_idx0[:, None] * HEAD_DIM + off_d[None, :]).to(tl.float32)
++        dv_val = tl.where(valid_step[:, None], dv_val, 0.0)
++        tl.atomic_add(gk_ptrs, dv_val, mask=valid_step[:, None])
++    
++        # [Memory Release] acc_dv register released
++
++        # -----------------------------------------------------------
++        # [Part B] Compute dK and store
++        # -----------------------------------------------------------
++        ds_full = tl.load(ds_buf_ptr + buf_range_h[:, None] * BLOCK_K + off_k_buf[None, :])
++        # compute dK (复用刚才 dV 占用的 L1 空间)
++        dk_part = tl.dot(tl.trans(ds_full.to(tl.bfloat16)), q_full)
++        
++        # 将 dK 存入 Buffer (可以复用 dv_buf_ptr 的空间，或者用独立的 dk_buf_ptr)
++        tl.store(dk_buf_ptr + off_k_buf[:, None] * HEAD_DIM + off_d[None, :], dk_part)
++
++        # Atomic add dK
++        dk_val = tl.load(dk_buf_ptr + buf_k_idx0[:, None] * HEAD_DIM + off_d[None, :]).to(tl.float32)
++        dk_grad = dk_val * sm_scale
++        dk_grad = tl.where(valid_step[:, None], dk_grad, 0.0)
++        tl.atomic_add(gk_ptrs, dk_grad, mask=valid_step[:, None])
++
++
++@triton.jit
++def _attn_bwd_dq_dsink(
++    Q_ptr, KV_ptr, Sink_ptr, TopKIdx_ptr, grad_out_ptr,
++    grad_q_ptr, grad_sink_ptr, LSE_ptr, Out_ptr,
++    k_buf_ptr, s_buf_ptr, dp_buf_ptr, ds_buf_ptr, dq_buf_ptr,
++    stride_qb, stride_qm, stride_qh, stride_qd,
++    stride_kvb, stride_kvn, stride_kvd,
++    stride_gob, stride_gom, stride_goh, stride_god,
++    stride_gqb, stride_gqm, stride_gqh, stride_gqd,
++    stride_tb, stride_tm, stride_tk,
++    stride_lseb, stride_lsem, stride_lseh,
++    stride_ob, stride_om, stride_oh, stride_od,
++    stride_sink, stride_gsink,
++    sm_scale,
++    TOPK: tl.constexpr, n_ctx: tl.constexpr, n_heads: tl.constexpr, 
++    head_dim: tl.constexpr, BLOCK_K: tl.constexpr, NUM_BLOCKS: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    KV_CTX: tl.constexpr,
++):
++    off_batch = tl.program_id(axis=0)
++    off_seq = tl.program_id(axis=1)
++    
++    pid = tl.program_id(0) * tl.num_programs(1) + tl.program_id(1)
++    off_buf_kv = pid * (BLOCK_K * head_dim)
++    off_buf_qk = pid * (BLOCK_H * BLOCK_K)
++    off_buf_dq = pid * (BLOCK_H * head_dim)
++    
++    cur_k_buf = k_buf_ptr + off_buf_kv
++    cur_s_buf = s_buf_ptr + off_buf_qk
++    cur_dp_buf = dp_buf_ptr + off_buf_qk
++    cur_ds_buf = ds_buf_ptr + off_buf_qk
++    cur_dq_buf = dq_buf_ptr + off_buf_dq
++
++    q_base = Q_ptr + off_batch * stride_qb + off_seq * stride_qm
++    grad_o_base = grad_out_ptr + off_batch * stride_gob + off_seq * stride_gom
++    lse_base = LSE_ptr + off_batch * stride_lseb + off_seq * stride_lsem
++    out_base = Out_ptr + off_batch * stride_ob + off_seq * stride_om
++    grad_q_base = grad_q_ptr + off_batch * stride_gqb + off_seq * stride_gqm
++    topk_ptr_base = TopKIdx_ptr + off_batch * stride_tb + off_seq * stride_tm
++    kv_ptr_base = KV_ptr + off_batch * stride_kvb 
++
++    
++    off_d = tl.arange(0, head_dim)
++
++    for start_h in range(0, n_heads, BLOCK_H):
++        off_h_full = start_h + tl.arange(0, BLOCK_H)
++        h_mask_full = off_h_full < n_heads
++        
++        sub_id = al.sub_vec_id()
++        HALF_H: tl.constexpr = BLOCK_H // 2
++        row_indices = tl.arange(0, HALF_H) + sub_id * HALF_H
++        off_h_sub = start_h + row_indices
++        h_mask_sub = off_h_sub < n_heads
++        HALF_K: tl.constexpr = BLOCK_K // 2
++        n_offset_local = sub_id * HALF_K
++        n_offset_local1 = sub_id.to(tl.float32) * HALF_K
++
++        q_ptrs = q_base + off_h_full[:, None] * stride_qh + off_d[None, :] * stride_qd
++        do_ptrs = grad_o_base + off_h_full[:, None] * stride_goh + off_d[None, :] * stride_god
++        q_full = tl.load(q_ptrs, mask=h_mask_full[:, None], other=0.0)
++        do_full = tl.load(do_ptrs, mask=h_mask_full[:, None], other=0.0)
++
++        delta = _get_delta_split(
++            out_base, grad_o_base, stride_oh, stride_od, stride_goh, stride_god,
++            off_d, off_h_sub, h_mask_sub, head_dim
++        )
++        
++        sink_ptr_now = Sink_ptr + off_batch * stride_sink + off_h_sub
++        gsink_ptr_now = grad_sink_ptr + off_batch * stride_gsink + off_h_sub
++        sink_val = tl.load(sink_ptr_now, mask=h_mask_sub, other=0.0)
++        lse_val = tl.load(lse_base + off_h_sub * stride_lseh, mask=h_mask_sub, other=0.0)
++        p_sink = tl.math.exp2(sink_val * LOG2_E - lse_val)
++        d_sink = -p_sink * delta
++        tl.atomic_add(gsink_ptr_now, d_sink, mask=h_mask_sub)
++
++        acc_dq = _inner_dq(
++            q_full, do_full, lse_val, delta,
++            kv_ptr_base, topk_ptr_base,
++            cur_k_buf, cur_s_buf, cur_dp_buf, cur_ds_buf, cur_dq_buf,
++            stride_kvn, stride_kvd, stride_tk, 
++            off_d, sm_scale,
++            sub_id, row_indices, n_offset_local,n_offset_local1,
++            head_dim, BLOCK_K, BLOCK_H, TOPK, NUM_BLOCKS, KV_CTX,
++        )
++        
++        gq_ptrs = grad_q_base + off_h_sub[:, None] * stride_gqh + off_d[None, :] * stride_gqd
++        tl.store(gq_ptrs, acc_dq.to(tl.bfloat16), mask=h_mask_sub[:, None])
++
++
++@triton.jit
++def _attn_bwd_dk_dv(
++    Q_ptr, KV_ptr, TopKIdx_ptr, grad_out_ptr,
++    grad_kv_ptr, LSE_ptr, Out_ptr,
++    k_buf_ptr, s_buf_ptr, dp_buf_ptr, 
++    p_buf_ptr, ds_buf_ptr, dk_buf_ptr, dv_buf_ptr,
++    stride_qb, stride_qm, stride_qh, stride_qd,
++    stride_kvb, stride_kvn, stride_kvd,
++    stride_gob, stride_gom, stride_goh, stride_god,
++    stride_gkvs, stride_gkvd,
++    stride_tb, stride_tm, stride_tk,
++    stride_lseb, stride_lsem, stride_lseh,
++    stride_ob, stride_om, stride_oh, stride_od,
++    sm_scale,
++    TOPK: tl.constexpr, n_ctx: tl.constexpr, n_heads: tl.constexpr, 
++    head_dim: tl.constexpr, BLOCK_K: tl.constexpr, NUM_BLOCKS: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    KV_CTX: tl.constexpr,
++):
++    off_batch = tl.program_id(axis=0)
++    off_seq = tl.program_id(axis=1)
++    
++    pid = tl.program_id(0) * tl.num_programs(1) + tl.program_id(1)
++    off_buf_kv = pid * (BLOCK_K * head_dim)
++    off_buf_qk = pid * (BLOCK_H * BLOCK_K)
++    off_buf_dk = pid * (BLOCK_K * head_dim)
++    
++    cur_k_buf = k_buf_ptr + off_buf_kv
++    cur_s_buf = s_buf_ptr + off_buf_qk
++    cur_dp_buf = dp_buf_ptr + off_buf_qk
++    cur_p_buf = p_buf_ptr + off_buf_qk
++    cur_ds_buf = ds_buf_ptr + off_buf_qk
++    cur_dk_buf = dk_buf_ptr + off_buf_dk
++    cur_dv_buf = dv_buf_ptr + off_buf_dk
++
++    q_base = Q_ptr + off_batch * stride_qb + off_seq * stride_qm
++    grad_o_base = grad_out_ptr + off_batch * stride_gob + off_seq * stride_gom
++    lse_base = LSE_ptr + off_batch * stride_lseb + off_seq * stride_lsem
++    out_base = Out_ptr + off_batch * stride_ob + off_seq * stride_om
++    topk_ptr_base = TopKIdx_ptr + off_batch * stride_tb + off_seq * stride_tm
++    kv_ptr_base = KV_ptr + off_batch * stride_kvb 
++    grad_kv_ptr_base = grad_kv_ptr + off_batch * stride_kvb
++    
++    off_d = tl.arange(0, head_dim)
++
++    for start_h in range(0, n_heads, BLOCK_H):
++        off_h_full = start_h + tl.arange(0, BLOCK_H)
++        h_mask_full = off_h_full < n_heads
++        
++        sub_id = al.sub_vec_id()
++        HALF_H: tl.constexpr = BLOCK_H // 2
++        row_indices = tl.arange(0, HALF_H) + sub_id * HALF_H
++        off_h_sub = start_h + row_indices
++        h_mask_sub = off_h_sub < n_heads
++        HALF_K: tl.constexpr = BLOCK_K // 2
++        n_offset_local = sub_id * HALF_K
++        n_offset_local1 = sub_id.to(tl.float32) * HALF_K
++
++        q_ptrs = q_base + off_h_full[:, None] * stride_qh + off_d[None, :] * stride_qd
++        do_ptrs = grad_o_base + off_h_full[:, None] * stride_goh + off_d[None, :] * stride_god
++        q_full = tl.load(q_ptrs, mask=h_mask_full[:, None], other=0.0)
++        do_full = tl.load(do_ptrs, mask=h_mask_full[:, None], other=0.0)
++
++        delta = _get_delta_split(
++            out_base, grad_o_base, stride_oh, stride_od, stride_goh, stride_god,
++            off_d, off_h_sub, h_mask_sub, head_dim
++        )
++        
++        lse_val = tl.load(lse_base + off_h_sub * stride_lseh, mask=h_mask_sub, other=0.0)
++
++        _inner_dkv(
++            q_full, do_full, lse_val, delta,
++            kv_ptr_base, topk_ptr_base, grad_kv_ptr_base,
++            cur_k_buf, cur_s_buf, cur_dp_buf, cur_p_buf, cur_ds_buf, cur_dk_buf, cur_dv_buf,
++            stride_kvn, stride_kvd, stride_tk, stride_gkvs, stride_gkvd,
++            off_d, sm_scale,
++            sub_id, row_indices, n_offset_local,n_offset_local1,
++            head_dim, BLOCK_K, BLOCK_H, TOPK, NUM_BLOCKS, KV_CTX,
++        )
++
++# pytorch baseline
++def sparse_attn_pytorch(
++    q: torch.Tensor,
++    kv: torch.Tensor,
++    attn_sink: torch.Tensor,
++    topk_idxs: torch.Tensor,
++    softmax_scale: Optional[float] = None,
++):
++    """
++    Reference PyTorch implementation matching sparse_attn_kernel behavior.
++
++    Args:
++        q: (b, m, h, d) BF16/FP16/FP32
++        kv: (b, n, d) same dtype as q
++        attn_sink: (h,) FP32
++        topk_idxs: (b, m, topk) int32, -1 denotes padded slots
++        softmax_scale: optional override for scaling 1/sqrt(d)
++    """
++    assert q.ndim == 4 and kv.ndim == 3
++    # b, m, h, d = q.shape
++    m, b, h, d = q.shape
++    topk = topk_idxs.size(-1)
++    if softmax_scale is None:
++        softmax_scale = (1.0 / d) ** 0.5
++
++    q_f = q.float()
++    kv_f = kv.float()
++    attn_sink_f = attn_sink.float()
++
++    # out = torch.empty((b, m, h, d), device=q.device, dtype=torch.float32)
++    out = torch.empty((m, b, h, d), device=q.device, dtype=torch.float32)
++    for b_idx in range(b):
++        for m_idx in range(m):
++            idx = topk_idxs[m_idx, b_idx]
++            valid = idx >= 0
++            # Gather keys/values; invalid slots are harmless because weight will be zero.
++            idx_safe = idx.clamp(min=0)
++            # kv_block = kv_f[b_idx].index_select(0, idx_safe)
++            kv_batch_slice = kv_f[:, b_idx, :]
++            kv_block = kv_batch_slice.index_select(0, idx_safe)
++            
++            q_vec = q_f[m_idx, b_idx]
++            # scores = torch.einsum("hd,kd->hk", q_f[b_idx, m_idx], kv_block)
++            scores = torch.einsum("hd,kd->hk", q_vec, kv_block)
++            scores = scores * softmax_scale
++            scores = scores.masked_fill(~valid, -float("inf"))
++
++            scores_max = torch.max(scores, dim=1, keepdim=True).values
++            probs = torch.exp(scores - scores_max)
++            probs = probs.masked_fill(~valid, 0.0)
++
++            sum_exp = probs.sum(dim=1)
++            # Add sink contribution using the same max reference as kernel.
++            sum_exp = sum_exp + torch.exp(attn_sink_f - scores_max.squeeze(1))
++
++            acc_o = probs @ kv_block
++            acc_o = acc_o / sum_exp[:, None]
++            # out[b_idx, m_idx] = acc_o
++            out[m_idx, b_idx] = acc_o
++
++    return out.to(dtype=q.dtype)
++
++
++def test_performance_profile():
++    print("\n=== Running Performance Profiling ===")
++    device = "npu"
++    torch.manual_seed(100)
++    b, m, h, d, n, topk = 1, 4096, 64, 512, 5120, 640
++    # b, m, h, d, n, topk = 1, 1, 16, 128, 256, 64
++    scale = (1.0 / d) ** 0.5
++
++    q = torch.randn(m, b, h, d, device=device, dtype=torch.bfloat16, requires_grad=True)
++    kv = torch.randn(n, b, d, device=device, dtype=torch.bfloat16, requires_grad=True)
++    attn_sink = torch.randn(h, device=device, dtype=torch.float32, requires_grad=True)
++
++    topk_idxs = torch.randint(0, n, (m, b, topk), device=device, dtype=torch.int32)
++    # Insert a padded slot to cover mask path
++    topk_idxs[0, 0, -1] = -1
++    
++    # tensor = torch.load("/home/c00937190/sfa_new/scalar_reduce_debug/8die_sfa_step6_输入tensor.bin")
++    # topk_idxs = tensor["topk_idxs"][:, :, :]
++    # topk_idxs = topk_idxs.to(device).to(torch.int32).contiguous()
++    
++    grad_out = torch.randn_like(q)
++
++    sfa_triton = SparseFlashAttentionTriton.apply
++
++    q_ref2 = q.clone().detach().requires_grad_(True)
++    kv_ref2 = kv.clone().detach().requires_grad_(True)
++    sink_ref2 = attn_sink.clone().detach().requires_grad_(True)
++
++    triton_out = sfa_triton(q_ref2, kv_ref2, sink_ref2, topk_idxs, scale).to(torch.bfloat16)
++    triton_out.backward(grad_out)
++    grad_q_triton = q_ref2.grad
++    grad_kv_triton = kv_ref2.grad
++    grad_sink_triton = sink_ref2.grad
++
++    q_ref = q.clone().detach().requires_grad_(True)
++    kv_ref = kv.clone().detach().requires_grad_(True)
++    sink_ref = attn_sink.clone().detach().requires_grad_(True)
++    
++    # cpu_triton = triton_out.cpu()
++    # triton_out = None
++
++    baseline = sparse_attn_pytorch(q_ref, kv_ref, sink_ref, topk_idxs, scale).to(torch.bfloat16)
++    baseline.backward(grad_out)
++    grad_q_torch = q_ref.grad
++    grad_kv_torch = kv_ref.grad
++    grad_sink_torch = sink_ref.grad
++    
++
++    # print(grad_kv_triton)
++    # print(grad_kv_torch)
++    torch.testing.assert_close(triton_out, baseline, rtol=1e-2, atol=1e-2)
++    torch.testing.assert_close(grad_q_triton, grad_q_torch, rtol=1e-2, atol=1e-2)
++    # torch.testing.assert_close(grad_sink_triton, grad_sink_torch, rtol=1e-2, atol=1e-2)
++    # torch.testing.assert_close(grad_kv_triton, grad_kv_torch, rtol=1e-2, atol=1e-2)
++
++        
++    experimental_config = torch_npu.profiler._ExperimentalConfig(
++            export_type=torch_npu.profiler.ExportType.Text,
++            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
++            msprof_tx=False,
++            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
++            l2_cache=False,
++            op_attr=False,
++            data_simplification=False,
++            record_op_args=False,
++            gc_detect_threshold=None,
++        )
++
++    with torch_npu.profiler.profile(
++        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
++        schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=3, repeat=1, skip_first=1),
++        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("profiling/"),
++        record_shapes=True,
++        profile_memory=False,
++        with_stack=False,
++        with_modules=False,
++        with_flops=False,
++        experimental_config=experimental_config,
++        ) as prof:
++            for step in range(10):
++                q_ref2 = q.clone().detach().requires_grad_(True)
++                kv_ref2 = kv.clone().detach().requires_grad_(True)
++                sink_ref2 = attn_sink.clone().detach().requires_grad_(True)
++                grad_out = torch.randn_like(q)
++                triton_out = sfa_triton(q_ref2, kv_ref2, sink_ref2, topk_idxs, scale).to(torch.bfloat16)
++                triton_out.backward(grad_out)
++                # baseline = sparse_attn_pytorch(q_ref, kv_ref, sink_ref, topk_idxs, scale).to(torch.bfloat16)
++                # baseline.backward(grad_out)
++                torch.npu.synchronize()
++                prof.step()
++
++
++if __name__ == "__main__":
++    test_performance_profile()
+diff --git a/src/transformers/models/deepseek_v4/modeling_deepseek.py b/src/transformers/models/deepseek_v4/modeling_deepseek.py
+new file mode 100644
+index 0000000000..db00b56b76
+--- /dev/null
++++ b/src/transformers/models/deepseek_v4/modeling_deepseek.py
+@@ -0,0 +1,1647 @@
++#                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
++#           This file was automatically generated from src/transformers/models/deepseek_v3/modular_deepseek_v3.py.
++#               Do NOT edit this file manually as any edits will be overwritten by the generation of
++#             the file from the modular. If any change should be done, please apply the change to the
++#                          modular_deepseek_v3.py file directly. One of our CI enforces this.
++#                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
++import math
++from typing import Callable, Optional, Union
++import math
++from dataclasses import dataclass
++from typing import Tuple, Optional, Literal
++from functools import lru_cache
++
++import torch
++from torch import nn
++import torch.nn.functional as F
++import torch.distributed as dist
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++from functools import lru_cache
++from transformers.activations import ACT2FN
++from transformers.cache_utils import Cache, DynamicCache
++from transformers.generation import GenerationMixin
++from transformers.integrations import use_kernel_forward_from_hub
++from transformers.masking_utils import create_causal_mask
++from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
++from transformers.modeling_layers import (
++    GenericForSequenceClassification,
++    GenericForTokenClassification,
++    GradientCheckpointingLayer,
++)
++from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
++from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
++from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
++from transformers.processing_utils import Unpack
++from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
++from transformers.utils.deprecation import deprecate_kwarg
++from transformers.utils.generic import check_model_inputs
++from .configuration_deepseek import DeepseekV4Config
++# from .kernel import sparse_attn, hc_split_sinkhorn
++from .g2_attention_kernel import SparseFlashAttentionTriton
++from .sinkhorn import HcSplitSinkhornFunction
++
++
++class RMSNorm(nn.Module):
++    """
++    Root Mean Square Layer Normalization (RMSNorm).
++
++    Args:
++        dim (int): Dimension of the input tensor.
++        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
++    """
++    def __init__(self, dim: int, eps: float = 1e-6):
++        super().__init__()
++        self.dim = dim
++        self.eps = eps
++        # rmsnorm in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for convenient.
++        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
++
++    def forward(self, x: torch.Tensor):
++        """
++        Forward pass for RMSNorm.
++
++        Args:
++            x (torch.Tensor): Input tensor.
++
++        Returns:
++            torch.Tensor: Normalized tensor with the same shape as input.
++        """
++        dtype = x.dtype
++        x = x.float()
++        var = x.square().mean(-1, keepdim=True)
++        x = x * torch.rsqrt(var + self.eps)
++        return (self.weight * x).to(dtype)
++
++
++def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
++    """
++    Applies rotary positional embeddings to the input tensor.
++
++    Args:
++        x (torch.Tensor): Input tensor with positional embeddings to be applied.
++        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
++
++    Returns:
++        torch.Tensor: Tensor with rotary embeddings applied.
++    """
++    # y = x
++    original_dtype = x.dtype
++    x_complex = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
++    if inverse:
++        freqs_cis = freqs_cis.conj()
++    if x.ndim == 3:
++        freqs_cis = freqs_cis.view(1, x_complex.size(1), x_complex.size(-1))
++    else:
++        freqs_cis = freqs_cis.view(1, x_complex.size(1), 1, x_complex.size(-1))
++
++    x_rotated = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
++    # y.copy_(x)
++    return x_rotated.to(original_dtype)
++
++def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
++    """
++    Apply the normalized Hadamard transform (Fast Walsh-Hadamard Transform) to the last dimension of x.
++    
++    Args:
++        x (torch.Tensor): Input tensor of shape [..., N], where N is a power of 2.
++        scale (float): Scaling factor applied after the transform (e.g., N**-0.5 for orthonormal transform).
++    
++    Returns:
++        torch.Tensor: Transformed tensor of the same shape as x.
++    """
++    dtype = x.dtype
++    x = x.float()  # FWHT is numerically safer in float32
++    n = x.size(-1)
++    
++    # Check that n is a power of two
++    if n <= 0 or (n & (n - 1)) != 0:
++        raise ValueError(f"Last dimension must be a power of 2, got {n}")
++
++    # Reshape to [..., n] and make contiguous
++    original_shape = x.shape
++    x = x.view(-1, n)
++    h = x
++
++    # Iterative in-place FWHT (butterfly operations)
++    h = h.contiguous()
++    m = 1
++    while m < n:
++        for i in range(0, n, m * 2):
++            a = h[:, i:i + m]
++            b = h[:, i + m:i + 2 * m]
++            h[:, i:i + m] = a + b
++            h[:, i + m:i + 2 * m] = a - b
++        m *= 2
++
++    h = h.view(original_shape)
++    h = h * scale
++    return h.to(dtype)
++
++def rotate_activation(x: torch.Tensor) -> torch.Tensor:
++    assert x.dtype == torch.bfloat16
++    # from fast_hadamard_transform import hadamard_transform
++    return hadamard_transform(x, scale=x.size(-1) ** -0.5)
++
++@lru_cache(2)
++def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow) -> torch.Tensor:
++    """
++    Precomputes frequency-based complex exponential values for rotary positional embeddings.
++
++    Args:
++        args (ModelArgs): Model arguments containing positional embedding parameters.
++
++    Returns:
++        torch.Tensor: Precomputed complex exponential values for positional embeddings.
++    """
++
++    def find_correction_dim(num_rotations, dim, base, max_seq_len):
++        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
++
++    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
++        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
++        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
++        return max(low, 0), min(high, dim-1)
++
++    def linear_ramp_factor(min, max, dim):
++        if min == max:
++            max += 0.001
++        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
++        ramp_func = torch.clamp(linear_func, 0, 1)
++        return ramp_func
++
++    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
++    if original_seq_len > 0:
++        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
++        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
++        freqs = freqs / factor * (1 - smooth) + freqs * smooth
++
++    t = torch.arange(seqlen)
++    freqs = torch.outer(t, freqs)
++    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
++    return freqs_cis
++
++@use_kernel_forward_from_hub("RMSNorm")
++class DeepseekV4RMSNorm(nn.Module):
++    def __init__(self, hidden_size, eps=1e-6):
++        """
++        DeepseekV3RMSNorm is equivalent to T5LayerNorm
++        """
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(hidden_size))
++        self.variance_epsilon = eps
++
++    def forward(self, hidden_states):
++        input_dtype = hidden_states.dtype
++        hidden_states = hidden_states.to(torch.float32)
++        variance = hidden_states.pow(2).mean(-1, keepdim=True)
++        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
++        return self.weight * hidden_states.to(input_dtype)
++
++    def extra_repr(self):
++        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
++
++
++class DeepseekV4RotaryEmbedding(nn.Module):
++    inv_freq: torch.Tensor  # fix linting for `register_buffer`
++
++    def __init__(self, config: DeepseekV4Config, device=None):
++        super().__init__()
++        # BC: "rope_type" was originally "type"
++        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
++            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
++        else:
++            self.rope_type = "default"
++        self.max_seq_len_cached = config.max_position_embeddings
++        self.original_max_seq_len = config.max_position_embeddings
++
++        self.config = config
++        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
++
++        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++        self.original_inv_freq = self.inv_freq
++
++    @torch.no_grad()
++    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
++    def forward(self, x, position_ids):
++        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
++        position_ids_expanded = position_ids[:, None, :].float()
++
++        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
++        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
++            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
++            emb = torch.cat((freqs, freqs), dim=-1)
++            cos = emb.cos() * self.attention_scaling
++            sin = emb.sin() * self.attention_scaling
++
++        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
++
++
++class DeepseekV4MLP(nn.Module):
++    def __init__(self, config, hidden_size=None, intermediate_size=None):
++        super().__init__()
++        self.config = config
++        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
++        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
++
++        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
++        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
++        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
++        self.act_fn = ACT2FN[config.hidden_act]
++
++    def forward(self, x):
++        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
++        return down_proj
++
++
++# class DeepseekV3TopkRouter(nn.Module):
++#     def __init__(self, config):
++#         super().__init__()
++#         self.config = config
++#         self.top_k = config.num_experts_per_tok
++#         self.n_routed_experts = config.n_routed_experts
++#         self.routed_scaling_factor = config.routed_scaling_factor
++#         self.n_group = config.n_group
++#         self.topk_group = config.topk_group
++#         self.norm_topk_prob = config.norm_topk_prob
++
++#         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
++#         self.register_buffer("e_score_correction_bias", torch.zeros(self.n_routed_experts))
++
++#     @torch.no_grad()
++#     def get_topk_indices(self, scores):
++#         scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
++#         group_scores = (
++#             scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
++#             .topk(2, dim=-1)[0]
++#             .sum(dim=-1)
++#         )
++#         group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
++#         group_mask = torch.zeros_like(group_scores)
++#         group_mask.scatter_(1, group_idx, 1)
++#         score_mask = (
++#             group_mask.unsqueeze(-1)
++#             .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
++#             .reshape(-1, self.n_routed_experts)
++#         )
++#         scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
++#         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
++#         return topk_indices
++
++#     def forward(self, hidden_states):
++#         hidden_states = hidden_states.view(-1, self.config.hidden_size)
++#         router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
++#         scores = router_logits.sigmoid()
++#         topk_indices = self.get_topk_indices(scores)
++#         topk_weights = scores.gather(1, topk_indices)
++#         if self.norm_topk_prob:
++#             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
++#             topk_weights /= denominator
++#         topk_weights = topk_weights * self.routed_scaling_factor
++#         return topk_indices, topk_weights
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from typing import Optional, Tuple
++
++class DeepseekV4TopkRouter(nn.Module):
++    """
++    Fused routing mechanism supporting both Hash-based routing (for early layers)
++    and DeepSeek V3 Group-based Top-K routing (for deeper layers).
++    """
++    def __init__(self, config, layer_id: int):
++        super().__init__()
++        self.config = config
++        self.hidden_size = config.hidden_size
++        self.top_k = config.num_experts_per_tok
++        self.n_routed_experts = config.n_routed_experts
++        self.routed_scaling_factor = config.routed_scaling_factor
++        
++        # DeepSeek V3 Group Routing parameters
++        self.n_group = getattr(config, "n_group", 1)
++        self.topk_group = getattr(config, "topk_group", 1)
++        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
++        
++        # Original Gate parameters
++        self.score_func = getattr(config, "score_func", "sigmoid")
++        self.hash = layer_id < getattr(config, "n_hash_layers", 0)
++
++        # Router weights
++        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.hidden_size)))
++        
++        if self.hash:
++            # Hash routing: Pre-allocated TokenID -> ExpertID mapping
++            self.tid2eid = nn.Parameter(
++                torch.empty((config.vocab_size, self.top_k), dtype=torch.int32), 
++                requires_grad=False
++            )
++        else:
++            # Group routing: Bias parameter (replaces the old self.bias)
++            self.e_score_correction_bias = nn.Parameter(torch.zeros(self.n_routed_experts))
++
++    @torch.no_grad()
++    def get_topk_indices(self, scores: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
++        """
++        Calculates the top-k expert indices based on the routing strategy.
++        """
++        # 1. Hash-based Routing (Early Layers)
++        if self.hash:
++            if input_ids is None:
++                raise ValueError("input_ids must be provided when hash routing is enabled.")
++            # Flatten input_ids to match the flattened hidden_states [-1]
++            flat_input_ids = input_ids.view(-1)
++            return self.tid2eid[flat_input_ids].long()
++
++        # 2. DeepSeek V3 Group-based Routing (Deeper Layers)
++        scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
++        
++        # Calculate group scores by taking sum of top 2 experts in each group
++        group_scores = (
++            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
++            .topk(2, dim=-1)[0]
++            .sum(dim=-1)
++        )
++        
++        # Identify top-k groups
++        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
++        group_mask = torch.zeros_like(group_scores)
++        group_mask.scatter_(1, group_idx, 1)
++        
++        # Expand mask back to expert level
++        score_mask = (
++            group_mask.unsqueeze(-1)
++            .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
++            .reshape(-1, self.n_routed_experts)
++        )
++        
++        # Mask out experts not in the selected groups and find final top-k
++        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
++        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
++        
++        return topk_indices
++
++    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
++        """
++        Forward pass.
++        Returns: topk_indices, topk_weights
++        """
++        # Flatten input to [Batch * Seq, Hidden]
++        hidden_states = hidden_states.view(-1, self.config.hidden_size)
++        
++        # Compute raw routing logits
++        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
++        
++        # Apply the selected scoring function
++        if self.score_func == "softmax":
++            scores = router_logits.softmax(dim=-1)
++        elif self.score_func == "sigmoid":
++            scores = router_logits.sigmoid()
++        else:
++            scores = F.softplus(router_logits).sqrt()
++            
++        # Get target indices (delegated to @torch.no_grad method for efficiency)
++        topk_indices = self.get_topk_indices(scores, input_ids)
++        
++        # Gather weights for selected experts
++        topk_weights = scores.gather(1, topk_indices)
++        
++        # Normalization (Combines your Gate logic + DeepSeek target config)
++        if self.score_func != "softmax" or self.norm_topk_prob:
++            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
++            topk_weights /= denominator
++            
++        # Scale the weights
++        topk_weights = topk_weights * self.routed_scaling_factor
++        
++        return topk_indices, topk_weights
++
++
++class DeepseekV4MoE(nn.Module):
++    """
++    A mixed expert module containing shared experts.
++    """
++
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.experts = nn.ModuleList(
++            [
++                DeepseekV4MLP(config, intermediate_size=config.moe_intermediate_size)
++                for _ in range(config.n_routed_experts)
++            ]
++        )
++        self.gate = DeepseekV4TopkRouter(config)
++        self.shared_experts = DeepseekV4MLP(
++            config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
++        )
++
++    def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
++        r"""
++        CALL FOR CONTRIBUTION! I don't have time to optimise this right now, but expert weights need to be fused
++        to not have to do a loop here (deepseek has 256 experts soooo yeah).
++        """
++        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
++        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
++        expert_mask = expert_mask.permute(2, 0, 1)
++
++        for expert_idx in range(len(self.experts)):
++            expert = self.experts[expert_idx]
++            mask = expert_mask[expert_idx]
++            token_indices, weight_indices = torch.where(mask)
++
++            if token_indices.numel() > 0:
++                expert_weights = topk_weights[token_indices, weight_indices]
++                expert_input = hidden_states[token_indices]
++                expert_output = expert(expert_input)
++                weighted_output = expert_output * expert_weights.unsqueeze(-1)
++                final_hidden_states.index_add_(0, token_indices, weighted_output)
++
++        # in original deepseek, the output of the experts are gathered once we leave this module
++        # thus the moe module is itelsf an IsolatedParallel module
++        # and all expert are "local" meaning we shard but we don't gather
++        return final_hidden_states.type(hidden_states.dtype)
++
++    def forward(self, hidden_states):
++        residuals = hidden_states
++        orig_shape = hidden_states.shape
++        topk_indices, topk_weights = self.gate(hidden_states)
++        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
++        hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
++        hidden_states = hidden_states + self.shared_experts(residuals)
++        return hidden_states
++
++
++# def rotate_half(x):
++#     """Rotates half the hidden dims of the input."""
++#     x1 = x[..., : x.shape[-1] // 2]
++#     x2 = x[..., x.shape[-1] // 2 :]
++#     return torch.cat((-x2, x1), dim=-1)
++
++
++# def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
++#     """Applies Rotary Position Embedding to the query and key tensors.
++
++#     Args:
++#         q (`torch.Tensor`): The query tensor.
++#         k (`torch.Tensor`): The key tensor.
++#         cos (`torch.Tensor`): The cosine part of the rotary embedding.
++#         sin (`torch.Tensor`): The sine part of the rotary embedding.
++#         position_ids (`torch.Tensor`, *optional*):
++#             Deprecated and unused.
++#         unsqueeze_dim (`int`, *optional*, defaults to 1):
++#             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
++#             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
++#             that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
++#             k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
++#             cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
++#             the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
++#     Returns:
++#         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
++#     """
++#     cos = cos.unsqueeze(unsqueeze_dim)
++#     sin = sin.unsqueeze(unsqueeze_dim)
++#     q_embed = (q * cos) + (rotate_half(q) * sin)
++#     k_embed = (k * cos) + (rotate_half(k) * sin)
++#     return q_embed, k_embed
++
++
++# def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
++#     """
++#     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
++#     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
++#     """
++#     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
++#     if n_rep == 1:
++#         return hidden_states
++#     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
++#     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
++
++
++# def eager_attention_forward(
++#     module: nn.Module,
++#     query: torch.Tensor,
++#     key: torch.Tensor,
++#     value: torch.Tensor,
++#     attention_mask: Optional[torch.Tensor],
++#     scaling: float,
++#     dropout: float = 0.0,
++#     **kwargs: Unpack[TransformersKwargs],
++# ):
++#     key_states = repeat_kv(key, module.num_key_value_groups)
++#     value_states = repeat_kv(value, module.num_key_value_groups)
++
++#     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
++#     if attention_mask is not None:
++#         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
++#         attn_weights = attn_weights + causal_mask
++
++#     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
++#     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
++#     attn_output = torch.matmul(attn_weights, value_states)
++#     attn_output = attn_output.transpose(1, 2).contiguous()
++
++#     return attn_output, attn_weights
++
++
++# def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
++#     r"""
++#     TODO let's just use the original freqcis computation to not have the view
++#     transpose + reshape! This is not optimized!
++#     Applies Rotary Position Embedding to the query and key tensors.
++
++#     Args:
++#         q (`torch.Tensor`): The query tensor.
++#         k (`torch.Tensor`): The key tensor.
++#         cos (`torch.Tensor`): The cosine part of the rotary embedding.
++#         sin (`torch.Tensor`): The sine part of the rotary embedding.
++#         position_ids (`torch.Tensor`):
++#             The position indices of the tokens corresponding to the query and key tensors. For example, this can be
++#             used to pass offsetted position ids when working with a KV-cache.
++#         unsqueeze_dim (`int`, *optional*, defaults to 1):
++#             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
++#             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
++#             that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
++#             k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
++#             cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
++#             the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
++#     Returns:
++#         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
++#     """
++#     cos = cos.unsqueeze(unsqueeze_dim)
++#     sin = sin.unsqueeze(unsqueeze_dim)
++
++#     b, h, s, d = q.shape
++#     q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
++
++#     b, h, s, d = k.shape
++#     k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
++
++#     q_embed = (q * cos) + (rotate_half(q) * sin)
++#     k_embed = (k * cos) + (rotate_half(k) * sin)
++#     return q_embed, k_embed
++
++
++# def yarn_get_mscale(scale=1, mscale=1):
++#     if scale <= 1:
++#         return 1.0
++#     return 0.1 * mscale * math.log(scale) + 1.0
++
++@lru_cache(1)
++def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
++    def _get_window_topk_idxs():
++        if start_pos >= window_size - 1:
++            return torch.arange(window_size)
++        elif start_pos > 0:
++            return F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
++        else:
++            base = torch.arange(seqlen).unsqueeze(1)
++            matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
++            matrix = torch.where(matrix > base, -1, matrix)
++            return matrix
++    return _get_window_topk_idxs().unsqueeze(0).expand(bsz, -1, -1)
++
++@lru_cache(2)
++def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
++    def _get_compress_topk_idxs():
++        if start_pos > 0:
++            return torch.arange(0, start_pos // ratio) + offset
++        else:
++            matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
++            mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
++            matrix = torch.where(mask, -1, matrix + offset)
++            return matrix
++    return _get_compress_topk_idxs().unsqueeze(0).expand(bsz, -1, -1)
++
++
++# class DeepseekV3Attention(nn.Module):
++#     """Multi-headed attention from 'Attention Is All You Need' paper"""
++
++#     def __init__(self, config: DeepseekV3Config, layer_idx: int):
++#         super().__init__()
++#         self.config = config
++#         self.layer_idx = layer_idx
++#         # self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
++#         # self.attention_dropout = config.attention_dropout
++#         self.num_heads = config.num_attention_heads
++#         self.q_lora_rank = config.q_lora_rank
++#         self.o_lora_rank = config.o_lora_rank
++#         self.head_dim = config.head_dim
++#         self.rope_head_dim = config.rope_head_dim
++#         self.nope_head_dim = config.head_dim - config.rope_head_dim
++#         self.n_groups = config.o_groups
++#         self.n_local_groups = self.n_groups
++#         self.window_size = config.window_size
++#         self.compress_ratio = config.compress_ratios[layer_idx]
++#         self.eps = config.norm_eps
++
++#         # 这里原版推理的实现是取的local_head， self.n_local_heads = args.n_heads // world_size
++#         self.attn_sink = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
++#         self.wq_a = nn.Linear(config.hidden_size, self.q_lora_rank)
++#         self.q_norm = DeepseekV3RMSNorm(self.q_lora_rank, self.eps)
++#         self.wq_b = nn.Linear(self.q_lora_rank, self.num_heads * self.head_dim)
++#         self.wkv = nn.Linear(config.hidden_size, self.head_dim)
++#         self.kv_norm = DeepseekV3RMSNorm(self.head_dim, self.eps)
++#         self.wo_a = nn.Linear(self.num_heads * self.head_dim // self.n_groups, self.n_groups * config.o_lora_rank, dtype=torch.bfloat16)
++#         self.wo_b = nn.Linear(self.n_groups * config.o_lora_rank, config.hidden_size)
++#         self.softmax_scale = self.head_dim ** -0.5
++#         self.scale_fmt = config.scale_fmt
++#         if self.compress_ratio > 1:
++#             self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
++#             if self.compress_ratio == 4:
++#                 self.indexer = Indexer(config, self.compress_ratio)
++#             else:
++#                 self.indexer = None
++
++
++
++
++#     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
++#     def forward(
++#         self,
++#         hidden_states: torch.Tensor,
++#         position_embeddings: tuple[torch.Tensor, torch.Tensor],
++#         attention_mask: Optional[torch.Tensor],
++#         past_key_values: Optional[Cache] = None,
++#         cache_position: Optional[torch.LongTensor] = None,
++#         **kwargs: Unpack[FlashAttentionKwargs],
++#     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
++#         batch_size, seq_length = hidden_states.shape[:-1]
++#         win = self.window_size
++#         start_pos = cache_position[0].item()
++#         ratio = self.compress_ratio
++#         rd = self.rope_head_dim
++#         if self.compress_ratio > 1 and self.compressor.kv_cache is None:
++#             self.compressor.kv_cache = self.kv_cache[:, win:]
++
++#         query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
++#         key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
++
++#         qr = q = self.q_norm(self.wq_a(hidden_states))
++#         q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
++#         q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
++
++#         # apply_rotary_emb(q[..., -rd:], freqs_cis)
++
++#         # win kv & topk_idxs
++#         kv = self.wkv(hidden_states)
++#         kv = self.kv_norm(kv)
++#         # apply_rotary_emb(kv[..., -rd:], freqs_cis)
++#         topk_idxs = get_window_topk_idxs(win, batch_size, seq_length, start_pos)
++
++
++
++
++#         if self.q_lora_rank is None:
++#             q_states = self.q_proj(hidden_states)
++#         else:
++#             q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
++#         q_states = q_states.view(query_shape).transpose(1, 2)
++#         q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
++
++#         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
++#         k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
++
++#         k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
++#         k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
++
++#         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
++
++#         cos, sin = position_embeddings
++#         if self.config.rope_interleave:  # support using interleaved weights for efficiency
++#             q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
++#         else:
++#             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
++#         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
++
++#         query_states = torch.cat((q_pass, q_rot), dim=-1)
++#         key_states = torch.cat((k_pass, k_rot), dim=-1)
++
++#         if past_key_values is not None:
++#             # sin and cos are specific to RoPE models; cache_position needed for the static cache
++#             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
++#             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
++
++#         if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
++#             value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
++
++#         attention_interface: Callable = eager_attention_forward
++#         if self.config._attn_implementation != "eager":
++#             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
++
++#         attn_output, attn_weights = attention_interface(
++#             self,
++#             query_states,
++#             key_states,
++#             value_states,
++#             attention_mask,
++#             dropout=0.0 if not self.training else self.attention_dropout,
++#             scaling=self.scaling,
++#             **kwargs,
++#         )
++
++#         if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
++#             attn_output = attn_output[:, :, :, : self.v_head_dim]
++
++#         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
++#         attn_output = self.o_proj(attn_output)
++#         return attn_output, attn_weights
++
++class Gate(nn.Module):
++    """
++    Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
++
++    Attributes:
++        dim (int): Dimensionality of input features.
++        topk (int): Number of top experts activated for each input.
++        n_groups (int): Number of groups for routing.
++        topk_groups (int): Number of groups to route inputs to.
++        score_func (str): Scoring function ('softmax' or 'sigmoid').
++        route_scale (float): Scaling factor for routing weights.
++        weight (torch.nn.Parameter): Learnable weights for the gate.
++        bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
++    """
++    def __init__(self, layer_id: int, config: DeepseekV4Config):
++        """
++        Initializes the Gate module.
++
++        Args:
++            args (ModelArgs): Model arguments containing gating parameters.
++        """
++        super().__init__()
++        self.dim = config.dim
++        self.topk = config.n_activated_experts
++        self.score_func = config.score_func
++        self.route_scale = config.route_scale
++        self.hash = layer_id < config.n_hash_layers
++        self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.dim))
++        if self.hash:
++            self.tid2eid = nn.Parameter(torch.empty(config.vocab_size, config.n_activated_experts, dtype=torch.int32), requires_grad=False)
++            self.bias = None
++        else:
++            self.bias = nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
++
++    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
++        """
++        Forward pass for the gating mechanism.
++
++        Args:
++            x (torch.Tensor): Input tensor.
++            input_ids (torch.Tensor): Token IDs tensor.
++
++        Returns:
++            Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
++        """
++        scores = F.linear(x.float(), self.weight.float())
++        if self.score_func == "softmax":
++            scores = scores.softmax(dim=-1)
++        elif self.score_func == "sigmoid":
++            scores = scores.sigmoid()
++        else:
++            scores = F.softplus(scores).sqrt()
++        original_scores = scores
++        if self.bias is not None:
++            scores = scores + self.bias
++        if self.hash:
++            indices = self.tid2eid[input_ids]
++        else:
++            indices = scores.topk(self.topk, dim=-1)[1]
++        weights = original_scores.gather(1, indices)
++        # weights = original_scores
++        if self.score_func != "softmax":
++            weights /= weights.sum(dim=-1, keepdim=True)
++        weights = weights * self.route_scale
++        return weights, indices
++
++
++class Expert(nn.Module):
++    """
++    Expert layer for Mixture-of-Experts (MoE) models.
++
++    Attributes:
++        w1 (nn.Module): Linear layer for input-to-hidden transformation.
++        w2 (nn.Module): Linear layer for hidden-to-output transformation.
++        w3 (nn.Module): Additional linear layer for feature transformation.
++    """
++    def __init__(self, dim: int, inter_dim: int):
++        """
++        Initializes the Expert layer.
++
++        Args:
++            dim (int): Input and output dimensionality.
++            inter_dim (int): Hidden layer dimensionality.
++        """
++        super().__init__()
++        self.w1 = nn.Linear(dim, inter_dim)
++        self.w2 = nn.Linear(inter_dim, dim)
++        self.w3 = nn.Linear(dim, inter_dim)
++
++    def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
++        """
++        Forward pass for the Expert layer.
++
++        Args:
++            x (torch.Tensor): Input tensor.
++
++        Returns:
++            torch.Tensor: Output tensor after expert computation.
++        """
++        dtype = x.dtype
++        x = F.silu(self.w1(x).float()) * self.w3(x).float()
++        if weights is not None:
++            x = weights * x
++        return self.w2(x.to(dtype))
++
++class MoE(nn.Module):
++    """
++    Mixture-of-Experts (MoE) module.
++
++    Attributes:
++        dim (int): Dimensionality of input features.
++        n_routed_experts (int): Total number of experts in the model.
++        n_local_experts (int): Number of experts handled locally in distributed systems.
++        n_activated_experts (int): Number of experts activated for each input.
++        gate (nn.Module): Gating mechanism to route inputs to experts.
++        experts (nn.ModuleList): List of expert modules.
++        shared_experts (nn.Module): Shared experts applied to all inputs.
++    """
++    def __init__(self, config: DeepseekV4Config, layer_idx: int):
++        """
++        Initializes the MoE module.
++
++        Args:
++            args (ModelArgs): Model arguments containing MoE parameters.
++        """
++        super().__init__()
++        self.layer_id = layer_idx
++        self.dim = config.dim
++        # self.experts = nn.ModuleList(
++        #     [
++        #         DeepseekV3MLP(config, intermediate_size=config.moe_intermediate_size)
++        #         for _ in range(config.n_routed_experts)
++        #     ]
++        # )
++        # # assert config.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
++        # self.n_routed_experts = config.n_routed_experts
++        # # self.n_local_experts = config.n_routed_experts // world_size
++        # self.n_activated_experts = config.n_activated_experts
++        # self.experts_start_idx = rank * self.n_local_experts
++        # self.experts_end_idx = self.experts_start_idx + self.n_local_experts
++        # self.gate = Gate(layer_idx, config)
++        self.gate = DeepseekV4TopkRouter(config, layer_idx)
++        self.experts = nn.ModuleList(
++            [
++                Expert(config.dim, config.moe_inter_dim) 
++                for _ in range(config.n_routed_experts)
++                ]
++        )
++        assert config.n_shared_experts == 1
++        self.shared_experts = Expert(config.dim, config.moe_inter_dim)
++    
++    def run_gate(self, x, input_ids: Optional[torch.Tensor] = None):
++        return self.gate(x, input_ids)
++
++    def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
++        r"""
++        CALL FOR CONTRIBUTION! I don't have time to optimise this right now, but expert weights need to be fused
++        to not have to do a loop here (deepseek has 256 experts soooo yeah).
++        """
++        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
++        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
++        expert_mask = expert_mask.permute(2, 0, 1)
++
++        for expert_idx in range(len(self.experts)):
++            expert = self.experts[expert_idx]
++            mask = expert_mask[expert_idx]
++            token_indices, weight_indices = torch.where(mask)
++
++            if token_indices.numel() > 0:
++                expert_weights = topk_weights[token_indices, weight_indices]
++                expert_input = hidden_states[token_indices]
++                expert_output = expert(expert_input)
++                # expert_output [24576, 4096], expert_weights [24576, 8]
++                weighted_output = expert_output * expert_weights.unsqueeze(-1)
++                final_hidden_states.index_add_(0, token_indices, weighted_output)
++
++        # in original deepseek, the output of the experts are gathered once we leave this module
++        # thus the moe module is itelsf an IsolatedParallel module
++        # and all expert are "local" meaning we shard but we don't gather
++        return final_hidden_states.type(hidden_states.dtype)
++        
++    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
++        """
++        Forward pass for the MoE module.
++
++        Args:
++            x (torch.Tensor): Input tensor.
++
++        Returns:
++            torch.Tensor: Output tensor after expert routing and computation.
++        """
++        # shape = x.size()
++        # x = x.view(-1, self.dim)
++        # weights, indices = self.run_gate(x, input_ids.flatten())
++        # y = torch.zeros_like(x, dtype=torch.float32)
++        # counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
++        # for i in range(self.experts_start_idx, self.experts_end_idx):
++        #     if counts[i] == 0:
++        #         continue
++        #     expert = self.experts[i]
++        #     idx, top = torch.where(indices == i)
++        #     y[idx] += expert(x[idx], weights[idx, top, None])
++        # if world_size > 1:
++        #     dist.all_reduce(y)
++        # y += self.shared_experts(x)
++        # return y.type_as(x).view(shape)
++        residuals = x
++        orig_shape = x.shape
++        topk_indices, topk_weights = self.run_gate(x, input_ids.flatten())
++        x = x.view(-1, x.shape[-1])
++        hidden_states = self.moe(x, topk_indices, topk_weights).view(*orig_shape)
++        hidden_states = hidden_states + self.shared_experts(residuals)
++        return hidden_states
++
++
++class Compressor(nn.Module):
++
++    def __init__(self, config: DeepseekV4Config, compress_ratio: int = 4, head_dim: int = 512, rotate: bool = False):
++        super().__init__()
++        self.dim = config.dim
++        self.head_dim = head_dim
++        self.rope_head_dim = config.rope_head_dim
++        self.nope_head_dim = head_dim - config.rope_head_dim
++        self.compress_ratio = compress_ratio
++        self.overlap = compress_ratio == 4
++        self.rotate = rotate
++        coff = 1 + self.overlap
++
++        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32))
++        # wkv and wgate in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for convenient.
++        # The first half of dimensions for overlapping compression and second half for normal compression.
++        self.wkv = nn.Linear(self.dim, coff * self.head_dim, dtype=torch.float32)
++        self.wgate = nn.Linear(self.dim, coff * self.head_dim, dtype=torch.float32)
++        self.norm = RMSNorm(self.head_dim, config.norm_eps)
++        self.kv_cache = None
++        # If overlap is enabled, state[:, :ratio] for overlapping compression and state[:, ratio:] for normal compression.
++        # self.register_buffer("kv_state", torch.zeros(config.max_batch_size, coff * compress_ratio, coff * self.head_dim, dtype=torch.float32), persistent=False)
++        # self.register_buffer("score_state", torch.full((config.max_batch_size, coff * compress_ratio, coff * self.head_dim), float("-inf"), dtype=torch.float32), persistent=False)
++
++    def overlap_transform(self, tensor: torch.Tensor, value=0):
++        # tensor: [b,s,r,2d]
++        b, s, _, _ = tensor.size()
++        ratio, d = self.compress_ratio, self.head_dim
++        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
++        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
++        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
++        return new_tensor
++
++    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor):
++        # assert self.kv_cache is not None
++        bsz, seqlen, _ = x.size()
++        ratio, overlap, d = self.compress_ratio, self.overlap, self.head_dim
++        dtype = x.dtype
++        x = x.float()
++        kv = self.wkv(x)
++        score = self.wgate(x)
++        if start_pos == 0:
++            should_compress = seqlen >= ratio
++            remainder = seqlen % ratio
++            cutoff = seqlen - remainder
++            freqs_cis = freqs_cis[:cutoff:ratio]
++            # offset = ratio if overlap else 0
++            # if overlap and cutoff >= ratio:
++            #     self.kv_state[:bsz, :ratio] = kv[:, cutoff-ratio : cutoff]
++            #     self.score_state[:bsz, :ratio] = score[:, cutoff-ratio : cutoff] + self.ape
++            if remainder > 0:
++                # kv, self.kv_state[:bsz, offset : offset+remainder] = kv.split([cutoff, remainder], dim=1)
++                # self.score_state[:bsz, offset : offset+remainder] = score[:, cutoff:] + self.ape[:remainder]
++                kv, _ = kv.split([cutoff, remainder], dim=1)
++                score = score[:, :cutoff]
++            kv = kv.unflatten(1, (-1, ratio))
++            score = score.unflatten(1, (-1, ratio)) + self.ape
++            if overlap:
++                kv = self.overlap_transform(kv, 0)
++                score = self.overlap_transform(score, float("-inf"))
++            kv = (kv * score.softmax(dim=2)).sum(dim=2)
++        else:
++            should_compress = (start_pos + 1) % self.compress_ratio == 0
++            score += self.ape[start_pos % ratio]
++            if overlap:
++                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
++                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
++                if should_compress:
++                    kv_state = torch.cat([self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]], dim=1)
++                    score_state = torch.cat([self.score_state[:bsz, :ratio, :d], self.score_state[:bsz, ratio:, d:]], dim=1)
++                    kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
++                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
++                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
++            else:
++                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
++                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
++                if should_compress:
++                    kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
++        if not should_compress:
++            return
++        kv = self.norm(kv.to(dtype))
++        kv[..., -self.rope_head_dim:] = apply_rotary_emb(kv[..., -self.rope_head_dim:], freqs_cis)
++        if self.rotate:
++            kv = rotate_activation(kv)
++        # if start_pos == 0:
++        #     self.kv_cache[:bsz, :seqlen // ratio] = kv
++        # else:
++        #     self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
++        return kv
++
++
++class Indexer(torch.nn.Module):
++
++    def __init__(self, config: DeepseekV4Config, compress_ratio: int = 4):
++        super().__init__()
++        self.dim = config.dim
++        self.n_heads = config.index_n_heads
++        self.head_dim = config.index_head_dim
++        self.rope_head_dim = config.rope_head_dim
++        self.index_topk = config.index_topk
++        self.q_lora_rank = config.q_lora_rank
++        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim)
++        self.weights_proj = nn.Linear(self.dim, self.n_heads, dtype=torch.bfloat16)
++        self.softmax_scale = self.head_dim ** -0.5
++        self.compress_ratio = compress_ratio
++
++        self.compressor = Compressor(config, compress_ratio, self.head_dim, True)
++        self.register_buffer("kv_cache", torch.zeros(1, config.max_position_embeddings // compress_ratio, self.head_dim), persistent=False)
++
++    def bf16_index(self,
++        q: torch.Tensor,
++        weights: torch.Tensor,
++        k: torch.Tensor
++    ) -> torch.Tensor:
++        """
++        Perform index score using BF16 precision.
++
++        Args:
++            q(torch.Tensor): query tensor of shape [S, B, N, D]
++            weights(torch.Tensor): weights tensor of shape [S, B, Di, 1]
++            k(torch.Tensor): key tensor of shape [S, B, N, D]
++
++            bf16 q bf16 k -> fp32 q fp32 k
++            q @ k -> fp32 logits
++            relu(fp32 logits) * weights -> fp32 logits
++            sum(fp32 logits) -> fp32 index_score
++        """
++        from einops import rearrange
++
++        query = rearrange(q, 'b s h d -> b h s d').to(torch.float32)
++        key = rearrange(k, 'b s h d -> b h d s').to(torch.float32)
++
++        p = torch.matmul(query, key)
++        relu_out = torch.nn.functional.relu(p)
++
++        weight_out = relu_out * weights.permute(0, 2, 1, 3)
++
++        reduce_out = torch.sum(weight_out, dim=1)
++
++        return reduce_out
++
++    def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, offset: int):
++        bsz, seqlen, _ = x.size()
++        ratio = self.compress_ratio
++        rd = self.rope_head_dim
++        end_pos = start_pos + seqlen
++        # if self.compressor.kv_cache is None:
++        #     self.compressor.kv_cache = self.kv_cache
++
++        q = self.wq_b(qr)
++        q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
++        apply_rotary_emb(q[..., -rd:], freqs_cis)
++        q = rotate_activation(q)
++        
++        k = self.compressor(x, start_pos, freqs_cis).unsqueeze(2)
++        # compress_idxs = torch.arange(1, k.size(0) * ratio + 1, device=x.device)
++        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
++        # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
++        # index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
++
++        index_score = self.bf16_index(q.contiguous(), weights.unsqueeze(-1), k.contiguous()) 
++        # breakpoint()
++        # index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
++        if start_pos == 0:
++            # breakpoint()
++            mask = torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
++            index_score += torch.where(mask, float("-inf"), 0)
++        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
++        if start_pos == 0:
++            mask = topk_idxs >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
++            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
++        else:
++            topk_idxs += offset
++        return topk_idxs
++
++class Attention(nn.Module):
++    """Multi-Query Attention (MQA) Layer."""
++    def __init__(self, config: DeepseekV4Config, layer_idx: int):
++        super().__init__()
++        self.layer_id = layer_idx
++        self.dim = config.dim
++        self.n_heads = config.n_heads
++        # self.n_local_heads = config.n_heads // world_size
++        self.q_lora_rank = config.q_lora_rank
++        self.o_lora_rank = config.o_lora_rank
++        self.head_dim = config.head_dim
++        self.rope_head_dim = config.rope_head_dim
++        self.nope_head_dim = config.head_dim - config.rope_head_dim
++        self.n_groups = config.o_groups
++        # self.n_local_groups = self.n_groups // world_size
++        self.window_size = config.window_size
++        self.compress_ratio = config.compress_ratios[layer_idx]
++        self.eps = config.norm_eps
++
++        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
++        self.wq_a = nn.Linear(self.dim, self.q_lora_rank)
++        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
++        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim)
++        self.wkv = nn.Linear(self.dim, self.head_dim)
++        self.kv_norm = RMSNorm(self.head_dim, self.eps)
++        self.wo_a = nn.Linear(self.n_heads * self.head_dim // self.n_groups, self.n_groups * config.o_lora_rank, dtype=torch.bfloat16)
++        self.wo_b = nn.Linear(self.n_groups * config.o_lora_rank, self.dim)
++        self.softmax_scale = self.head_dim ** -0.5
++        self.scale_fmt = config.scale_fmt
++
++        if self.compress_ratio > 1:
++            self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
++            if self.compress_ratio == 4:
++                self.indexer = Indexer(config, self.compress_ratio)
++            else:
++                self.indexer = None
++
++        # self.register_buffer("kv_cache", torch.zeros(config.max_batch_size, config.window_size + config.max_seq_len // self.compress_ratio, self.head_dim), persistent=False)
++        self.freqs_cis = precompute_freqs_cis(self.rope_head_dim, config.max_position_embeddings, config.original_seq_len,
++                                         config.compress_rope_theta if self.compress_ratio > 1 else config.rope_theta,
++                                         config.rope_factor, config.beta_fast, config.beta_slow)
++        # self.register_buffer("freqs_cis", freqs_cis, persistent=False)
++
++    def forward(self, x: torch.Tensor, start_pos: int, position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None):
++        """
++        Forward pass for the Multi-Head Latent Attention (MLA) Layer.
++
++        Args:
++            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
++            start_pos (int): Starting position in the sequence for caching.
++
++        Returns:
++            torch.Tensor: Output tensor with the same shape as the input.
++        """
++
++        bsz, seqlen, _ = x.size()
++        # rotary_pos_emb = position_embeddings[0] if self.compress_ratio > 1 else position_embeddings[1]
++        # self.freqs_cis = rotary_pos_emb.to(x.device)
++        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen].to(x.device)
++        win = self.window_size
++        ratio = self.compress_ratio
++        rd = self.rope_head_dim
++        # if self.compress_ratio > 1 and self.compressor.kv_cache is None:
++        #     self.compressor.kv_cache = self.kv_cache[:, win:]
++        # q
++        qr = q = self.q_norm(self.wq_a(x))
++        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
++        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
++        q[..., -rd:] = apply_rotary_emb(q[..., -rd:], freqs_cis)
++
++        # win kv & topk_idxs
++        kv = self.wkv(x)
++        kv = self.kv_norm(kv)
++        
++        kv[..., -rd:] = apply_rotary_emb(kv[..., -rd:], freqs_cis)
++
++        # topk_idxs = None
++        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).to(x.device)
++        if self.compress_ratio > 1:
++            offset = kv.size(1) if start_pos == 0 else win
++            if self.indexer is not None:
++                compress_topk_idxs = self.indexer(x, qr, start_pos, freqs_cis, offset)
++            else:
++                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset).to(x.device)
++            
++            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
++        topk_idxs = topk_idxs.int()
++
++
++        # compress kv & attn
++        if start_pos == 0:
++            # self.kv_cache[:bsz, :min(win, seqlen)] = kv[:, -win:]
++            if self.compress_ratio > 1:
++                # breakpoint()
++                if (kv_compress := self.compressor(x, start_pos, freqs_cis)) is not None:
++                    # breakpoint()
++                    kv = torch.cat([kv, kv_compress], dim=1)
++
++            # q = q.contiguous()
++            # kv = kv.contiguous()
++            # if self.attn_sink is not None:
++            #     self.attn_sink = self.attn_sink.contiguous()
++            # if topk_idxs is not None:
++            #     topk_idxs = topk_idxs.contiguous()
++
++            q = q.clone()
++            kv = kv.clone()
++
++            q = q.transpose(0, 1)
++            kv = kv.transpose(0, 1)
++            # print(f"DEBUG: kv max seq len = {kv.size(2)}, topk_idxs max = {topk_idxs.max().item()}")
++            # print(f"q shape : {q.shape}")
++            # print(f"kv shape : {kv.shape}")
++            # print(f"self.attn_sink shape : {self.attn_sink.shape}")
++            # print(f"topk_idxs shape : {topk_idxs.shape}")
++            # print(f"self.softmax_scale: {self.softmax_scale}")
++
++            # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
++            # breakpoint()
++            # device = torch.device("npu:0") 
++            # o = torch.randn(bsz, seqlen, 64, 512, device=device)
++            o = SparseFlashAttentionTriton.apply(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
++        else:
++            # self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
++            if self.compress_ratio > 1:
++                self.compressor(x, start_pos, freqs_cis)
++            o = SparseFlashAttentionTriton.apply(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
++        o = o.clone()
++        o = o.transpose(0, 1)
++        o[..., -rd:] = apply_rotary_emb(o[..., -rd:], freqs_cis, True)
++
++        # o
++        o = o.view(bsz, seqlen, self.n_groups, -1)
++        wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
++        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
++        x = self.wo_b(o.flatten(2))
++        return x
++
++
++class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
++    def __init__(self, config: DeepseekV4Config, layer_idx: int):
++        super().__init__()
++        self.hidden_size = config.hidden_size
++
++        self.self_attn = Attention(config=config, layer_idx=layer_idx)
++
++        # self.mlp = DeepseekV3MoE(config)
++        self.mlp = MoE(config=config, layer_idx=layer_idx)
++        self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.hc_mult = hc_mult = config.hc_mult
++        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
++        self.hc_eps = config.hc_eps
++        mix_hc = (2 + hc_mult) * hc_mult
++        hc_dim = hc_mult * config.dim
++        self.norm_eps = config.norm_eps
++        # origin_dtype = torch.get_default_dtype()
++        # torch.set_default_dtype(torch.float32)
++        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
++        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
++        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc))
++        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc))
++        self.hc_attn_scale = nn.Parameter(torch.empty(3))
++        self.hc_ffn_scale = nn.Parameter(torch.empty(3))
++
++
++    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
++        shape, dtype = x.size(), x.dtype
++        x_orig = x
++
++        x_flat = x.flatten(2).float().contiguous()
++        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.norm_eps)
++
++        hc_mult = hc_fn.size(1) // x_flat.size(-1) 
++        hc_fn_folded = hc_fn.view(hc_fn.size(0), hc_mult, -1).sum(dim=1)
++        
++        mixes = F.linear(x_flat, hc_fn_folded) * rsqrt
++
++        mixes = mixes.contiguous()
++        hc_scale = hc_scale.contiguous()
++        hc_base = hc_base.contiguous()
++
++        pre, post, comb = HcSplitSinkhornFunction.apply(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
++
++        if len(shape) == 3:
++            y = pre.sum(dim=2).unsqueeze(-1) * x_orig
++        else:
++            y = (pre.unsqueeze(-1) * x_orig).sum(dim=2)
++
++        return y.to(dtype).contiguous(), post, comb
++
++
++    def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
++        term1 = post.unsqueeze(-1) * x.unsqueeze(-2)
++
++        if residual.dim() == 3:
++            term2 = comb.sum(dim=2).unsqueeze(-1) * residual.unsqueeze(-2)
++        else:
++
++            term2 = torch.matmul(
++                comb.transpose(2, 3).contiguous(), 
++                residual.contiguous()
++            )
++
++        y = term1 + term2
++        return y.type_as(x).contiguous()
++
++    # @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
++    # def forward(
++    #     self,
++    #     hidden_states: torch.Tensor,
++    #     input_ids: Optional[torch.Tensor] = None,
++    #     attention_mask: Optional[torch.Tensor] = None,
++    #     position_ids: Optional[torch.LongTensor] = None,
++    #     past_key_values: Optional[Cache] = None,
++    #     use_cache: Optional[bool] = False,
++    #     cache_position: Optional[torch.LongTensor] = None,
++    #     position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
++    #     **kwargs: Unpack[TransformersKwargs],
++    # ) -> torch.Tensor:
++        
++    #     residual = hidden_states
++    #     # hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
++        
++    #     # hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
++        
++    #     x, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
++    #     hidden_states = self.input_layernorm(x)
++    #     # Self Attention
++    #     # hidden_states, _ = self.self_attn(
++    #     #     hidden_states=hidden_states,
++    #     #     attention_mask=attention_mask,
++    #     #     position_ids=position_ids,
++    #     #     past_key_values=past_key_values,
++    #     #     use_cache=use_cache,
++    #     #     cache_position=cache_position,
++    #     #     position_embeddings=position_embeddings,
++    #     #     **kwargs,
++    #     # )
++    #     start_pos = cache_position[0].item()
++        
++    #     hidden_states = self.self_attn(hidden_states, start_pos)
++    #     x = self.hc_post(hidden_states, residual, post, comb)
++
++    #     # Fully Connected
++    #     residual = x
++    #     # x = x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
++    #     x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
++    #     hidden_states = self.post_attention_layernorm(x)
++    #     hidden_states = self.mlp(hidden_states, input_ids)
++    #     x = self.hc_post(hidden_states, residual, post, comb)
++    #     # hidden_states = residual + hidden_states
++    #     return x
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: Optional[torch.Tensor] = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        past_key_values: Optional[Cache] = None,
++        use_cache: Optional[bool] = False,
++        cache_position: Optional[torch.LongTensor] = None,
++        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
++        **kwargs: Unpack[TransformersKwargs],
++    ) -> torch.Tensor:
++        
++        residual = hidden_states
++        
++        x, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
++
++        hidden_states = self.input_layernorm(x)
++
++        start_pos = cache_position[0].item()
++        hidden_states = self.self_attn(hidden_states, start_pos)
++
++        x = self.hc_post(hidden_states, residual, post, comb)
++
++        residual = x
++        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
++
++        hidden_states = self.post_attention_layernorm(x)
++        hidden_states = self.mlp(hidden_states, input_ids)
++        x = self.hc_post(hidden_states, residual, post, comb)
++        
++        return x
++
++@auto_docstring
++class DeepseekV4PreTrainedModel(PreTrainedModel):
++    config: DeepseekV4Config
++    base_model_prefix = "model"
++    supports_gradient_checkpointing = True
++    _no_split_modules = ["DeepseekV4DecoderLayer"]
++    _skip_keys_device_placement = ["past_key_values"]
++    _supports_flash_attn = True
++    _supports_sdpa = True
++    _supports_flex_attn = True
++    _can_compile_fullgraph = False
++    _supports_attention_backend = True
++    _can_record_outputs = {
++        "hidden_states": DeepseekV4DecoderLayer,
++        "attentions": Attention,
++    }
++
++    def _init_weights(self, module):
++        super()._init_weights(module)
++        if isinstance(module, DeepseekV4TopkRouter):
++            # std=self.config.initializer_range 配置里没有 给定0.02 ——by yzb
++            module.weight.data.normal_(mean=0.0, std=0.02)
++
++
++@auto_docstring
++class DeepseekV4Model(DeepseekV4PreTrainedModel):
++    _keys_to_ignore_on_load_unexpected = [r"model\.layers\.61.*"]
++
++    def __init__(self, config: DeepseekV4Config):
++        super().__init__(config)
++        self.padding_idx = config.pad_token_id
++        self.vocab_size = config.vocab_size
++
++        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
++        self.layers = nn.ModuleList(
++            [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
++        )
++        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.rotary_emb = DeepseekV4RotaryEmbedding(config=config)
++        self.gradient_checkpointing = False
++        self.hc_mult = config.hc_mult
++        # Initialize weights and apply final processing
++        self.post_init()
++
++    @check_model_inputs
++    @auto_docstring
++    def forward(
++        self,
++        input_ids: Optional[torch.LongTensor] = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        past_key_values: Optional[Cache] = None,
++        inputs_embeds: Optional[torch.FloatTensor] = None,
++        cache_position: Optional[torch.LongTensor] = None,
++        use_cache: Optional[bool] = None,
++        **kwargs: Unpack[TransformersKwargs],
++    ) -> BaseModelOutputWithPast:
++        if (input_ids is None) ^ (inputs_embeds is not None):
++            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
++
++        if inputs_embeds is None:
++            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
++
++        if use_cache and past_key_values is None:
++            past_key_values = DynamicCache(config=self.config)
++
++        if cache_position is None:
++            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
++            cache_position: torch.Tensor = torch.arange(
++                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
++            )
++
++        if position_ids is None:
++            position_ids = cache_position.unsqueeze(0)
++
++        causal_mask = create_causal_mask(
++            config=self.config,
++            input_embeds=inputs_embeds,
++            attention_mask=attention_mask,
++            cache_position=cache_position,
++            past_key_values=past_key_values,
++            position_ids=position_ids,
++        )
++
++        hidden_states = inputs_embeds
++        # hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
++        position_embeddings = self.rotary_emb(hidden_states, position_ids)
++        
++        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
++            hidden_states = decoder_layer(
++                hidden_states,
++                input_ids=input_ids,
++                attention_mask=causal_mask,
++                position_ids=position_ids,
++                past_key_values=past_key_values,
++                cache_position=cache_position,
++                position_embeddings=position_embeddings,
++                **kwargs,
++            )
++
++        hidden_states = self.norm(hidden_states)
++        return BaseModelOutputWithPast(
++            last_hidden_state=hidden_states,
++            past_key_values=past_key_values,
++        )
++
++
++@auto_docstring
++class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
++    _tied_weights_keys = ["lm_head.weight"]
++    _tp_plan = {"lm_head": "colwise_rep"}
++    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
++
++    def __init__(self, config):
++        super().__init__(config)
++        self.model = DeepseekV4Model(config)
++        self.vocab_size = config.vocab_size
++        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
++        self.hc_eps = config.hc_eps
++        self.hc_mult = hc_mult = config.hc_mult
++        hc_dim = hc_mult * config.dim
++        # origin_dtype = torch.get_default_dtype()
++        # torch.set_default_dtype(torch.float32)
++        self.norm_eps = config.norm_eps
++        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim))
++        self.hc_head_base = nn.Parameter(torch.empty(hc_mult))
++        self.hc_head_scale = nn.Parameter(torch.empty(1))
++        # Initialize weights and apply final processing
++        self.post_init()
++
++    def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
++        shape, dtype = x.size(), x.dtype
++        x = x.flatten(2).float()
++        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
++        mixes = F.linear(x, hc_fn) * rsqrt
++        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
++        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
++        return y.to(dtype)
++
++    @can_return_tuple
++    @auto_docstring
++    def forward(
++        self,
++        input_ids: Optional[torch.LongTensor] = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        past_key_values: Optional[Cache] = None,
++        inputs_embeds: Optional[torch.FloatTensor] = None,
++        labels: Optional[torch.LongTensor] = None,
++        use_cache: Optional[bool] = None,
++        cache_position: Optional[torch.LongTensor] = None,
++        logits_to_keep: Union[int, torch.Tensor] = 0,
++        **kwargs: Unpack[TransformersKwargs],
++    ) -> CausalLMOutputWithPast:
++        r"""
++        Example:
++
++        ```python
++        >>> from transformers import AutoTokenizer, DeepseekV3ForCausalLM
++
++        >>> model = DeepseekV3ForCausalLM.from_pretrained("meta-deepseek_v3/DeepseekV3-2-7b-hf")
++        >>> tokenizer = AutoTokenizer.from_pretrained("meta-deepseek_v3/DeepseekV3-2-7b-hf")
++
++        >>> prompt = "Hey, are you conscious? Can you talk to me?"
++        >>> inputs = tokenizer(prompt, return_tensors="pt")
++
++        >>> # Generate
++        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
++        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
++        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
++        ```"""
++        outputs: BaseModelOutputWithPast = self.model(
++            input_ids=input_ids,
++            attention_mask=attention_mask,
++            position_ids=position_ids,
++            past_key_values=past_key_values,
++            inputs_embeds=inputs_embeds,
++            use_cache=use_cache,
++            cache_position=cache_position,
++            **kwargs,
++        )
++        hidden_states = outputs.last_hidden_state
++        h = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
++        h = self.norm(h)
++        # hidden_states = outputs.last_hidden_state
++        # # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
++        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
++        logits = self.lm_head(h[:, slice_indices, :])
++        # logits = self.lm_head(h[:, -1].float())
++        loss = None
++        if labels is not None:
++            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
++
++        return CausalLMOutputWithPast(
++            loss=loss,
++            logits=logits,
++            past_key_values=outputs.past_key_values,
++            hidden_states=outputs.hidden_states,
++            attentions=outputs.attentions,
++        )
++
++
++class DeepseekV4ForSequenceClassification(GenericForSequenceClassification, DeepseekV4PreTrainedModel):
++    pass
++
++
++class DeepseekV4ForTokenClassification(GenericForTokenClassification, DeepseekV4PreTrainedModel):
++    pass
++
++
++__all__ = [
++    "DeepseekV4PreTrainedModel",
++    "DeepseekV4Model",
++    "DeepseekV4ForCausalLM",
++    "DeepseekV4ForSequenceClassification",
++    "DeepseekV4ForTokenClassification",
++]
+diff --git a/src/transformers/models/deepseek_v4/sinkhorn.py b/src/transformers/models/deepseek_v4/sinkhorn.py
+new file mode 100644
+index 0000000000..0d86f5985b
+--- /dev/null
++++ b/src/transformers/models/deepseek_v4/sinkhorn.py
+@@ -0,0 +1,77 @@
++import torch
++import copy
++
++from .sinkhorn_triton_kernel import hc_split_sinkhorn
++from .sinkhorn_triton_kernel import hc_split_sinkhorn_backward
++from mindspeed.lite.ops.triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
++
++class HcSplitSinkhornFunction(torch.autograd.Function):
++
++    @staticmethod
++    @input_guard
++    @autocast_custom_fwd
++    def forward(
++        ctx,
++        mixes: torch.Tensor,
++        hc_scale: torch.Tensor,
++        hc_base: torch.Tensor,
++        hc_mult: int = 4,
++        sinkhorn_iters: int = 20,
++        eps: float = 1e-6
++    ):
++        pre, post, comb = hc_split_sinkhorn(
++            mixes,
++            hc_scale,
++            hc_base,
++            hc_mult,
++            sinkhorn_iters,
++            eps
++        )
++        
++        ctx.save_for_backward(mixes, hc_scale, hc_base)
++        ctx.hc_mult = hc_mult
++        ctx.sinkhorn_iters = sinkhorn_iters
++        ctx.eps = eps
++        
++        return pre, post, comb
++
++    @staticmethod
++    @input_guard
++    @autocast_custom_bwd
++    def backward(
++        ctx,
++        grad_pre: torch.Tensor,
++        grad_post: torch.Tensor,
++        grad_comb: torch.Tensor,
++    ):
++        mixes, hc_scale, hc_base = ctx.saved_tensors
++        hc_mult = ctx.hc_mult
++        sinkhorn_iters = ctx.sinkhorn_iters
++        eps = ctx.eps
++
++        grad_mixes_triton, grad_scale_triton, grad_base_triton = hc_split_sinkhorn_backward(
++            grad_pre, grad_post, grad_comb,
++            mixes, hc_scale, hc_base,
++            hc_mult, sinkhorn_iters, eps 
++        )
++
++        return  grad_mixes_triton, grad_scale_triton, grad_base_triton, None,  None,  None                
++
++@torch.compiler.disable
++def hc_split_sinkhorn_triton(
++    mixes: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    hc_mult: int = 4,
++    sinkhorn_iters: int = 20,
++    eps: float = 1e-6
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    pre, post, comb = HcSplitSinkhornFunction.apply(
++        mixes,
++        hc_scale,
++        hc_base,
++        hc_mult,
++        sinkhorn_iters,
++        eps
++    )
++    return pre, post, comb
+\ No newline at end of file
+diff --git a/src/transformers/models/deepseek_v4/sinkhorn_triton_kernel.py b/src/transformers/models/deepseek_v4/sinkhorn_triton_kernel.py
+new file mode 100644
+index 0000000000..f658d6d81c
+--- /dev/null
++++ b/src/transformers/models/deepseek_v4/sinkhorn_triton_kernel.py
+@@ -0,0 +1,658 @@
++import torch, torch_npu
++import triton
++import triton.language as tl
++import torch.nn.functional as F
++import triton.language.extra.cann.extension as extension
++
++@triton.jit
++def _hc_split_sinkhorn_kernel_part1(
++    # Input/output tensor pointers
++    mixes_ptr, hc_scale_ptr, hc_base_ptr,
++    pre_ptr, post_ptr, comb_ptr,
++    # Dimension parameters
++    batch_seq_size,
++    # Constant parameters
++    eps: tl.constexpr,
++    feat_dim: tl.constexpr,
++    # Block size (compile-time constant)
++    hc_mult: tl.constexpr,
++    group: tl.constexpr,
++):
++    """
++    Triton Kernel: Core computation for HC-Split Sinkhorn (Pre/Post components)
++    
++    Compatible with older Triton versions (without keepdim parameter support). 
++    Each thread block processes one (batch, seq) sample.
++    
++    Args:
++        mixes_ptr: Pointer to input tensor mixes [batch_seq_size, feat_dim]
++        hc_scale_ptr: Pointer to scale tensor [3]
++        hc_base_ptr: Pointer to base tensor [(2+hc_mult)*hc_mult]
++        pre_ptr: Pointer to output pre tensor [batch_seq_size, hc_mult]
++        post_ptr: Pointer to output post tensor [batch_seq_size, hc_mult]
++        comb_ptr: Pointer to output comb tensor [batch_seq_size, hc_mult*hc_mult]
++        batch_seq_size: Total number of (batch, seq) samples (b*s)
++        eps: Small constant to avoid division by zero
++        feat_dim: Total feature dimension (2+hc_mult)*hc_mult
++        hc_mult: HC dimension size (typically 4)
++        group: Number of samples processed per thread block
++    """
++    ar4 = tl.arange(0, hc_mult)
++    arange_val = tl.arange(0, hc_mult * hc_mult)
++    
++    # Calculate program IDs for grouped processing
++    pid0 = tl.program_id(0) * group
++    pids = pid0 + tl.arange(0, group)  
++    pid_mask = pids < batch_seq_size
++    
++    # Calculate memory offsets for each sample
++    pid_comb_off = pids[:, None] * hc_mult * hc_mult
++    pid_feat_off = pids[:, None] * feat_dim
++    pid_hc_off = pids[:, None] * hc_mult
++    
++    # Load scale parameters (pre/post/comb)
++    scale_pre = tl.load(hc_scale_ptr + 0)
++    scale_post = tl.load(hc_scale_ptr + 1)
++    scale_comb = tl.load(hc_scale_ptr + 2)
++    
++    # Load base parameters
++    base_pre = tl.load(hc_base_ptr + ar4)
++    base_post = tl.load(hc_base_ptr + hc_mult + ar4)
++    base_comb = tl.load(hc_base_ptr + 2 * hc_mult + arange_val)
++    
++    # Load mixes tensor slices for pre/post/comb
++    mixes_pre = tl.load(
++        mixes_ptr + pid_feat_off + ar4[None, :],
++        mask=pid_mask[:, None],
++        other=0.0
++    )
++    mixes_post = tl.load(
++        mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :],
++        mask=pid_mask[:, None],
++        other=0.0
++    )
++    mixes_comb = tl.load(
++        mixes_ptr + pid_feat_off[:, :, None] + (2 * hc_mult + arange_val)[None, :],
++        mask=pid_mask[:, None, None]
++    )
++    
++    # Compute pre tensor with sigmoid activation
++    pre = tl.sigmoid(mixes_pre * scale_pre + base_pre[None, :]) + eps
++    tl.store(
++        pre_ptr + pid_hc_off + ar4[None, :],
++        pre,
++        mask=pid_mask[:, None]
++    )
++    
++    # Compute post tensor with sigmoid activation
++    post = 2.0 * tl.sigmoid(mixes_post * scale_post + base_post[None, :])
++    tl.store(
++        post_ptr + pid_hc_off + ar4[None, :],
++        post,
++        mask=pid_mask[:, None]
++    )
++    
++    # Compute comb logits and store
++    comb = mixes_comb * scale_comb + base_comb[None, :, :]
++    comb_flat = tl.reshape(comb, (group, hc_mult * hc_mult))
++    tl.store(
++        comb_ptr + pid_comb_off + arange_val[None, :],
++        comb_flat,
++        mask=pid_mask[:, None]
++    )
++
++
++@triton.jit
++def _hc_split_sinkhorn_kernel_part2(
++    # Input/output tensor pointers
++    comb_tmp_ptr,
++    comb_ptr,
++    # Dimension parameters
++    batch_seq_size, 
++    hc_mult: tl.constexpr,
++    sinkhorn_iters: tl.constexpr,
++    # Constant parameters
++    eps: tl.constexpr,
++    group: tl.constexpr,
++    BLOCK_ALIGN: tl.constexpr = 8
++):
++    """
++    Triton Kernel: Core computation for HC-Split Sinkhorn (Comb component)
++    
++    Implements Comb tensor calculation with Sinkhorn normalization iterations.
++    Each thread block processes one (batch, seq) sample.
++    
++    Args:
++        comb_tmp_ptr: Pointer to temporary comb tensor [batch_seq_size, hc_mult*BLOCK_ALIGN]
++        comb_ptr: Pointer to output comb tensor [batch_seq_size, hc_mult*BLOCK_ALIGN]
++        batch_seq_size: Total number of (batch, seq) samples (b*s)
++        hc_mult: HC dimension size (typically 4)
++        sinkhorn_iters: Number of Sinkhorn normalization iterations
++        eps: Small constant to avoid division by zero
++        group: Number of samples processed per thread block
++        BLOCK_ALIGN: Compile-time constant for memory alignment (typically 8)
++    """
++    lin = tl.arange(0, hc_mult * BLOCK_ALIGN)
++    
++    # Calculate program IDs for grouped processing
++    pid0 = tl.program_id(0) * group
++    pids = pid0 + tl.arange(0, group)
++    pid_mask = pids < batch_seq_size
++
++    # Column mask for alignment handling
++    pid_comb_off = pids[:, None] * (hc_mult * BLOCK_ALIGN)
++
++    # Load and reshape comb tensor
++    comb = tl.load(
++        comb_tmp_ptr + pid_comb_off + lin[None, :],
++        mask=pid_mask[:, None]
++    )
++    comb = comb.reshape(group, hc_mult, BLOCK_ALIGN)
++
++    # Numerical stability: subtract row max before exp
++    row_max = tl.max(comb, axis=2)
++    comb = tl.exp(comb - row_max[:, :, None])
++
++    # Sinkhorn normalization iterations
++    for _ in range(sinkhorn_iters):
++        # Row normalization
++        row_sum = tl.sum(comb, axis=2)
++        comb = comb / (row_sum[:, :, None] + eps)
++
++        # Column normalization
++        col_sum = tl.sum(comb, axis=1)
++        comb = comb / (col_sum[:, None, :] + eps)
++
++    # Reshape and store final comb tensor
++    comb_flat = tl.reshape(comb, (group, hc_mult * BLOCK_ALIGN))
++    tl.store(
++        comb_ptr + pid_comb_off + lin[None, :],
++        comb_flat,
++        mask=pid_mask[:, None]
++    )
++
++
++def hc_split_sinkhorn(
++    mixes: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    hc_mult: int = 4,
++    sinkhorn_iters: int = 20,
++    eps: float = 1e-6
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """
++    Triton implementation of HC-Split Sinkhorn, optimized for GPU performance
++    
++    Args:
++        mixes: Input tensor with shape [batch_size, seq_len, (2+hc_mult)*hc_mult]
++        hc_scale: Scale tensor with shape [3] (pre/post/comb scales)
++        hc_base: Base tensor with shape [(2+hc_mult)*hc_mult] (pre/post/comb bases)
++        hc_mult: HC dimension size (only 4 supported in current implementation), default=4
++        sinkhorn_iters: Number of Sinkhorn normalization iterations, default=20
++        eps: Small constant to prevent division by zero, default=1e-6
++    
++    Returns:
++        tuple: (pre, post, comb)
++            - pre: Output tensor with shape [batch_size, seq_len, hc_mult]
++            - post: Output tensor with shape [batch_size, seq_len, hc_mult]
++            - comb: Output tensor with shape [batch_size, seq_len, hc_mult, hc_mult]
++    """
++    # Save original dtype and convert to float32 for stable computation
++    origin_dtype = mixes.dtype
++    mixes = mixes.to(dtype=torch.float32)
++    hc_scale = hc_scale.to(dtype=torch.float32)
++    hc_base = hc_base.to(dtype=torch.float32)
++
++    # Flatten batch and sequence dimensions for Triton processing
++    b, s, _ = mixes.shape
++    feat_dim = (2 + hc_mult) * hc_mult
++    batch_seq_size = b * s
++    mixes_flat = mixes.view(-1, feat_dim).contiguous()
++
++    # Initialize output tensors
++    pre_flat = torch.empty((batch_seq_size, hc_mult), dtype=mixes.dtype, device=mixes.device)
++    post_flat = torch.empty((batch_seq_size, hc_mult), dtype=mixes.dtype, device=mixes.device)
++    comb_tmp = torch.empty((batch_seq_size, hc_mult, hc_mult), dtype=mixes.dtype, device=mixes.device)
++
++    # Configure Triton kernel parameters
++    BLOCK_ALIGN = 8
++    group_part1 = 64
++    group_part2 = 32
++
++    # Launch Part1 kernel (Pre/Post computation)
++    _hc_split_sinkhorn_kernel_part1[(triton.cdiv(batch_seq_size, group_part1),)](
++        mixes_flat, hc_scale, hc_base,
++        pre_flat, post_flat, comb_tmp,
++        batch_seq_size,
++        eps, feat_dim, hc_mult,
++        group_part1
++    )
++
++    # Pad comb tensor for memory alignment
++    comb_tmp_padded = F.pad(comb_tmp, pad=(0, BLOCK_ALIGN - hc_mult), mode="constant", value=float('-inf'))
++    comb_flat_padded = torch.empty((batch_seq_size, hc_mult * BLOCK_ALIGN), dtype=mixes.dtype, device=mixes.device)
++
++    # Launch Part2 kernel (Comb computation with Sinkhorn normalization)
++    _hc_split_sinkhorn_kernel_part2[(triton.cdiv(batch_seq_size, group_part2),)](
++        comb_tmp_padded,
++        comb_flat_padded,
++        batch_seq_size, hc_mult, sinkhorn_iters,
++        eps, group_part2,
++        BLOCK_ALIGN=BLOCK_ALIGN,
++    )
++
++    # Reshape outputs and restore original dtype
++    pre = pre_flat.view(b, s, hc_mult).to(dtype=origin_dtype)
++    post = post_flat.view(b, s, hc_mult).to(dtype=origin_dtype)
++    comb = comb_flat_padded.view(b, s, hc_mult, BLOCK_ALIGN)[:, :, :, :hc_mult].to(dtype=origin_dtype)
++
++    return pre, post, comb
++
++
++@triton.jit
++def hc_split_sinkhorn_backward_kernel_part1(
++    # Input gradient pointers
++    grad_pre_ptr,
++    grad_post_ptr,
++    # Forward input pointers
++    mixes_ptr,
++    hc_scale_ptr,
++    hc_base_ptr,
++    # Output gradient pointers
++    comb_tmp_ptr,
++    grad_mixes_ptr,
++    grad_hc_scale_ptr,
++    grad_hc_base_ptr,
++    batch_seq_size,
++    hc_mult: tl.constexpr = 4,
++    group: tl.constexpr = 32,
++):
++    """
++    Triton Kernel: Compute gradients for Pre/Post components of HC-Split Sinkhorn
++    
++    Calculates gradients for sigmoid-transformed Pre/Post tensors and updates
++    gradients for mixes, hc_scale, and hc_base.
++    
++    Args:
++        grad_pre_ptr: Gradient tensor pointer for pre output [batch_seq_size, hc_mult]
++        grad_post_ptr: Gradient tensor pointer for post output [batch_seq_size, hc_mult]
++        mixes_ptr: Forward input mixes tensor pointer [batch_seq_size, (2+hc_mult)*hc_mult]
++        hc_scale_ptr: Forward input scale tensor pointer [3]
++        hc_base_ptr: Forward input base tensor pointer [(2+hc_mult)*hc_mult]
++        comb_tmp_ptr: Temporary comb tensor pointer for backward computation
++        grad_mixes_ptr: Gradient tensor pointer for mixes input
++        grad_hc_scale_ptr: Gradient tensor pointer for hc_scale input
++        grad_hc_base_ptr: Gradient tensor pointer for hc_base input
++        batch_seq_size: Total number of (batch, seq) samples (b*s)
++        hc_mult: HC dimension size (default=4)
++        group: Number of samples processed per thread block (default=32)
++    """
++    feat_dim = (2 + hc_mult) * hc_mult
++    arange_val = tl.arange(0, hc_mult * hc_mult)
++    
++    # Calculate program IDs for grouped processing
++    pid0 = tl.program_id(0) * group
++    pids = pid0 + tl.arange(0, group)  
++    pid_mask = pids < batch_seq_size
++    
++    # Memory offset calculations
++    pid_comb_off = pids[:, None] * hc_mult * hc_mult
++    pid_feat_off = pids[:, None] * feat_dim
++    pid_hc_off = pids[:, None] * hc_mult
++    ar4 = tl.arange(0, hc_mult)
++
++    # Load scale parameters
++    scale_pre = tl.load(hc_scale_ptr + 0)
++    scale_post = tl.load(hc_scale_ptr + 1)
++    scale_comb = tl.load(hc_scale_ptr + 2)
++
++    # Load forward input slices
++    pre_slice = tl.load(mixes_ptr + pid_feat_off + ar4[None, :], mask=pid_mask[:, None], other=0.0)
++    post_slice = tl.load(mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :], mask=pid_mask[:, None], other=0.0)
++    comb_slice = tl.load(mixes_ptr + pid_feat_off + (2 * hc_mult + arange_val)[None, :], mask=pid_mask[:, None], other=0.0)
++
++    # Load base parameters
++    base_pre = tl.load(hc_base_ptr + ar4)
++    base_post = tl.load(hc_base_ptr + hc_mult + ar4)
++    base_comb = tl.load(hc_base_ptr + 2 * hc_mult + arange_val)
++
++    # Compute gradients for pre component
++    pre_input = pre_slice * scale_pre + base_pre[None, :]
++    sigmoid_pre = tl.sigmoid(pre_input)
++    sigmoid_deriv = sigmoid_pre * (1.0 - sigmoid_pre)
++    grad_pre = tl.load(grad_pre_ptr + pid_hc_off + ar4[None, :], mask=pid_mask[:, None], other=0.0)
++    grad_pre_input = grad_pre * sigmoid_deriv
++
++    # Update gradients for mixes (pre slice)
++    tl.store(grad_mixes_ptr + pid_feat_off + ar4[None, :], grad_pre_input * scale_pre, mask=pid_mask[:, None])
++    
++    # Atomic updates for scale and base gradients
++    tl.atomic_add(grad_hc_scale_ptr + 0, tl.sum(grad_pre_input * pre_slice))
++    grad_pre_input_sum = tl.sum(grad_pre_input, axis=0)
++    tl.atomic_add(grad_hc_base_ptr + ar4, grad_pre_input_sum)
++
++    # Compute gradients for post component
++    post_input = post_slice * scale_post + base_post[None, :]
++    sigmoid_post = tl.sigmoid(post_input)
++    sigmoid_deriv_post = sigmoid_post * (1.0 - sigmoid_post)
++    grad_post = tl.load(grad_post_ptr + pid_hc_off + ar4[None, :], mask=pid_mask[:, None], other=0.0)
++    grad_post_input = grad_post * 2.0 * sigmoid_deriv_post
++
++    # Update gradients for mixes (post slice)
++    tl.store(
++        grad_mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :],
++        grad_post_input * scale_post,
++        mask=pid_mask[:, None]
++    )
++    
++    # Atomic updates for scale and base gradients
++    tl.atomic_add(grad_hc_scale_ptr + 1, tl.sum(grad_post_input * post_slice))
++    grad_post_input_sum = tl.sum(grad_post_input, axis=0)
++    tl.atomic_add(grad_hc_base_ptr + hc_mult + ar4, grad_post_input_sum)
++
++    # Prepare comb logits for Part2 backward kernel
++    comb = comb_slice * scale_comb + base_comb[None, :, :]
++    comb_flat = tl.reshape(comb, (group, hc_mult * hc_mult))
++    tl.store(comb_tmp_ptr + pid_comb_off + arange_val[None, :], comb_flat, mask=pid_mask[:, None])
++
++
++@triton.jit
++def hc_split_sinkhorn_backward_kernel_part2(
++    # Input gradient pointer
++    grad_comb_ptr,
++    # Forward input pointers
++    mixes_ptr,
++    hc_scale_ptr,
++    comb_tmp_ptr,
++    # Output gradient pointers
++    grad_mixes_ptr,
++    grad_hc_scale_ptr,
++    grad_hc_base_ptr,
++    # Constant parameters (compile-time)
++    batch_seq_size,
++    hc_mult: tl.constexpr = 4,
++    sinkhorn_iters: tl.constexpr = 20,
++    eps: tl.constexpr = 1e-6,
++    BLOCK_ALIGN: tl.constexpr = 8,
++    group: tl.constexpr = 32,
++):
++    """
++    Triton Kernel: Compute gradients for Comb component of HC-Split Sinkhorn
++    
++    Reconstructs forward Sinkhorn iterations and backpropagates gradients
++    through the normalization process.
++    
++    Args:
++        grad_comb_ptr: Gradient tensor pointer for comb output [batch_seq_size, hc_mult*BLOCK_ALIGN]
++        mixes_ptr: Forward input mixes tensor pointer (comb slice) [batch_seq_size, hc_mult*BLOCK_ALIGN]
++        hc_scale_ptr: Forward input scale tensor pointer [3]
++        comb_tmp_ptr: Temporary comb tensor pointer from forward pass
++        grad_mixes_ptr: Gradient tensor pointer for mixes (comb slice)
++        grad_hc_scale_ptr: Gradient tensor pointer for hc_scale (comb component)
++        grad_hc_base_ptr: Gradient tensor pointer for hc_base (comb component)
++        batch_seq_size: Total number of (batch, seq) samples (b*s)
++        hc_mult: HC dimension size (default=4)
++        sinkhorn_iters: Number of Sinkhorn iterations (default=20)
++        eps: Small constant to avoid division by zero (default=1e-6)
++        BLOCK_ALIGN: Memory alignment constant (default=8)
++        group: Number of samples processed per thread block (default=32)
++    """
++    # Initialize indices and masks
++    arange_val = tl.arange(0, hc_mult * BLOCK_ALIGN)
++    pid0 = tl.program_id(0) * group
++    pids = pid0 + tl.arange(0, group)
++    pid_mask = pids < batch_seq_size
++    
++    # Column mask for alignment handling
++    c = tl.arange(0, BLOCK_ALIGN)[None, :]
++    col_mask = c < hc_mult
++    mask_val = col_mask[None, :, :]
++    pid_feat_off = pids[:, None] * hc_mult * BLOCK_ALIGN
++
++    # Load and reshape comb tensors
++    comb_slice_flat = tl.load(mixes_ptr + pid_feat_off + arange_val)
++    comb_slice = comb_slice_flat.reshape(group, hc_mult, BLOCK_ALIGN)
++
++    # Load scale parameter for comb component
++    scale_comb = tl.load(hc_scale_ptr + 2)
++
++    # Load initial comb values from forward pass
++    comb_init = tl.load(comb_tmp_ptr + pid_feat_off + arange_val)
++    comb_init = comb_init.reshape(group, hc_mult, BLOCK_ALIGN)
++
++    # Reconstruct forward Sinkhorn computation
++    row_max = tl.max(comb_init, axis=2).reshape(group, hc_mult, 1)
++    exp_comb = tl.exp(comb_init - row_max)
++
++    # Save row/column sums for backward pass
++    row_sum_list = tl.full((sinkhorn_iters, group, hc_mult, 1), 0.0, dtype=tl.float32)
++    col_sum_list = tl.full((sinkhorn_iters, group, 1, BLOCK_ALIGN), 0.0, dtype=tl.float32)
++    K = exp_comb
++
++    # Replay forward iterations to save intermediate values
++    for i in range(sinkhorn_iters):
++        # Row normalization
++        row_sum = tl.sum(K, axis=2).reshape(group, hc_mult, 1)
++        K_row = K / (row_sum + eps)
++
++        # Column normalization
++        col_sum = tl.sum(K_row, axis=1).reshape(group, 1, BLOCK_ALIGN)
++        K_col = K_row / (col_sum + eps)
++
++        # Save intermediate sums
++        row_sum_list = extension.insert_slice(
++            ful=row_sum_list,
++            sub=row_sum[None, :, :, :],
++            offsets=[i, 0, 0, 0],
++            sizes=[1, group, hc_mult, 1],
++            strides=[1, 1, 1, 1],
++        )
++        col_sum_list = extension.insert_slice(
++            ful=col_sum_list,
++            sub=col_sum[None, :, :, :],
++            offsets=[i, 0, 0, 0],
++            sizes=[1, group, 1, BLOCK_ALIGN],
++            strides=[1, 1, 1, 1],
++        )
++        K = K_col
++
++    # Load comb gradient and reshape
++    grad_comb_flat = tl.load(grad_comb_ptr + pid_feat_off + arange_val)
++    dK = grad_comb_flat.reshape(group, hc_mult, BLOCK_ALIGN)
++
++    # Backpropagate through Sinkhorn iterations (reverse order)
++    for j in range(sinkhorn_iters):
++        i = sinkhorn_iters - j - 1
++    
++        # Extract saved intermediate sums
++        row_sum = extension.extract_slice(
++            row_sum_list,
++            [i, 0, 0, 0],
++            [1, group, hc_mult, 1],
++            [1, 1, 1, 1],
++        )
++        col_sum = extension.extract_slice(
++            col_sum_list,
++            [i, 0, 0, 0],
++            [1, group, 1, BLOCK_ALIGN],
++            [1, 1, 1, 1],
++        )
++
++        # Backprop column normalization
++        col_sum = col_sum.reshape(group, 1, BLOCK_ALIGN) + eps
++        row_sum = row_sum.reshape(group, hc_mult, 1) + eps 
++        K_col = K * col_sum
++        
++        grad_direct = dK / col_sum
++        d_col_sum_compressed = -tl.sum(dK * K_col / (col_sum * col_sum), axis=-2)
++        dK_row = grad_direct + d_col_sum_compressed[:, None, :]
++
++        # Backprop row normalization
++        K_row = K_col * row_sum
++        K = K_row
++        
++        grad_direct_row = dK_row / row_sum
++        d_row_sum_compressed = -tl.sum(dK_row * K_row / (row_sum * row_sum), axis=-1)
++        dK = grad_direct_row + d_row_sum_compressed[:, :, None]
++
++        dK = dK * mask_val
++
++    # Backprop through exp and row max subtraction
++    d_exp_comb = dK
++    d_comb_before_exp = d_exp_comb * exp_comb
++
++    # Handle gradient of row max subtraction
++    max_mask = tl.where(comb_init == row_max, 1.0, 0.0)
++    max_count = tl.sum(max_mask, axis=-1).reshape(group, hc_mult, 1) + eps
++    row_sum_d_before_exp = tl.sum(d_comb_before_exp, axis=-1).reshape(group, hc_mult, 1)
++    d_comb_init = d_comb_before_exp - (row_sum_d_before_exp * max_mask / max_count)
++
++    # Backprop through linear transformation
++    grad_comb_slice_flat = d_comb_init * scale_comb
++
++    # Update mixes gradient
++    tl.store(
++        grad_mixes_ptr + pid_feat_off + arange_val[None, :],
++        grad_comb_slice_flat.reshape(group, hc_mult * BLOCK_ALIGN),
++        mask=pid_mask[:, None]
++    )
++
++    # Atomic updates for scale and base gradients (with boundary check)
++    tmp_res = d_comb_init * comb_slice
++    tmp_res = tl.where(pid_mask[:, None, None], tmp_res, 0.0)
++    d_comb_init = tl.where(pid_mask[:, None, None], d_comb_init, 0.0)
++
++    tl.atomic_add(grad_hc_scale_ptr + 2, tl.sum(tmp_res))
++    d_comb_init_sum = tl.sum(d_comb_init, axis=0)
++    tl.atomic_add(grad_hc_base_ptr + arange_val, d_comb_init_sum.reshape(hc_mult * BLOCK_ALIGN))
++
++
++def hc_split_sinkhorn_backward(
++    grad_pre: torch.Tensor,
++    grad_post: torch.Tensor,
++    grad_comb: torch.Tensor,
++    mixes: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    hc_mult: int = 4,
++    sinkhorn_iters: int = 20,
++    eps: float = 1e-6,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """
++    Computes gradients for input tensors (mixes, hc_scale, hc_base) with GPU optimization
++    
++    Args:
++        grad_pre: Gradient of loss w.r.t. pre output, shape [b, s, hc_mult]
++        grad_post: Gradient of loss w.r.t. post output, shape [b, s, hc_mult]
++        grad_comb: Gradient of loss w.r.t. comb output, shape [b, s, hc_mult, hc_mult]
++        mixes: Input tensor from forward pass, shape [b, s, (2+hc_mult)*hc_mult]
++        hc_scale: Scale tensor from forward pass, shape [3]
++        hc_base: Base tensor from forward pass, shape [(2+hc_mult)*hc_mult]
++        hc_mult: HC dimension size (only 4 supported), default=4
++        sinkhorn_iters: Number of Sinkhorn iterations, default=20
++        eps: Small constant to avoid division by zero, default=1e-6
++
++    Returns:
++        tuple: (grad_mixes, grad_hc_scale, grad_hc_base)
++            - grad_mixes: Gradient w.r.t. mixes, shape [b, s, (2+hc_mult)*hc_mult]
++            - grad_hc_scale: Gradient w.r.t. hc_scale, shape [3]
++            - grad_hc_base: Gradient w.r.t. hc_base, shape [(2+hc_mult)*hc_mult]
++    """
++    # Input dimension validation
++    b, s, _ = mixes.shape
++    batch_seq_size = b * s
++
++    # Convert to float32 for stable gradient computation
++    origin_dtype = mixes.dtype
++    mixes = mixes.to(dtype=torch.float32)
++    hc_scale = hc_scale.to(dtype=torch.float32)
++    hc_base = hc_base.to(dtype=torch.float32)
++    grad_pre = grad_pre.to(dtype=torch.float32)
++    grad_post = grad_post.to(dtype=torch.float32)
++    grad_comb = grad_comb.to(dtype=torch.float32)
++
++    # Initialize gradient tensors with zeros
++    grad_mixes = torch.zeros_like(mixes, device=mixes.device)
++    grad_hc_scale = torch.zeros_like(hc_scale, device=hc_scale.device)
++    grad_hc_base = torch.zeros_like(hc_base, device=hc_base.device)
++    comb_tmp = torch.empty((batch_seq_size, hc_mult, hc_mult), dtype=mixes.dtype, device=mixes.device)
++
++    # Flatten gradient tensors for Triton processing
++    grad_pre_flat = grad_pre.reshape(-1, hc_mult)
++    grad_post_flat = grad_post.reshape(-1, hc_mult)
++
++    # Configure Triton kernel parameters
++    BLOCK_ALIGN = 8
++    group_part1 = 64
++    group_part2 = 32
++
++    # Launch Part1 kernel (Pre/Post gradients)
++    hc_split_sinkhorn_backward_kernel_part1[(triton.cdiv(batch_seq_size, group_part1),)](
++        grad_pre_flat,
++        grad_post_flat,
++        mixes,
++        hc_scale,
++        hc_base,
++        comb_tmp,
++        grad_mixes,
++        grad_hc_scale,
++        grad_hc_base,
++        batch_seq_size,
++        hc_mult=hc_mult,
++        group=group_part1
++    )
++
++    # Prepare comb slice for Part2 backward kernel (padding for alignment)
++    mixes_flat = mixes.view(-1, (2 + hc_mult) * hc_mult)
++    mixes_slice = mixes_flat[:, 2 * hc_mult:].view(-1, hc_mult, hc_mult)
++    mixes_pad = F.pad(mixes_slice, (0, BLOCK_ALIGN - hc_mult), mode="constant", value=0.0)
++
++    # Initialize padded gradient tensors
++    grad_mixes_pad = torch.zeros(
++        (batch_seq_size, hc_mult, BLOCK_ALIGN),
++        dtype=grad_mixes.dtype,
++        device=grad_mixes.device,
++    )
++    grad_hc_base_pad = torch.zeros(
++        (hc_mult, BLOCK_ALIGN), dtype=grad_hc_base.dtype, device=grad_hc_base.device
++    )
++
++    # Pad comb gradient tensor
++    grad_comb_flat = grad_comb.reshape(-1, hc_mult, hc_mult)
++    grad_comb_flat_pad = F.pad(
++        grad_comb_flat, (0, BLOCK_ALIGN - hc_mult), mode="constant", value=0.0
++    )
++    comb_tmp_padded = F.pad(comb_tmp, pad=(0, BLOCK_ALIGN - hc_mult), mode="constant", value=float('-inf'))
++
++    # Launch Part2 kernel (Comb gradients)
++    hc_split_sinkhorn_backward_kernel_part2[(triton.cdiv(batch_seq_size, group_part2),)](
++        grad_comb_flat_pad,
++        mixes_pad,
++        hc_scale,
++        comb_tmp_padded,
++        grad_mixes_pad,
++        grad_hc_scale,
++        grad_hc_base_pad,
++        batch_seq_size,
++        hc_mult,
++        sinkhorn_iters,
++        eps,
++        BLOCK_ALIGN=BLOCK_ALIGN,
++        group=group_part2
++    )
++
++    # Merge padded gradients back to original shape
++    grad_mixes_slice = grad_mixes_pad[:, :, :hc_mult].reshape(b, s, hc_mult * hc_mult)
++    grad_hc_base_slice = grad_hc_base_pad[:, :hc_mult].reshape(hc_mult * hc_mult)
++
++    # Update final gradients
++    grad_mixes[:, :, 2 * hc_mult:] = grad_mixes_slice
++    grad_hc_base[2 * hc_mult:] = grad_hc_base_slice
++
++    # Restore original dtype
++    grad_mixes = grad_mixes.to(dtype=origin_dtype)
++    grad_hc_scale = grad_hc_scale.to(dtype=origin_dtype)
++    grad_hc_base = grad_hc_base.to(dtype=origin_dtype)
++
++    return grad_mixes, grad_hc_scale, grad_hc_base
++
