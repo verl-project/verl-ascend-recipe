@@ -45,11 +45,11 @@ actor_ppo_max_token_len=$(((max_prompt_length + max_response_length)))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length)))
 
 # Megatron Parallelism Configuration
-train_tp=8
+train_tp=2
 train_ep=32
 train_etp=1
-train_pp=2
-train_cp=1
+train_pp=4
+train_cp=8
 
 
 # Generation Configuration
@@ -106,6 +106,9 @@ ACTOR_CONFIG=(
     # Core Runtime Settings
     actor_rollout_ref.actor.use_torch_compile=False
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz}
+    # 全层定位实验：actor 重算 logprob 时复用 rollout/vLLM 返回的逐层专家路由。
+    # 与 rollout.enable_rollout_routing_replay 配对，用于隔离 MoE 路由分叉的贡献。
+    #actor_rollout_ref.actor.mindspeed.router_replay.mode=R3
     # Loss Function Configuration
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss}
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
@@ -192,7 +195,7 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_factor=16
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_mscale=1.0
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_mscale_all_dim=1.0
-    ###  超过64k要改这个参数  =  prompt + response + (2048 余量) 
+    ###  长序列要改这个参数  =  prompt + response + (2048 余量)  会影响显存初始化占用的   69632是64K的
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_original_max_position_embeddings=65536
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_theta=10000.0
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.rope_scaling_type=yarn
@@ -206,6 +209,7 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.use_mcore_models=True
 
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.num_layers=43
+    #+actor_rollout_ref.actor.mindspeed.llm_kwargs.num_layer_list=\'21,22\'
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.num_layer_list=\'10,11,11,11\'
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.hidden_size=4096
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.ffn_hidden_size=4096
@@ -259,8 +263,10 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.masked_softmax_fusion=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.moe_shared_expert_overlap=False
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.indexer_loss_coeff=0.0
+    #+actor_rollout_ref.actor.mindspeed.llm_kwargs.swap_optimizer=True
 
     +actor_rollout_ref.actor.mindspeed.llm_kwargs.swap_optimizer=False
+    # 
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
 	+actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
@@ -303,6 +309,7 @@ ROLLOUT_CONFIG=(
     +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=bfloat16
     actor_rollout_ref.rollout.max_model_len=${max_model_len}
     actor_rollout_ref.rollout.calculate_log_probs=True   
+    #actor_rollout_ref.rollout.enable_rollout_routing_replay=True
     actor_rollout_ref.rollout.name=vllm
     # Generation Parameters
     actor_rollout_ref.rollout.load_format="safetensors"
@@ -363,6 +370,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     "${ALGORITHM_CONFIG[@]}" \
     "${TRAINER_CONFIG[@]}" \
     "$@" 2>&1 | tee logs/run_deepseek_v4_npu_$(date +%Y%m%d_%H%M%S).log
+
+
+
 
 
 
