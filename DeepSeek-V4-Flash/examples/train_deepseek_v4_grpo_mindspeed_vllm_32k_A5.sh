@@ -358,6 +358,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     "${ROLLOUT_CONFIG[@]}" \
     "${ALGORITHM_CONFIG[@]}" \
     "${TRAINER_CONFIG[@]}" \
-    "$@" 2>&1 | tee logs/run_deepseek_v4_npu_$(date +%Y%m%d_%H%M%S).log
+    "$@" 2>&1 | tee ./run_deepseek_v4_npu_$(date +%Y%m%d_%H%M%S).log
 
 
