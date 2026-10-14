@@ -136,6 +136,7 @@ MemFabric Hybrid AccOffload:
 ### 启动训练
 
 请根据实际数据/权重等路径修改ray_start_A5.sh 以及 train_deepseek_v4_grpo_mindspeed_vllm_A5.sh的中相应路径
+tips：全层任务需在 CPU 侧宿主机内存总量 ≥ 1.5TB 的机器上运行。运行前请清理环境，执行 free -h，确认 Mem 行的 total 列 ≥ 1.5TB。
 
 
 ```bash
