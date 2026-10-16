@@ -53,27 +53,61 @@ batch256 训练从初始权重独立运行，训练前后使用相同提示、�
 | vLLM | 0.18.0，`bcf2be96120005e9aea171927f85055a6a5c0cf6` |
 | vLLM-Ascend | 0.18.1.dev44，`a43c8cc8057f490ed1df2c6ed66253e2d7817da4` |
 | transformers / peft / ray | 5.10.4 / 0.20.0 / 2.56.1 |
+| NumPy / opencv-python-headless | 2.4.6 / 4.11.0.86 |
 
 实测容器来自历史镜像
 `quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm`，
 加载后的 image ID 为 `sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c`。
 这是运行身份记录，不是当前可下载镜像的承诺；历史拉取曾返回 404。
-复现按软件版本、源码和补丁核对，可使用已有兼容环境；本次未验证从空环境重新构建这套依赖。
+复现按软件版本、源码和补丁核对；下述源码安装不依赖历史镜像标签。
+安装流程依据固定版本的[官方说明](https://github.com/vllm-project/vllm-ascend/blob/a43c8cc8057f490ed1df2c6ed66253e2d7817da4/docs/source/installation.md)，
+但尚未在独立 NPU 环境验证从零构建及训练，不能将下面的步骤视为新增设备验证结果。
 
 仓库的 `install_verl.sh` 只安装 verl，不能替代 CANN 和 vLLM-Ascend 环境准备。
 在 recipe 仓库根目录设置实际路径，三个源码目录须对应当前 Python 环境安装的代码：
 
 ```bash
-RECIPE_DIR=$(realpath mopd)
-VERL_DIR=/path/to/verl
-VLLM_DIR=/path/to/vllm
-VLLM_ASCEND_DIR=/path/to/vllm-ascend
-python3 -m pip show torch torch-npu verl vllm vllm-ascend transformers peft ray
-npu-smi info
+set -e
+export RECIPE_DIR=$(realpath mopd)
+export VERL_DIR=/path/to/verl
+export VLLM_DIR=/path/to/vllm
+export VLLM_ASCEND_DIR=/path/to/vllm-ascend
 ```
 
-CANN 版本另查安装目录中的版本文件；`npu-smi` 用于核对设备和驱动。
-以下命令应用实测的两份补丁。已应用时用 `git apply --reverse --check` 确认，不重复应用。
+新环境先安装与设备匹配的驱动、CANN 9.0.0、算子包及 NNAL 9.0.0，并准备 gcc/g++、CMake 和 libnuma 开发包。
+具体平台步骤见上述官方说明。以下使用 Python 3.11，源码目录须尚不存在；使用既有兼容环境时跳过创建和克隆，
+直接核对下一段的固定提交。CANN 和 NNAL 的环境脚本路径按实际安装位置修改。
+
+固定 vLLM-Ascend 还要求 `triton-ascend==3.2.1`。截至 2026-10-16，公开 PyPI 未提供该版本；
+从零安装须先取得与 Python 3.11、目标 CPU 架构和 CANN 匹配的该版本 wheel，并设置下面的路径。
+本交付未提供此二进制产物，也未验证其他版本可替代；缺少它时不能完成这套环境的独立重建。
+
+```bash
+export TRITON_ASCEND_WHEEL=/path/to/matching-triton-ascend-3.2.1.whl
+test -f "$TRITON_ASCEND_WHEEL"
+python3.11 -m venv /path/to/mopd-env
+source /path/to/mopd-env/bin/activate
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+python3 -m pip install --upgrade pip
+python3 -m pip install 'torch==2.9.0' 'torch-npu==2.9.0.post2'
+python3 -m pip install "$TRITON_ASCEND_WHEEL"
+
+git clone https://github.com/verl-project/verl.git "$VERL_DIR"
+git -C "$VERL_DIR" checkout --detach bc72e38edba78e778bfbd462638f9634b9140a76
+git clone https://github.com/vllm-project/vllm.git "$VLLM_DIR"
+git -C "$VLLM_DIR" checkout --detach bcf2be96120005e9aea171927f85055a6a5c0cf6
+git clone https://github.com/vllm-project/vllm-ascend.git "$VLLM_ASCEND_DIR"
+git -C "$VLLM_ASCEND_DIR" checkout --detach a43c8cc8057f490ed1df2c6ed66253e2d7817da4
+git -C "$VLLM_ASCEND_DIR" submodule update --init --recursive
+```
+
+固定源码的安装声明存在冲突：vLLM 要求 Transformers < 5、OpenCV >= 4.13，vLLM-Ascend 要求
+NumPy < 2、OpenCV <= 4.11，而 verl 要求 Transformers >= 5.5.3、NumPy >= 2。
+两份新增依赖声明补丁将这些约束及 vLLM 的构建期 torch 对齐到上表实测版本，不改模型或训练算法代码。
+它们用于源码重建，没有参与历史 100 步运行；新构建仍需独立设备验证。
+
+以下命令核对版本，应用两份实测运行补丁和两份依赖声明补丁。已应用时验证反向应用，不重复应用。
 
 ```bash
 (
@@ -81,14 +115,74 @@ CANN 版本另查安装目录中的版本文件；`npu-smi` 用于核对设备�
   test "$(git -C "$VERL_DIR" rev-parse HEAD)" = bc72e38edba78e778bfbd462638f9634b9140a76
   test "$(git -C "$VLLM_DIR" rev-parse HEAD)" = bcf2be96120005e9aea171927f85055a6a5c0cf6
   test "$(git -C "$VLLM_ASCEND_DIR" rev-parse HEAD)" = a43c8cc8057f490ed1df2c6ed66253e2d7817da4
-  git -C "$VERL_DIR" apply --check "$RECIPE_DIR/patches/0001-get_npu_versions-first-visible-npu-id.patch"
-  git -C "$VERL_DIR" apply "$RECIPE_DIR/patches/0001-get_npu_versions-first-visible-npu-id.patch"
-  git -C "$VLLM_ASCEND_DIR" apply --check "$RECIPE_DIR/patches/vllm-ascend/0001-record-sampler-stream.patch"
-  git -C "$VLLM_ASCEND_DIR" apply "$RECIPE_DIR/patches/vllm-ascend/0001-record-sampler-stream.patch"
+  for entry in "$VERL_DIR|$RECIPE_DIR/patches/0001-get_npu_versions-first-visible-npu-id.patch" \
+               "$VLLM_ASCEND_DIR|$RECIPE_DIR/patches/vllm-ascend/0001-record-sampler-stream.patch" \
+               "$VLLM_DIR|$RECIPE_DIR/patches/vllm/0001-align-tested-npu-dependencies.patch" \
+               "$VLLM_ASCEND_DIR|$RECIPE_DIR/patches/vllm-ascend/0002-align-tested-numpy.patch"; do
+    repo=${entry%%|*}
+    patch=${entry#*|}
+    if git -C "$repo" apply --reverse --check "$patch"; then
+      continue
+    fi
+    git -C "$repo" apply --check "$patch"
+    git -C "$repo" apply "$patch"
+  done
 )
 ```
 
-修改必须在当前 Python 环境中生效。可编辑安装直接使用源码；预构建安装包需要按对应项目流程重新构建或安装。
+在已激活的环境中安装这三个源码目录，使补丁作用于实际导入版本。vLLM 使用官方 NPU 安装方式中的
+`VLLM_TARGET_DEVICE=empty`，vLLM-Ascend 构建需要上述 CANN/NNAL 环境。
+先安装两个项目声明的构建依赖，再关闭构建隔离，使源码构建使用已安装的目标 torch 和 Triton Ascend。
+
+```bash
+(
+  set -e
+  constraints=$(mktemp)
+  trap 'rm -f "$constraints"' EXIT
+  printf '%s\n' 'torch==2.9.0' 'torch-npu==2.9.0.post2' \
+    'transformers==5.10.4' 'peft==0.20.0' 'ray==2.56.1' \
+    'numpy==2.4.6' 'opencv-python-headless==4.11.0.86' > "$constraints"
+  python3 - "$constraints" <<'PY'
+import importlib.metadata
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+if importlib.metadata.version("triton-ascend") != "3.2.1":
+    raise RuntimeError("This build requires the tested triton-ascend 3.2.1 artifact")
+for variable in ("VLLM_DIR", "VLLM_ASCEND_DIR"):
+    with (Path(os.environ[variable]) / "pyproject.toml").open("rb") as source:
+        requirements = tomllib.load(source)["build-system"]["requires"]
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-c", sys.argv[1], *requirements])
+PY
+  VLLM_TARGET_DEVICE=empty python3 -m pip install --no-build-isolation -c "$constraints" -e "$VLLM_DIR"
+  python3 -m pip install --no-build-isolation -c "$constraints" -e "$VLLM_ASCEND_DIR"
+  python3 -m pip install -c "$constraints" -e "$VERL_DIR" \
+    'transformers==5.10.4' 'peft==0.20.0' 'ray==2.56.1' pyarrow
+  python3 -m pip check
+)
+python3 - <<'PY'
+import importlib
+import os
+from pathlib import Path
+
+for name, variable in (("verl", "VERL_DIR"), ("vllm", "VLLM_DIR"), ("vllm_ascend", "VLLM_ASCEND_DIR")):
+    module = importlib.import_module(name)
+    actual = Path(module.__file__).resolve()
+    expected = Path(os.environ[variable]).resolve()
+    if not actual.is_relative_to(expected):
+        raise RuntimeError(f"{name} imports {actual}, expected source under {expected}")
+    print(f"{name}: {actual}")
+PY
+python3 -m pip show torch torch-npu verl vllm vllm-ascend transformers peft ray
+npu-smi info
+```
+
+三个导入路径应指向已核对、已应用补丁的源码，`pip check` 应无依赖冲突。
+CANN 版本另查安装目录中的版本文件；`npu-smi` 用于核对设备和驱动。
+若采用预构建安装包，须按对应项目流程重新构建或安装补丁版本，再核对实际导入位置。
 
 - 设备探测补丁从 `npu-smi info -m` 取得首个可见物理卡，保留上游已有的环境变量回退。
   上游在正确设置 `ASCEND_VISIBLE_DEVICES` 时也可处理部分设备映射；保留此补丁是为了复现实测源码，不能称其为所有环境的必需修复。
@@ -117,6 +211,8 @@ python3 "$RECIPE_DIR/tools/prepare_nonthinking_data.py" --source "$SOURCE_DATA_D
 ```
 
 输出目录须不存在，脚本只向 GSM8K 最后一个 user prompt 追加固定格式说明，不读取答案。
+脚本先检查四个输入文件，在临时目录中完成处理后才创建结果目录。输入、数据解析或写入失败时清理本次产物，
+修正问题后可使用原命令重试；已有输出目录或符号链接仍会被拒绝，不覆盖其中的数据。
 其他字段和行序保持不变，MATH 文件逐字节复制。无需预先用 tokenizer 扫描数据，训练时由 verl 统一套用
 非思考模板并按 1024 token 过滤。本轮过滤后训练 14966 条，验证 GSM8K 1319 条、MATH 4998 条。
 
@@ -160,6 +256,24 @@ epoch 上限默认等于目标步数，`total_training_steps=100` 控制结束�
 本次为 `13434084 / 21880.460205 / 4`。token 包含 prompt 与 response，分母包括两位教师。
 这不是单步吞吐量算术平均、纯生成速度或整个作业的墙钟吞吐量。
 
+## 本地检查的覆盖范围
+
+数据准备可以在无 NPU 的独立 Python 环境检查：
+
+```bash
+python3 -m venv /path/to/mopd-data-test-env
+source /path/to/mopd-data-test-env/bin/activate
+python3 -m pip install pytest pyarrow
+python3 -m pytest "$RECIPE_DIR/../tests/mopd/test_prepare_data.py" -q
+```
+
+这些测试覆盖数据内容保持、失败后重试和已有目录保护，不能证明模型训练或 NPU 安装成功。
+未安装 PyArrow 时，该测试模块会跳过；运行专项检查前须安装上述依赖。
+原有 331 项 `tests/ascend_ci_case_diff_scan/` 测试覆盖 CI 差异扫描工具，不能作为 MOPD 算法验证。
+启动参数和样例 Parquet 的历史对照只证明整理前后的对应行为；设备效果证据来自下文固定版本的 100 步训练。
+
+## 验证准确率与原始证据
+
 | 验证步 | GSM8K | MATH |
 | --- | --- | --- |
 | 0 | 499/1319，37.8317% | 2505/4998，50.1200% |
@@ -181,4 +295,4 @@ epoch 上限默认等于目标步数，`total_training_steps=100` 控制结束�
 
 MATH 最终准确率比第 80 步低 0.5602 个百分点，两条曲线均非单调；只有一条完整轨迹，不能声称多种子稳定。
 数值检查只覆盖日志指标，未证明全部中间张量；本次没有 GPU 对照、八卡、其他模型组合或实际 checkpoint 恢复结果。
-现有结果满足 issue 无 GPU 标杆时的训练指标要求；正式完成仍需 PR 合入及实践文档提交到 issue。
+现有结果满足 issue 无 GPU 标杆时的训练指标要求；实践文档已提交到 issue，正式完成仍需 PR 合入及社区验收确认。
