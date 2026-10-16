@@ -1,0 +1,24 @@
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,7 +2,7 @@
+ cmake>=3.26
+ decorator
+ einops
+-numpy<2.0.0
++numpy==2.4.6
+ packaging
+ pip
+ pybind11
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -6,7 +6,7 @@
+     "decorator",
+     "einops",
+     "googleapis-common-protos",
+-    "numpy<2.0.0",
++    "numpy==2.4.6",
+     "packaging",
+     "pip",
+     "pybind11",
