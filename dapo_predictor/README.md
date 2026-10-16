@@ -1,176 +1,169 @@
-# DAPO Predictor Reorder
+# DAPO length predictor and EPWS
 
-This directory is a portable copy of `recipe/dapo_predictor`. You can copy it into a local `recipe/` tree, for example when adapting the predictor reorder flow around a local verl `0.7.1` environment.
+This recipe adds two orthogonal components to DAPO rollout generation:
 
-The feature adds predictor-driven prompt reordering to DAPO. Before rollout generation, prompts are scored by a lightweight predictor head and then reordered with serpentine packing so prompts with similar predicted response length are spread across data-parallel ranks. After actor update, the predictor head is trained from the observed rollout response lengths and is used again in the next step.
+1. a prompt-side response-length predictor; and
+2. an event-driven pending/waiting-pool scheduler (EPWS).
 
-## What It Changes
+EPWS has a deterministic fail-closed mode. Before the selected predictor passes its activation gates, EPWS admits requests in stable FCFS order. After activation it admits the longest predicted work first and refills the bounded rollout window whenever one request completes. Actual inference-server placement remains owned by verl's existing `GlobalRequestLoadBalancer`.
 
-- Uses `PredictorAsyncActorRolloutRefWorker` instead of the default actor-rollout worker for FSDP/FSDP2 actor rollout.
-- Adds a linear predictor head on the actor worker: `nn.Linear(hidden_size, 1, bias=False)`.
-- Scores one sample per prompt group before generation, expands the score to all `rollout.n` samples, and applies `snake_sort_indices`.
-- Restores order after DP batch balancing before training the predictor, so labels still correspond to the original prompt groups.
-- Trains only the predictor head during `update_predictor`; the actor update still follows the normal DAPO/PPO path.
+The implementation uses verl's public `agent_loop_manager_class` extension point. It does not patch vLLM or vLLM-Ascend and does not require either project as a Python dependency of the scheduler package.
 
-Prompt-reorder patch examples were removed from this branch; this package documents predictor-driven reorder only.
+## Required `verl` version
 
-## Entry Points
+See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt). The tested pin is `bcb638649a50e58494a8ddd92085ad1174f674b8`.
 
-- `main_dapo_predictor_reorder.py`
-  - Main DAPO entrypoint with predictor score + snake-sort reorder enabled.
-- `main_dapo_reorder.py`
-  - Backward-compatible alias to the predictor-driven reorder entrypoint.
+## Tested environment and dependency boundary
 
-## Implementation Modules
+| Component | Tested value | Dependency role |
+| --- | --- | --- |
+| Python | 3.10 / 3.11 | Provided by the selected verl runtime image. |
+| verl | commit `bcb638649a50e58494a8ddd92085ad1174f674b8` (`0.8.0.dev`) | Required and machine-pinned in `REQUIRED_VERL.txt`. |
+| PyTorch / torch-npu | The versions bundled by the tested Ascend runtime | Inherited from verl; this recipe does not repin them. |
+| vLLM | `0.19.1` | Tested rollout runtime, not imported by this package. |
+| vLLM-Ascend | `0.19.1rc1` | Tested Ascend rollout runtime, not imported by this package. |
+| Ascend image | `quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler` | End-to-end evaluation environment. |
+| Hardware | Ascend 910 | End-to-end evaluation hardware. |
 
-- `predictor_dapo_trainer.py`
-  - Injects predictor scoring before rollout generation.
-  - Builds and applies predictor reorder indices.
-  - Reverses DP balancing order before predictor training.
-  - Calls `actor_rollout_wg.update_predictor(prompt_batch, batch)` after actor update.
-- `predictor_worker.py`
-  - Adds `PredictorDataParallelPPOActor` with the linear predictor head.
-  - Implements `compute_predictor_score` and `update_predictor` worker RPCs.
-  - Extracts last-token hidden states from the actor model for scoring and training.
-- `predictor_utils.py`
-  - Provides `snake_sort_indices` for prompt-level serpentine DP packing.
+The scheduler package intentionally has no direct Python dependency on vLLM or vLLM-Ascend. Runtime compatibility with newer rollout stacks is therefore expected to follow verl's public agent-loop contract, but only the versions above are claimed as tested. Core Python dependencies (`torch`, `numpy`, `ray`, Hydra/OmegaConf, and verl utilities) come from the pinned verl environment. SciPy is optional and is used only to emit the Kendall-tau training metric; training and scheduling continue without it.
 
-## Runtime Flow
+## Source-tree placement
 
-1. Build `gen_batch` from the training batch and repeat each prompt `rollout.n` times.
-2. Hydrate the predictor input with `input_ids`, `attention_mask`, and `position_ids` when needed.
-3. Run `compute_predictor_score` on actor workers:
-   - sample one item from each prompt group,
-   - extract the last-token hidden state,
-   - score it with the predictor head,
-   - broadcast that score back to all samples from the same prompt.
-4. Sort prompt groups by predictor score and apply serpentine DP packing through `snake_sort_indices`.
-5. Generate rollouts with the reordered batch.
-6. Continue normal reward, KL, advantage, critic, and actor update logic.
-7. If DP batch balancing changed row order, restore the pre-balance order.
-8. Train the predictor head using the latest prompt hidden states and observed response lengths.
+This is a recipe overlay, not a standalone wheel. Install or clone the pinned verl revision (including its `recipe` submodule), then place this directory at `recipe/dapo_predictor` in that source checkout:
 
-## Predictor Head Training
+```bash
+git clone --recurse-submodules https://github.com/verl-project/verl.git
+cd verl
+git checkout bcb638649a50e58494a8ddd92085ad1174f674b8
+git submodule update --init --recursive recipe
+cp -a /path/to/verl-ascend-recipe/dapo_predictor recipe/dapo_predictor
+pip install -e .
+```
 
-The predictor head is trained online after each actor update. The training data comes from the same rollout step:
+Run the commands below from the verl checkout with that checkout on `PYTHONPATH`. The upstream DAPO recipe remains the owner of the base trainer configuration; this overlay adds predictor and EPWS behavior through the documented extension point.
 
-- Inputs: prompt-side last-token hidden states extracted from `prompt_batch`.
-- Labels: observed generated response lengths from `response_batch.batch["responses"]`.
-- Prompt grouping: response lengths are reshaped by `rollout.n`, and the max response length in each prompt group is used as the label.
-- Label scaling: response lengths are bucketed by `max(1, rollout.response_length // 40)` to keep label values in a stable range.
-- Loss: ListMLE ranking loss, so the head learns the relative ordering of prompts by response length rather than an exact length regression target.
-- Optimizer: AdamW over the linear predictor head only.
-- Determinism: the predictor dataloader and ListMLE shuffle use `trainer.predictor_reorder.seed`.
+## Product boundary
 
-The update path gathers hidden states and labels across distributed ranks. When sequence parallelism is enabled, only SP rank 0 data from each DP group is used to avoid duplicated prompt samples.
+Included in the first contribution:
 
-Metrics emitted by the predictor update include:
+- no-anchor EPWS with deterministic FCFS fallback;
+- D1 `Linear/ListMLE` as the default online backend;
+- train-history-only PAVA calibration from ranking score to token-scale work;
+- a two-part activation gate (`min_epoch` and `min_samples`);
+- predictor-only checkpoint save/resume;
+- D2 right-censored LogNormal inference as an optional frozen backend;
+- strict finite/range/schema checks and prediction provenance.
 
-- `predictor/epoch_0_loss`
-- `predictor/epoch_0_kendall_tau`
-- `predictor/epoch_{last}_loss`
-- `predictor/epoch_{last}_kendall_tau`
-- `predictor/final_loss`
-- `predictor/epochs`
-- `predictor/update_time_s`
-- `predictor/total_samples`
+Not enabled or submitted as product behavior:
 
-`scipy` is optional. If it is unavailable, Kendall tau metrics fall back to `0.0` instead of failing the worker.
+- forced K=1/K=2 anchor rollouts;
+- sibling/history correction;
+- live decode-progress polling;
+- automatic D1-to-D2 switching;
+- TailGate/OOD heuristics;
+- vLLM/vLLM-Ascend source patches;
+- exact-trace replay helpers used by experiments.
+
+## Runtime flow
+
+1. The trainer repeats each prompt by `rollout.n` as usual.
+2. If the selected predictor has not passed both activation gates, no predictor forward is run and EPWS behaves as stable FCFS.
+3. Once active, the actor performs one prompt-side forward per unique prompt. All sibling rollouts share that prompt prediction.
+4. D1 maps the scalar ListMLE score to token work using a train-history-only monotone PAVA map. D2 uses `median + risk_weight * (p90 - median)`.
+5. `EPWSAgentLoopManager` keeps a bounded set of rollout requests in flight. Each completion immediately admits the next request; active mode is longest-predicted-work-first.
+6. verl's existing global load balancer chooses the inference server.
+7. After the actor update, D1 learns from the completed rollout batch and refits calibration for future batches. The batch being scheduled never uses its own completion lengths.
+
+## Modules
+
+| Module | Responsibility |
+| --- | --- |
+| `main_dapo_predictor_reorder.py` | DAPO entry point; selects the custom actor worker and installs EPWS through verl's manager extension. |
+| `predictor_dapo_trainer.py` | Lifecycle gates, prompt-side scoring, predictor update, and predictor checkpoint state. |
+| `predictor_worker.py` | Hidden-state extraction, D1 online training/calibration, and optional D2 inference. |
+| `epws_manager.py` | Event-driven bounded admission and output-order restoration. |
+| `length_scheduler/calibration.py` | Weighted PAVA and monotone score-to-token interpolation. |
+| `length_scheduler/scheduler.py` | Stable FCFS / longest-predicted-work-first waiting pool. |
+| `length_scheduler/predictor.py` | Backend-neutral prediction API, D1/D2 adapters, provenance, and validation. |
+| `length_scheduler/checkpoint.py` | Backend-aware lifecycle metadata and frozen-D2 checkpoint binding. |
+| `length_scheduler/distribution.py` | Right-censored LogNormal inference primitives. |
+| `predictor_utils.py` | Legacy static-snake helper retained for backward compatibility. |
+
+## Backends
+
+### D1: Linear/ListMLE (default)
+
+D1 is a bias-free linear ranking head over the final prompt-token hidden state. It is trained online with ListMLE. Since a ranking score has no token unit, the worker retains a bounded training-history replay and refits a monotone PAVA map after each update. PAVA sees only already-completed training rows. Until at least two valid calibration observations exist, the predictor reports not ready and EPWS remains FCFS.
+
+### D2: censored LogNormal (optional)
+
+D2 consumes the hidden-state tap schema declared by a frozen checkpoint and exposes unstandardized `mu`, `sigma`, expected length, median, p90, p95, and exceedance probability. It is useful when downstream systems need a distribution rather than only an ordering. D2 checkpoints must be produced independently and supplied with `d2_checkpoint`; this recipe does not train D2 online.
 
 ## Configuration
 
-Enable predictor reorder with Hydra overrides under `trainer.predictor_reorder`. The entrypoint mirrors this config to `actor_rollout_ref.predictor_reorder` so the worker can read it.
+The entry point mirrors `trainer.predictor_reorder` into the actor worker config.
 
-Common options:
+```yaml
+trainer:
+  predictor_reorder:
+    enable: true
+    scheduler: epws
+    backend: linear_listmle
+    activation:
+      min_epoch: 10
+      min_samples: 2560
+    epochs: 10
+    batch_size: 32
+    lr: 3.0e-5
+    weight_decay: 1.0e-4
+    seed: 1
+    calibration_max_samples: 4096
+    predictor_keep_actor_loaded: false
+    epws:
+      slots_per_server: 8
+      max_concurrent_requests: null
+```
 
-| Option | Default | Description |
-| ------ | ------- | ----------- |
-| `enable` | `False` | Enables predictor scoring, reorder, and predictor head training. |
-| `epochs` | `10` | Number of predictor-head training epochs per actor update. |
-| `batch_size` | `32` | Batch size for predictor-head training. |
-| `lr` | `3e-5` | AdamW learning rate for the predictor head. |
-| `weight_decay` | `1e-4` | AdamW weight decay for the predictor head. |
-| `seed` | `1` | Local seed used by predictor dataloader/ListMLE shuffling. |
-| `predictor_keep_actor_loaded` | `False` | Keeps actor parameters on GPU across actor update when predictor training immediately follows. Useful when offload overhead is high. |
+`max_concurrent_requests: null` derives the admission window as `rollout server count * slots_per_server`. Set it explicitly when the inference deployment has a different safe concurrency limit.
 
-## Launch Example
+For D2, replace the backend and supply the frozen checkpoint:
+
+```yaml
+trainer:
+  predictor_reorder:
+    backend: censored_lognormal
+    d2_checkpoint: /absolute/path/to/d2.pt
+    risk_weight: 0.5
+```
+
+The backend is selected before training and never changes mid-run.
+
+## Launch
+
+Use the same DAPO data/model/rollout overrides as `recipe.dapo`, plus:
 
 ```bash
 PYTHONPATH=/workspace/verl python recipe/dapo_predictor/main_dapo_predictor_reorder.py \
-  +trainer.predictor_reorder.enable=True \
-  +trainer.predictor_reorder.epochs=10 \
-  +trainer.predictor_reorder.batch_size=32 \
-  +trainer.predictor_reorder.lr=3e-5 \
-  +trainer.predictor_reorder.weight_decay=1e-4 \
+  +trainer.predictor_reorder.enable=true \
+  +trainer.predictor_reorder.scheduler=epws \
+  +trainer.predictor_reorder.backend=linear_listmle \
+  +trainer.predictor_reorder.activation.min_epoch=10 \
+  +trainer.predictor_reorder.activation.min_samples=2560 \
+  +trainer.predictor_reorder.calibration_max_samples=4096 \
+  +trainer.predictor_reorder.epws.slots_per_server=8 \
+  +trainer.predictor_reorder.epws.max_concurrent_requests=null
 ```
 
-Use the same DAPO data, model, rollout, critic, and trainer overrides as the normal `recipe.dapo` entrypoint. This package only adds predictor reorder-specific overrides.
+## Correctness and fallback guarantees
 
-## Experimental Setup and Effects
+- Missing, non-finite, negative, or incomplete predictions fail closed to FCFS.
+- Dynamic micro-batch reordering is reversed before predictions are attached to prompts.
+- Generated outputs are restored to original batch order before the trainer unions them with training rows.
+- D1 calibration never reads the completion lengths of the rollout batch currently being scheduled.
+- D1 weights and calibration are stored beside the normal trainer checkpoint. D2 remains external and frozen; its SHA-256 is stored with the shared lifecycle state and verified on resume.
+- If lifecycle state is absent on resume, the scheduler restarts in FCFS fallback mode instead of using stale predictions. A backend or D2 checkpoint mismatch fails explicitly.
+- D2 validates hidden tap names/dimensions, finite inputs, positive sigma, monotone quantiles, and checkpoint provenance.
 
-The PR experiment used a long-response DAPO workload where generation time can become unbalanced across DP ranks:
+## Validation scope
 
-| Parameter | Value |
-| --------- | ----- |
-| Model | Qwen3-30B-A3B-Instruct-2507 |
-| DataLoader seed | 1 |
-| Global batch size | 32 |
-| Samples per prompt | 8 |
-| Max num sequences | 16 |
-| Generation TP | 4 |
-| Sequence parallel | 4, ulysses |
-| Max model length | 22528 |
-| Prompt length | about 2k |
-| Response length | about 20k |
-| NPU count | 32 |
-| Training steps | 57 |
-
-### Critic Score
-
-| Metric | Reorder | Baseline |
-| ------ | ------- | -------- |
-| Average | 0.6179 | 0.6137 |
-| First 10 steps avg | 0.4383 | 0.4391 |
-| Last 10 steps avg | 0.6680 | 0.6680 |
-
-The critic score is essentially unchanged, so predictor reorder did not degrade training quality in this run.
-
-### Step Time
-
-| Metric | Reorder | Baseline |
-| ------ | ------- | -------- |
-| Average | 638.98 s/it | 668.40 s/it |
-| First 10 steps avg | 616.14 s/it | 621.21 s/it |
-| Last 10 steps avg | 616.23 s/it | 711.55 s/it |
-
-The reorder run stayed around 616 s/it, while the baseline degraded from about 621 s/it to 711 s/it. The step-time gap grew from 5.08s to 95.33s.
-
-### Generation Time
-
-| Metric | Reorder | Baseline |
-| ------ | ------- | -------- |
-| Average | 471.66s | 504.67s |
-| First 10 steps avg | 439.39s | 461.45s |
-| Last 5 steps avg | 421.14s | 522.81s |
-| Trend | -18.25s | +61.37s |
-
-Generation time decreased during the reorder run but increased in the baseline. The generation-time advantage grew from about 22s to 101.67s as training progressed.
-
-### Actor Entropy
-
-| Metric | Reorder | Baseline |
-| ------ | ------- | -------- |
-| Average | 0.2664 | 0.2626 |
-| First 10 steps avg | 0.2571 | 0.2577 |
-| Last 5 steps avg | 0.2619 | 0.2611 |
-| Trend | +0.0048 | +0.0034 |
-
-Actor entropy stayed comparable between the reorder and baseline runs.
-
-### Summary
-
-- No quality loss was observed: critic score was unchanged.
-- Step time stayed stable with predictor reorder, while baseline step time increased late in training.
-- Generation became faster and more stable in the reorder run.
-- Actor entropy remained similar, suggesting the reorder did not materially change policy entropy.
-- The benefit widened over time, especially for generation latency.
+Unit tests cover lifecycle gates, PAVA, scheduler fallback/priority, event-driven refill, numerical invariants, D1/D2 reload, and error inputs. Integration validation should use the pinned verl commit and the target Ascend rollout stack. See the PR validation receipt for the exact commands and environment used for the contribution.

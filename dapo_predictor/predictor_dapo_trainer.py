@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections import defaultdict
@@ -26,6 +27,12 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
 
+from .length_scheduler.checkpoint import (
+    DISTRIBUTION_BACKEND,
+    LINEAR_BACKEND,
+    build_lifecycle_state,
+    validate_lifecycle_state,
+)
 from .predictor_utils import snake_sort_indices
 
 
@@ -40,8 +47,90 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
     def _predictor_cfg(self):
         return self.config.trainer.get("predictor_reorder", {})
 
+    def _predictor_checkpoint_paths(self) -> tuple[str, str]:
+        folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        return os.path.join(folder, "predictor.pt"), os.path.join(folder, "predictor_state.json")
+
+    def _predictor_backend(self) -> str:
+        backend = str(self._predictor_cfg().get("backend", LINEAR_BACKEND))
+        if backend not in (LINEAR_BACKEND, DISTRIBUTION_BACKEND):
+            raise ValueError(f"unsupported predictor backend: {backend!r}")
+        return backend
+
+    def _d2_checkpoint(self) -> str | None:
+        checkpoint = self._predictor_cfg().get("d2_checkpoint")
+        return None if checkpoint is None else str(checkpoint)
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+        if not self._predictor_enabled():
+            return
+        predictor_path, state_path = self._predictor_checkpoint_paths()
+        backend = self._predictor_backend()
+        if backend == LINEAR_BACKEND:
+            self.actor_rollout_wg.save_predictor(predictor_path)
+        state = build_lifecycle_state(
+            backend=backend,
+            observed_rollouts=self._predictor_observed_rollouts,
+            ready=self._predictor_ready,
+            d2_checkpoint=self._d2_checkpoint(),
+        )
+        temporary_state_path = f"{state_path}.tmp-{uuid.uuid4().hex}"
+        with open(temporary_state_path, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, sort_keys=True)
+        os.replace(temporary_state_path, state_path)
+
+    def _load_checkpoint(self):
+        result = super()._load_checkpoint()
+        if not self._predictor_enabled() or self.global_steps == 0:
+            return result
+        predictor_path, state_path = self._predictor_checkpoint_paths()
+        if not os.path.exists(state_path):
+            print("Predictor checkpoint is missing; predictor lifecycle restarts in FCFS fallback mode")
+            return result
+        with open(state_path, encoding="utf-8") as stream:
+            state = json.load(stream)
+        backend = self._predictor_backend()
+        observed_rollouts, ready = validate_lifecycle_state(
+            state,
+            backend=backend,
+            d2_checkpoint=self._d2_checkpoint(),
+        )
+        if backend == LINEAR_BACKEND:
+            if not os.path.exists(predictor_path):
+                print("D1 predictor checkpoint is missing; predictor lifecycle restarts in FCFS fallback mode")
+                return result
+            self.actor_rollout_wg.load_predictor(predictor_path)
+        self._predictor_observed_rollouts = observed_rollouts
+        self._predictor_ready = ready
+        return result
+
     def _predictor_enabled(self) -> bool:
         return self._predictor_cfg().get("enable", False)
+
+    def _scheduler_name(self) -> str:
+        return str(self._predictor_cfg().get("scheduler", "static_snake"))
+
+    def _predictor_active(self, epoch: int) -> bool:
+        activation = self._predictor_cfg().get("activation", {})
+        return (
+            bool(getattr(self, "_predictor_ready", False))
+            and epoch >= int(activation.get("min_epoch", 10))
+            and getattr(self, "_predictor_observed_rollouts", 0) >= int(activation.get("min_samples", 2560))
+        )
+
+    def _attach_epws_predictions(self, gen_batch: DataProto, epoch: int) -> DataProto:
+        """Attach token-scale work only after the train-only activation gates pass."""
+        active = self._predictor_active(epoch)
+        if active:
+            predictor_output = self.actor_rollout_wg.compute_predictor_score(gen_batch)
+            ready = bool(predictor_output.meta_info.get("predictor_ready", False))
+            if ready:
+                gen_batch = gen_batch.union(predictor_output)
+            else:
+                active = False
+        gen_batch.meta_info["epws_predictor_active"] = active
+        return gen_batch
 
     def _build_predictor_order(self, gen_batch: DataProto) -> torch.Tensor:
         """Compute predictor scores and build snake-sort reorder indices."""
@@ -297,7 +386,11 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             )
 
             predictor_output = self.actor_rollout_wg.update_predictor(prompt_batch, batch)
-        metrics.update(reduce_metrics(predictor_output.meta_info.get("metrics", {})))
+        predictor_metrics = reduce_metrics(predictor_output.meta_info.get("metrics", {}))
+        metrics.update(predictor_metrics)
+        self._predictor_observed_rollouts += int(predictor_metrics.get("predictor/observed_rollouts", 0))
+        self._predictor_ready = bool(predictor_metrics.get("predictor/calibration_ready", 0.0))
+        metrics["predictor/observed_rollouts_cumulative"] = self._predictor_observed_rollouts
 
     def fit(self):
         """
@@ -322,6 +415,8 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         self.global_steps = 0
         self.gen_steps = 0
         self.max_steps_duration = 0
+        self._predictor_observed_rollouts = 0
+        self._predictor_ready = False
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -390,11 +485,25 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
 
                 with marked_timer("step", timing_raw):
                     with marked_timer("predictor_score", timing_raw, "purple"):
-                        with marked_timer("predictor_hydrate", timing_raw, "purple"):
-                            predictor_input_batch = gen_batch_output.select(deepcopy=True)
-                            predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
-                        predictor_order = self._build_predictor_order(predictor_input_batch)
-                        self._apply_predictor_order(gen_batch_output, predictor_order)
+                        if self._scheduler_name() == "epws":
+                            predictor_order = None
+                            if self._predictor_active(epoch):
+                                with marked_timer("predictor_hydrate", timing_raw, "purple"):
+                                    predictor_input_batch = gen_batch_output.select(deepcopy=True)
+                                    predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
+                                gen_batch_output = self._attach_epws_predictions(predictor_input_batch, epoch)
+                            else:
+                                # Cold start is a true zero-predictor path: no
+                                # prompt hydration and no actor forward.
+                                gen_batch_output.meta_info["epws_predictor_active"] = False
+                        elif self._scheduler_name() == "static_snake":
+                            with marked_timer("predictor_hydrate", timing_raw, "purple"):
+                                predictor_input_batch = gen_batch_output.select(deepcopy=True)
+                                predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
+                            predictor_order = self._build_predictor_order(predictor_input_batch)
+                            self._apply_predictor_order(gen_batch_output, predictor_order)
+                        else:
+                            raise ValueError("trainer.predictor_reorder.scheduler must be 'epws' or 'static_snake'")
                         # print(f'predictor_scores{predictor_scores}')
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
