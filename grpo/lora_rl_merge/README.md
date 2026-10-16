@@ -152,4 +152,6 @@ python3 "$VERL_DIR/examples/data_preprocess/gsm8k.py" --local_save_dir "$WORK_DI
 日志仅脱敏两处内部 IP，101 个指标行保持原样，见[脱敏记录](https://github.com/xchencehn/verl-ascend-recipe/blob/0fbc67b7bc66b925c8c1d72ed06de8e28ce107b4/lora_rl_merge/evidence/910b3-100step/log_sanitization.json)。
 第 100 步比第 80 步低 8.42 个百分点，不能把第 100 步称为最佳 checkpoint，后期退化原因仍未确定。
 本次没有从 checkpoint 100 实际恢复，也没有 GPU 对照、八卡或 A3 验证。
-现有结果满足 issue 无 GPU 标杆时的训练指标要求；正式完成仍需 PR 合入及实践文档提交到 issue。
+现有结果满足 issue 无 GPU 标杆时的训练指标要求；实践文档已提交到
+[issue #78](https://github.com/verl-project/verl-ascend-recipe/issues/78#issuecomment-5633188810)，
+PR 合入及正式验收仍待完成。
