@@ -1,0 +1,4 @@
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=3e4edb6e3d6872ad8aa21af83e98ee6e1bea19a2
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@3e4edb6e3d6872ad8aa21af83e98ee6e1bea19a2
