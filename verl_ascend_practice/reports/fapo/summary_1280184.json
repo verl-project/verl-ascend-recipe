@@ -1,0 +1,16 @@
+{
+  "job_id": 1280184,
+  "steps": 100,
+  "devices_total": 16,
+  "raw_log_sha256": "aa016a83f80cdd681bba6cc261cc6515b57d06ec4467ed15a74e18cb9d9736e2",
+  "sum_step_seconds": 7290.245627959259,
+  "mean_step_seconds": 72.90245627959258,
+  "total_tokens": 13931414.0,
+  "weighted_tokens_per_second_per_device": 119.43539620402841,
+  "weighted_tokens_per_second_all_devices": 1910.9663392644545,
+  "reward_first10": -1.065026092529297,
+  "reward_last10": -0.4473686218261719,
+  "throughput_min": 94.09581892534882,
+  "throughput_max": 164.9689769855581,
+  "exit_code": 0
+}
