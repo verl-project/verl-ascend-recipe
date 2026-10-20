@@ -1,0 +1,130 @@
+diff --git a/examples/blackbox_recipes/claude_code/reward.py b/examples/blackbox_recipes/claude_code/reward.py
+index a4a78c00821a57e8c58ece528ce518bbc75b20a4..919d53d85dfa577fa41f497de887ad822c4eac36 100644
+--- a/examples/blackbox_recipes/claude_code/reward.py
++++ b/examples/blackbox_recipes/claude_code/reward.py
+@@ -50,11 +50,13 @@ async def evaluate_in_env(
+     data_source = metadata.get("data_source", "unknown")
+     reward_model = metadata.get("reward_model", {})
+ 
+-    if data_source != "swe_bench":
++    if data_source == "swe_bench":
++        from uni_agent.tasks.swe_bench.reward import compute_reward
++    elif data_source == "swe_rebench":
++        from uni_agent.tasks.swe_rebench.reward import compute_reward
++    else:
+         raise ValueError(f"Unsupported reward data source: {data_source}")
+ 
+-    from uni_agent.tasks.swe_bench.reward import compute_reward
+-
+     spec_metadata = reward_model.get("ground_truth", reward_model)
+     result = await compute_reward(spec_metadata, env, eval_timeout=eval_timeout)
+     score = 1.0 if result.get("resolved", False) else 0.0
+diff --git a/uni_agent/framework/framework.py b/uni_agent/framework/framework.py
+index 777311cd3c4672d9f688b0c3171ef2e778412b9e..d8aaa96b4ae81a0c7b785ddfa15bec1f338a205d 100644
+--- a/uni_agent/framework/framework.py
++++ b/uni_agent/framework/framework.py
+@@ -764,7 +764,13 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+                     for traj, (score, extra) in zip(session_trajectories, annotations, strict=True)
+                 ]
+ 
+-            self._log_trajectory_summary(session_id, result_trajectories)
++            self._log_trajectory_summary(
++                session_id,
++                result_trajectories,
++                sample_fields,
++                sample_index=sample_index,
++                session_index=session_index,
++            )
+             if run_dir is not None:
+                 await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
+             return result_trajectories, sample_fields
+@@ -802,18 +808,74 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+             # that is the expected outcome.
+             pass
+ 
+-    def _log_trajectory_summary(self, session_id: str, trajectories: list[Trajectory]) -> None:
++    @staticmethod
++    def _get_rollout_instance_id(sample_fields: dict[str, object]) -> str:
++        def nested_get(value: object, *path: str) -> object | None:
++            current = value
++            for key in path:
++                if not isinstance(current, dict):
++                    return None
++                current = current.get(key)
++            return current
++
++        candidates = (
++            sample_fields.get("instance_id"),
++            nested_get(sample_fields, "tools_kwargs", "task", "metadata", "instance_id"),
++            nested_get(sample_fields, "tools_kwargs", "reward", "metadata", "ground_truth", "instance_id"),
++            nested_get(sample_fields, "tools_kwargs", "reward", "metadata", "instance_id"),
++            nested_get(sample_fields, "reward_model", "ground_truth", "instance_id"),
++            nested_get(sample_fields, "extra_info", "instance_id"),
++        )
++        for candidate in candidates:
++            if candidate is not None and str(candidate):
++                return str(candidate)
++        return ""
++
++    def _log_trajectory_summary(
++        self,
++        session_id: str,
++        trajectories: list[Trajectory],
++        sample_fields: dict[str, object],
++        *,
++        sample_index: int,
++        session_index: int,
++    ) -> None:
+         """Log a per-session trajectory summary -- the info the task layer can't emit,
+         since trajectories exist only after the session finalizes."""
++        instance_id = self._get_rollout_instance_id(sample_fields)
++        uid = str(sample_fields.get("uid", ""))
+         lines = [f"session {session_id}: {len(trajectories)} trajectory(ies)"]
+         for i, traj in enumerate(trajectories):
+             model_tokens = sum(traj.response_mask) if traj.response_mask else 0
+-            finished = traj.reward_info.get("finished")
+             reason = (traj.extra_fields or {}).get("materialization_reason")
++            reward_info = dict(traj.reward_info or {})
++            eval_report = reward_info.get("eval_report")
++            if not isinstance(eval_report, dict):
++                eval_report = {}
++            rollout_record = {
++                "instance_id": instance_id,
++                "uid": uid,
++                "session_id": session_id,
++                "sample_index": sample_index,
++                "session_index": session_index,
++                "trajectory_index": i,
++                "num_turns": traj.num_turns,
++                "prompt_tokens": len(traj.prompt_ids),
++                "response_tokens": len(traj.response_ids),
++                "model_tokens": model_tokens,
++                "total_tokens": len(traj.prompt_ids) + len(traj.response_ids),
++                "reward_score": traj.reward_score,
++                "claude_code_exit_code": reward_info.get("claude_code_exit_code"),
++                "eval_completed": reward_info.get("eval_completed"),
++                "eval_execution_time": reward_info.get("eval_execution_time"),
++                "resolved": reward_info.get("resolved"),
++                "found_eval_status": eval_report.get("found_eval_status"),
++                "materialization_reason": reason,
++            }
++            print(f"[ROLLOUT_SAMPLE] {json.dumps(rollout_record, ensure_ascii=False, default=str)}", flush=True)
+             lines.append(
+                 f"  [{i}] turns={traj.num_turns} prompt_tokens={len(traj.prompt_ids)} "
+                 f"response_tokens={len(traj.response_ids)} model_tokens={model_tokens} "
+-                f"finished={finished} "
+                 f"logprobs={'yes' if traj.response_logprobs else 'no'} "
+                 f"experts={'yes' if traj.routed_experts is not None else 'no'} "
+                 f"reward_score={traj.reward_score} reward_info={traj.reward_info or {}}"
+diff --git a/uni_agent/sandbox/openyuanrong.py b/uni_agent/sandbox/openyuanrong.py
+index 44edc4aa95cc105739960a7ffd761509def4ed76..453fdc8954e231c4787298f013e6abb13c152dc9 100644
+--- a/uni_agent/sandbox/openyuanrong.py
++++ b/uni_agent/sandbox/openyuanrong.py
+@@ -22,6 +22,7 @@ if TYPE_CHECKING:
+     from .base import SandboxConfig
+ 
+ logger = logging.getLogger(__name__)
++logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+ 
+ _sdk_initialized = False
+ 

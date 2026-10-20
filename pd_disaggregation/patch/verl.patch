@@ -1,0 +1,2087 @@
+diff --git a/tests/workers/rollout/test_pd_disaggregation.py b/tests/workers/rollout/test_pd_disaggregation.py
+index 616abc2ce74a3a0c6618125e4e612987e7dec540..a4ee1a706343e2d33c2a74c3000336e989938d60 100644
+--- a/tests/workers/rollout/test_pd_disaggregation.py
++++ b/tests/workers/rollout/test_pd_disaggregation.py
+@@ -28,6 +28,10 @@ def test_disaggregation_defaults_disabled_and_valid():
+     assert cfg.transfer_backend == "nixl"
+     assert cfg.bootstrap_port is None
+     assert cfg.ib_device is None
++    assert cfg.prefill_gpu_memory_utilization is None
++    assert cfg.decode_gpu_memory_utilization is None
++    assert cfg.prefill_engine_kwargs == {}
++    assert cfg.decode_engine_kwargs == {}
+ 
+ 
+ def test_disaggregation_enabled_nixl_accepted():
+@@ -57,6 +61,34 @@ def test_disaggregation_bad_bootstrap_port_rejected():
+         DisaggregationConfig(enabled=True, bootstrap_port=70000)
+ 
+ 
++@pytest.mark.parametrize("field", ["prefill_gpu_memory_utilization", "decode_gpu_memory_utilization"])
++@pytest.mark.parametrize("value", [0, -0.1, 1.1])
++def test_disaggregation_bad_role_gpu_memory_utilization_rejected(field, value):
++    with pytest.raises(ValueError, match=field):
++        DisaggregationConfig(enabled=True, **{field: value})
++
++
++@pytest.mark.parametrize("role", ["prefill", "decode"])
++@pytest.mark.parametrize("field", ["max_num_batched_tokens", "max_num_seqs"])
++@pytest.mark.parametrize("value", [0, -1, 1.5, True])
++def test_disaggregation_bad_role_engine_integer_rejected(role, field, value):
++    with pytest.raises(ValueError, match=field):
++        DisaggregationConfig(enabled=True, **{f"{role}_engine_kwargs": {field: value}})
++
++
++def test_disaggregation_role_engine_kwargs_rejects_unsupported_fields():
++    with pytest.raises(ValueError, match="unsupported prefill_engine_kwargs"):
++        DisaggregationConfig(enabled=True, prefill_engine_kwargs={"unsupported": 1})
++
++
++def test_disaggregation_role_engine_kwargs_rejects_invalid_scheduler_limits():
++    with pytest.raises(ValueError, match="must be >= max_num_seqs"):
++        DisaggregationConfig(
++            enabled=True,
++            decode_engine_kwargs={"max_num_batched_tokens": 64, "max_num_seqs": 128},
++        )
++
++
+ def test_disaggregation_disabled_skips_validation():
+     """When enabled=False, even bad values are tolerated (matches YAML defaults)."""
+     cfg = DisaggregationConfig(enabled=False, transfer_backend="bogus", bootstrap_port=70000)
+@@ -145,15 +177,8 @@ def _assign_pd_role(rollout_rank: int, prefill_tp: int, decode_replicas: int, de
+     [
+         (1, 3, 1, 0, ("prefill", 0, 0)),
+         (1, 3, 1, 1, ("decode", 0, 0)),
+-        (1, 3, 1, 2, ("decode", 1, 0)),
+-        (1, 3, 1, 3, ("decode", 2, 0)),
+-        (1, 7, 1, 0, ("prefill", 0, 0)),
+-        (1, 7, 1, 7, ("decode", 6, 0)),
+-        (2, 3, 2, 0, ("prefill", 0, 0)),
+         (2, 3, 2, 1, ("prefill", 0, 1)),
+         (2, 3, 2, 2, ("decode", 0, 0)),
+-        (2, 3, 2, 3, ("decode", 0, 1)),
+-        (2, 3, 2, 6, ("decode", 2, 0)),
+         (2, 3, 2, 7, ("decode", 2, 1)),
+     ],
+ )
+@@ -161,7 +186,10 @@ def test_pd_role_assignment(prefill_tp, decode_replicas, decode_tp, rollout_rank
+     assert _assign_pd_role(rollout_rank, prefill_tp, decode_replicas, decode_tp) == expected
+ 
+ 
+-@pytest.mark.parametrize("prefill_tp,decode_replicas,decode_tp", [(1, 3, 1), (1, 7, 1), (2, 3, 2), (1, 1, 4)])
++@pytest.mark.parametrize(
++    "prefill_tp,decode_replicas,decode_tp",
++    [(1, 3, 1), (2, 3, 2), (1, 1, 4)],
++)
+ def test_pd_role_covers_every_rank_exactly_once(prefill_tp, decode_replicas, decode_tp):
+     world = prefill_tp + decode_replicas * decode_tp
+     seen: set[tuple[str, int, int]] = set()
+diff --git a/tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py b/tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py
+index 524ef43e1759a1c7afddef8820cce5eed782c996..b008d468ee20000052cdb2bcc58ec11476324e26 100644
+--- a/tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py
++++ b/tests/workers/rollout/test_vllm_pd_disaggregation_on_cpu.py
+@@ -11,14 +11,14 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""GPU-free unit tests for vLLM PD disaggregation config + replica plumbing.
++"""Accelerator-free unit tests for vLLM PD config and replica plumbing.
+ 
+ Covers Phase 1 of the verl-vllm-pd-disagg series:
+   * ``DisaggregationConfig`` validation rules
+   * ``RolloutConfig`` post_init coercion + name-vs-disagg.enabled gate
+   * ``get_rollout_replica_class("vllm", disaggregation_enabled=True)`` resolves to ``vLLMPDReplica``
+-  * ``vLLMPDReplica`` config validation paths (NIXL-only, single-node MVP)
+-  * ``vLLMPDReplica._build_kv_transfer_config`` JSON shape
++  * ``vLLMPDReplica`` config validation paths
++  * GPU and Ascend connector selection/config shapes
+ 
+ Phase 2 (NIXL 1P:1D smoke) and Phase 3 (1P:ND scaling) add live Ray-actor and
+ vLLM-engine tests behind ``@pytest.mark.skipif(not CUDA_AVAILABLE)``.
+@@ -31,7 +31,8 @@ from unittest.mock import patch
+ 
+ import pytest
+ 
+-from verl.workers.config import DisaggregationConfig, RolloutConfig
++from verl.workers.config import DisaggregationConfig, RolloutConfig, RoutingPolicyConfig
++from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
+ 
+ # ---------------------------------------------------------------------------
+ # DisaggregationConfig validation
+@@ -54,6 +55,24 @@ def test_disaggregation_enabled_nixl_accepted():
+     assert cfg.transfer_backend == "nixl"
+ 
+ 
++def test_disaggregation_decode_policy_uses_vllm_router_defaults():
++    cfg = DisaggregationConfig(enabled=True)
++    assert cfg.decode_policy.type == "round_robin"
++    assert cfg.decode_policy.load_check_interval_secs == 5
++    assert cfg.decode_policy.virtual_nodes == 160
++    assert cfg.decode_policy.cache_threshold == 0.3
++    assert cfg.decode_policy.balance_abs_threshold == 64
++    assert cfg.decode_policy.balance_rel_threshold == 1.5
++    assert cfg.decode_policy.eviction_interval_secs == 120
++    assert cfg.decode_policy.max_tree_size == 2**26
++
++    for policy in ("random", "power_of_two", "consistent_hash", "rendezvous_hash", "cache_aware"):
++        assert DisaggregationConfig(
++            enabled=True,
++            decode_policy=RoutingPolicyConfig(type=policy),
++        ).decode_policy.type == policy
++
++
+ @pytest.mark.parametrize("backend", ["nixl", "mooncake", "ascend", "mori", "fake"])
+ def test_disaggregation_all_known_backends_pass_config_validation(backend):
+     cfg = DisaggregationConfig(enabled=True, transfer_backend=backend)
+@@ -181,6 +200,10 @@ def _build_kv_cfg(
+     engine_id: str = "test-eid",
+     transfer_backend: str = "nixl",
+     mooncake_protocol=None,
++    use_ascend_mooncake_v1: bool = False,
++    kv_port=None,
++    prefill_tp=None,
++    decode_tp=None,
+ ):
+     # Lazy import: only meaningful when vllm-rollout deps are importable.
+     pytest.importorskip("vllm")
+@@ -191,9 +214,26 @@ def _build_kv_cfg(
+         engine_id=engine_id,
+         transfer_backend=transfer_backend,
+         mooncake_protocol=mooncake_protocol,
++        use_ascend_mooncake_v1=use_ascend_mooncake_v1,
++        kv_port=kv_port,
++        prefill_tp=prefill_tp,
++        decode_tp=decode_tp,
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    "npu_available,expected",
++    [(False, False), (True, True)],
++)
++def test_ascend_detection_follows_verl_npu_availability(npu_available, expected):
++    pytest.importorskip("vllm")
++    from verl.workers.rollout.vllm_rollout import vllm_pd_replica as mod
++
++    with patch.object(mod, "is_torch_npu_available", return_value=npu_available) as is_npu:
++        assert mod.vLLMPDReplica._is_ascend_platform() is expected
++    is_npu.assert_called_once_with(check_device=False)
++
++
+ def test_build_kv_transfer_config_prefill_role_maps_to_kv_producer():
+     cfg = _build_kv_cfg(role="prefill", engine_id="e0")
+     assert cfg["kv_connector"] == "NixlConnector"
+@@ -243,6 +283,25 @@ def test_build_kv_transfer_config_mooncake_protocol_ignored_for_nixl():
+     assert "kv_connector_extra_config" not in cfg
+ 
+ 
++@pytest.mark.parametrize("role,expected_role", [("prefill", "kv_producer"), ("decode", "kv_consumer")])
++def test_build_kv_transfer_config_ascend_mooncake_v1(role, expected_role):
++    cfg = _build_kv_cfg(
++        role=role,
++        transfer_backend="mooncake",
++        use_ascend_mooncake_v1=True,
++        kv_port=19001,
++        prefill_tp=4,
++        decode_tp=2,
++    )
++    assert cfg["kv_connector"] == "MooncakeConnectorV1"
++    assert cfg["kv_role"] == expected_role
++    assert cfg["kv_port"] == 19001
++    assert cfg["kv_connector_extra_config"] == {
++        "prefill": {"dp_size": 1, "tp_size": 4},
++        "decode": {"dp_size": 1, "tp_size": 2},
++    }
++
++
+ @pytest.mark.parametrize("protocol", ["nvlink", "local", "rdma", "tcp"])
+ def test_disagg_config_accepts_known_mooncake_protocols(protocol):
+     DisaggregationConfig(enabled=True, transfer_backend="mooncake", mooncake_protocol=protocol)
+@@ -276,6 +335,10 @@ def _make_pd_config(**overrides) -> RolloutConfig:
+         decode_replicas=overrides.pop("decode_replicas", 1),
+         transfer_backend=overrides.pop("transfer_backend", "nixl"),
+         decode_tensor_model_parallel_size=overrides.pop("decode_tensor_model_parallel_size", None),
++        prefill_gpu_memory_utilization=overrides.pop("prefill_gpu_memory_utilization", None),
++        decode_gpu_memory_utilization=overrides.pop("decode_gpu_memory_utilization", None),
++        prefill_engine_kwargs=overrides.pop("prefill_engine_kwargs", {}),
++        decode_engine_kwargs=overrides.pop("decode_engine_kwargs", {}),
+         ib_device=overrides.pop("ib_device", None),
+     )
+     return RolloutConfig(
+@@ -383,18 +446,92 @@ def test_pd_replica_init_rejects_multi_prefill(patched_replica_cls):
+         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+ 
+ 
+-def test_pd_replica_init_rejects_dp_gt_1(patched_replica_cls):
+-    cfg = _make_pd_config(data_parallel_size=2)
+-    with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
+-        patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+-
+-
+ def test_pd_replica_init_rejects_oversized_world(patched_replica_cls):
+     cfg = _make_pd_config(decode_replicas=8)  # 1 + 8 = 9 GPUs needed
+     with pytest.raises(NotImplementedError, match="single-node only"):
+         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+ 
+ 
++def test_pd_role_engine_kwargs_deep_merge_without_cross_role_mutation(patched_replica_cls):
++    cfg = _make_pd_config(
++        prefill_gpu_memory_utilization=0.85,
++        decode_gpu_memory_utilization=0.7,
++        prefill_engine_kwargs={"max_num_batched_tokens": 65536, "max_num_seqs": None},
++        decode_engine_kwargs={"max_num_batched_tokens": 2048, "max_num_seqs": 256},
++        engine_kwargs={"vllm": {"max_num_seqs": 512}},
++    )
++    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
++
++    prefill = replica._build_pd_role_config("prefill", tp=1)
++    decode = replica._build_pd_role_config("decode", tp=1)
++
++    assert prefill.gpu_memory_utilization == 0.85
++    assert decode.gpu_memory_utilization == 0.7
++    assert prefill.engine_kwargs["vllm"] == {"max_num_batched_tokens": 65536, "max_num_seqs": 512}
++    assert decode.engine_kwargs["vllm"] == {"max_num_batched_tokens": 2048, "max_num_seqs": 256}
++    assert cfg.engine_kwargs["vllm"] == {"max_num_seqs": 512}
++
++
++def test_pd_replica_exposes_prefill_request_and_all_metrics_endpoints(patched_replica_cls):
++    cfg = _make_pd_config(decode_replicas=2)
++    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
++    prefill_handles = [object()]
++    replica._prefill_servers = prefill_handles
++    replica._decode_servers = [object(), object()]
++    replica._prefill_server_addresses = ["p0:8000"]
++    replica._decode_server_addresses = ["d0:8000", "d1:8000"]
++
++    assert replica.get_request_server_endpoints() == [
++        ("p0:8000", prefill_handles[0]),
++    ]
++    assert [labels["pd_role"] for _, labels in replica.get_metrics_server_endpoints()] == [
++        "prefill",
++        "decode",
++        "decode",
++    ]
++
++
++class _AwaitableRemoteMethod:
++    def __init__(self):
++        self.calls = []
++
++    def remote(self, *args, **kwargs):
++        self.calls.append((args, kwargs))
++
++        async def _done():
++            return None
++
++        return _done()
++
++
++class _SleepServerStub:
++    def __init__(self):
++        self.wait_for_requests_to_drain = _AwaitableRemoteMethod()
++        self.sleep = _AwaitableRemoteMethod()
++
++
++@pytest.mark.asyncio
++async def test_pd_sleep_drains_prefill_before_sleeping_all_servers(patched_replica_cls):
++    replica = object.__new__(patched_replica_cls)
++    prefill = _SleepServerStub()
++    decode = _SleepServerStub()
++    replica._prefill_servers = [prefill]
++    replica._prefill_server_addresses = ["p0:8000"]
++    replica.servers = [prefill, decode]
++
++    await replica.sleep()
++
++    assert len(prefill.wait_for_requests_to_drain.calls) == 1
++    assert len(prefill.sleep.calls) == 1
++    assert len(decode.sleep.calls) == 1
++
++
++def test_pd_replica_init_rejects_dp_gt_1(patched_replica_cls):
++    cfg = _make_pd_config(data_parallel_size=2)
++    with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
++        patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
++
++
+ def test_pd_replica_init_requires_disaggregation_enabled(patched_replica_cls):
+     cfg = _make_pd_config(enabled=False)
+     # RolloutConfig validation lets `name='vllm'` + `enabled=False` through
+@@ -417,10 +554,11 @@ def test_pd_replica_init_requires_disaggregation_enabled(patched_replica_cls):
+ class _DispatchStub:
+     """Minimal vLLMHttpServer-like instance for unbound-method tests."""
+ 
+-    def __init__(self, decode_peers, role="prefill", connector="NixlConnector"):
++    def __init__(self, decode_peers, role="prefill", connector="NixlConnector", policy="round_robin"):
+         self._disaggregation_role = role
+         self._pd_decode_peers = list(decode_peers)
+-        self._pd_peer_idx = 0
++        peer_ids = [f"http://decode-{index}:8000" for index in range(len(self._pd_decode_peers))]
++        self._pd_decode_selector = DecodePeerSelector(RoutingPolicyConfig(type=policy), peer_ids)
+         # Used by _pd_dispatch to branch between NIXL (read kv_transfer_params
+         # back from prefill) and Mooncake (construct it locally from prefill
+         # engine_id + bootstrap addr).
+@@ -429,13 +567,13 @@ class _DispatchStub:
+         self._pd_prefill_side_channel_host = "127.0.0.1"
+         self._pd_prefill_side_channel_port = 5559
+ 
+-    def _select_decode_peer(self):
++    def _select_decode_peer(self, routing_key, prompt_ids):
+         # Borrow the real implementation to keep the stub aligned with
+         # production rotation semantics — _pd_dispatch's behavior must not
+         # depend on the test's peer-selection policy.
+         from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+ 
+-        return vLLMHttpServer._select_decode_peer(self)
++        return vLLMHttpServer._select_decode_peer(self, routing_key, prompt_ids)
+ 
+ 
+ def _import_http_server():
+@@ -448,16 +586,15 @@ def _import_http_server():
+ def test_select_decode_peer_round_robin_cycles():
+     server_cls = _import_http_server()
+     stub = _DispatchStub(decode_peers=["peer0", "peer1", "peer2"])
+-    picks = [server_cls._select_decode_peer(stub) for _ in range(7)]
++    picks = [server_cls._select_decode_peer(stub, "session", [1])[1] for _ in range(7)]
+     assert picks == ["peer0", "peer1", "peer2", "peer0", "peer1", "peer2", "peer0"]
+-    # Internal counter advances exactly once per call.
+-    assert stub._pd_peer_idx == 7
++    assert stub._pd_decode_selector.pending_requests == [3, 2, 2]
+ 
+ 
+ def test_select_decode_peer_single_peer_returns_same():
+     server_cls = _import_http_server()
+     stub = _DispatchStub(decode_peers=["only_peer"])
+-    assert all(server_cls._select_decode_peer(stub) == "only_peer" for _ in range(5))
++    assert all(server_cls._select_decode_peer(stub, "session", [1])[1] == "only_peer" for _ in range(5))
+ 
+ 
+ def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
+@@ -467,7 +604,7 @@ def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
+     future change that randomizes for cache-locality but loses balance)."""
+     server_cls = _import_http_server()
+     stub = _DispatchStub(decode_peers=["peer0", "peer1", "peer2"])
+-    counts = Counter(server_cls._select_decode_peer(stub) for _ in range(32))
++    counts = Counter(server_cls._select_decode_peer(stub, "session", [1])[1] for _ in range(32))
+     assert sorted(counts.values()) == [10, 11, 11], (
+         f"expected (10, 11, 11) hit counts under strict round-robin, got {dict(counts)}"
+     )
+@@ -543,6 +680,7 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
+     assert dkw.kwargs["priority"] == 0
+ 
+     assert result.token_ids == expected_decode_token_ids
++    assert stub._pd_decode_selector.pending_requests == [0]
+ 
+ 
+ @pytest.mark.asyncio
+@@ -612,6 +750,38 @@ async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
+             sampling_params={"max_tokens": 8},
+             request_id="req-bare",
+         )
++    assert stub._pd_decode_selector.pending_requests == [0]
++
++
++@pytest.mark.asyncio
++async def test_pd_dispatch_releases_reservation_when_decode_is_cancelled():
++    import asyncio
++    from unittest.mock import MagicMock
++
++    from verl.workers.rollout.replica import TokenOutput
++
++    server_cls = _import_http_server()
++    decode_peer = MagicMock()
++
++    async def cancelled_decode():
++        raise asyncio.CancelledError
++
++    decode_peer.generate.remote = MagicMock(return_value=cancelled_decode())
++
++    async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
++        return TokenOutput(token_ids=[0], stop_reason="completed", extra_fields={"kv_transfer_params": {}})
++
++    stub = _DispatchStub(decode_peers=[decode_peer])
++    stub.generate = fake_generate
++
++    with pytest.raises(asyncio.CancelledError):
++        await server_cls._pd_dispatch(
++            stub,
++            prompt_ids=[1],
++            sampling_params={"max_tokens": 8},
++            request_id="req-cancelled",
++        )
++    assert stub._pd_decode_selector.pending_requests == [0]
+ 
+ 
+ def _make_awaitable_token_output(token_ids):
+diff --git a/tests/workers/rollout/test_vllm_pd_routing.py b/tests/workers/rollout/test_vllm_pd_routing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34ab03560a70d22c9f34770edabde523f62cc398
+--- /dev/null
++++ b/tests/workers/rollout/test_vllm_pd_routing.py
+@@ -0,0 +1,151 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import pytest
++
++from verl.workers.config import RoutingPolicyConfig
++from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
++
++
++class _FixedSampler:
++    def __init__(self, samples):
++        self._samples = iter(samples)
++
++    def sample(self, population, k):
++        sample = next(self._samples)
++        assert k == len(sample)
++        assert all(index in population for index in sample)
++        return list(sample)
++
++
++def test_random_selects_from_eligible_peers_only():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(type="random"),
++        ["d0", "d1", "d2"],
++        sampler=_FixedSampler([(2,)]),
++    )
++
++    assert selector.select(eligible=[1, 2]) == 2
++
++
++def test_power_of_two_selects_lower_pending_peer_and_reserves():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(type="power_of_two"),
++        ["d0", "d1", "d2"],
++        sampler=_FixedSampler([(0, 2)]),
++    )
++    selector.pending_requests[:] = [4, 0, 1]
++
++    index = selector.acquire()
++
++    assert index == 2
++    assert selector.pending_requests == [4, 0, 2]
++
++
++def test_power_of_two_only_samples_eligible_peers():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(type="power_of_two"),
++        ["d0", "d1", "d2", "d3"],
++        sampler=_FixedSampler([(1, 3)]),
++    )
++    selector.pending_requests[:] = [0, 3, 0, 1]
++
++    assert selector.select(eligible=[1, 3]) == 3
++
++
++def test_power_of_two_tie_selects_first_sample_like_vllm_router():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(type="power_of_two"),
++        ["d0", "d1"],
++        sampler=_FixedSampler([(0, 1), (0, 1)]),
++    )
++
++    assert [selector.select(), selector.select()] == [0, 0]
++
++
++def test_decode_selector_release_and_empty_eligible_guard():
++    selector = DecodePeerSelector(RoutingPolicyConfig(type="power_of_two"), ["d0"])
++    selector.acquire()
++    selector.release(0)
++
++    assert selector.pending_requests == [0]
++    with pytest.raises(RuntimeError, match="no eligible"):
++        selector.select(eligible=[])
++    with pytest.raises(RuntimeError, match="no in-flight"):
++        selector.release(0)
++
++
++def test_consistent_hash_keeps_session_on_same_peer():
++    selector = DecodePeerSelector(RoutingPolicyConfig(type="consistent_hash"), ["d0", "d1", "d2", "d3"])
++
++    picks = [selector.select(routing_key="episode-123") for _ in range(10)]
++
++    assert len(set(picks)) == 1
++
++
++def test_consistent_hash_falls_back_to_first_eligible_peer():
++    selector = DecodePeerSelector(RoutingPolicyConfig(type="consistent_hash"), ["d0", "d1", "d2"])
++    target = selector.select(routing_key="episode-123")
++    eligible = [index for index in range(3) if index != target]
++
++    assert selector.select(eligible=eligible, routing_key="episode-123") == eligible[0]
++
++
++def test_consistent_hash_honors_virtual_nodes_config():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(type="consistent_hash", virtual_nodes=7),
++        ["http://d0:8000", "http://d1:8000"],
++    )
++
++    assert len(selector._hash_ring) == 14
++
++
++def test_rendezvous_hash_keeps_session_on_same_peer():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(type="rendezvous_hash"),
++        ["http://d0:8000", "http://d1:8000", "http://d2:8000"],
++    )
++
++    picks = [selector.select(routing_key="episode-123") for _ in range(10)]
++
++    assert len(set(picks)) == 1
++
++
++def test_cache_aware_reuses_longest_prefix_when_load_is_balanced():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(type="cache_aware", eviction_interval_secs=0),
++        ["d0", "d1"],
++    )
++    prompt = list(range(100))
++
++    first = selector.select(prompt_ids=prompt)
++
++    assert selector.select(prompt_ids=prompt + [100]) == first
++
++
++def test_cache_aware_uses_shortest_queue_when_load_is_imbalanced():
++    selector = DecodePeerSelector(
++        RoutingPolicyConfig(
++            type="cache_aware",
++            balance_abs_threshold=1,
++            balance_rel_threshold=1.1,
++            eviction_interval_secs=0,
++        ),
++        ["d0", "d1"],
++    )
++    prompt = list(range(100))
++    assert selector.select(prompt_ids=prompt) == 0
++    selector.pending_requests[:] = [5, 0]
++
++    assert selector.select(prompt_ids=prompt) == 1
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index f6212520d4a734b52cd18d06fec46afd79de5834..3d3b8ffd11c32d0d358c9187f3b6546db2e20987 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -439,7 +439,17 @@ actor_rollout_ref:
+       enabled: false
+       prefill_replicas: 1
+       decode_replicas: 1
++      decode_policy:
++        type: round_robin
+       decode_tensor_model_parallel_size: null
++      prefill_gpu_memory_utilization: null
++      decode_gpu_memory_utilization: null
++      prefill_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
++      decode_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
+       transfer_backend: nixl
+       bootstrap_port: null
+       ib_device: null
+@@ -869,7 +879,17 @@ reward:
+         enabled: false
+         prefill_replicas: 1
+         decode_replicas: 1
++        decode_policy:
++          type: round_robin
+         decode_tensor_model_parallel_size: null
++        prefill_gpu_memory_utilization: null
++        decode_gpu_memory_utilization: null
++        prefill_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
++        decode_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
+         transfer_backend: nixl
+         bootstrap_port: null
+         ib_device: null
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index 2660c6b30aad562ebb16f4fdb5114dce7f116110..8c6a5c10e86bc55534321e1cd811fba8a53cc695 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -381,7 +381,17 @@ actor_rollout_ref:
+       enabled: false
+       prefill_replicas: 1
+       decode_replicas: 1
++      decode_policy:
++        type: round_robin
+       decode_tensor_model_parallel_size: null
++      prefill_gpu_memory_utilization: null
++      decode_gpu_memory_utilization: null
++      prefill_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
++      decode_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
+       transfer_backend: nixl
+       bootstrap_port: null
+       ib_device: null
+@@ -761,7 +771,17 @@ reward:
+         enabled: false
+         prefill_replicas: 1
+         decode_replicas: 1
++        decode_policy:
++          type: round_robin
+         decode_tensor_model_parallel_size: null
++        prefill_gpu_memory_utilization: null
++        decode_gpu_memory_utilization: null
++        prefill_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
++        decode_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
+         transfer_backend: nixl
+         bootstrap_port: null
+         ib_device: null
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index 0452deaf11d3a3ac908aef6315c99c23faa262bd..4f6a4d902fba8f8c98a416cd5b60df7e1600fc13 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -392,7 +392,17 @@ actor_rollout_ref:
+       enabled: false
+       prefill_replicas: 1
+       decode_replicas: 1
++      decode_policy:
++        type: round_robin
+       decode_tensor_model_parallel_size: null
++      prefill_gpu_memory_utilization: null
++      decode_gpu_memory_utilization: null
++      prefill_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
++      decode_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
+       transfer_backend: nixl
+       bootstrap_port: null
+       ib_device: null
+@@ -785,7 +795,17 @@ reward:
+         enabled: false
+         prefill_replicas: 1
+         decode_replicas: 1
++        decode_policy:
++          type: round_robin
+         decode_tensor_model_parallel_size: null
++        prefill_gpu_memory_utilization: null
++        decode_gpu_memory_utilization: null
++        prefill_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
++        decode_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
+         transfer_backend: nixl
+         bootstrap_port: null
+         ib_device: null
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index 6f45f69fc55c68c62cf79b9fd1b62dc1d89e2311..bc0bdbb8462a4a9605a8911127c149b16dec870e 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -397,7 +397,17 @@ actor_rollout_ref:
+       enabled: false
+       prefill_replicas: 1
+       decode_replicas: 1
++      decode_policy:
++        type: round_robin
+       decode_tensor_model_parallel_size: null
++      prefill_gpu_memory_utilization: null
++      decode_gpu_memory_utilization: null
++      prefill_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
++      decode_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
+       transfer_backend: nixl
+       bootstrap_port: null
+       ib_device: null
+@@ -792,7 +802,17 @@ reward:
+         enabled: false
+         prefill_replicas: 1
+         decode_replicas: 1
++        decode_policy:
++          type: round_robin
+         decode_tensor_model_parallel_size: null
++        prefill_gpu_memory_utilization: null
++        decode_gpu_memory_utilization: null
++        prefill_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
++        decode_engine_kwargs:
++          max_num_batched_tokens: null
++          max_num_seqs: null
+         transfer_backend: nixl
+         bootstrap_port: null
+         ib_device: null
+diff --git a/verl/trainer/config/reward/reward.yaml b/verl/trainer/config/reward/reward.yaml
+index 6553e56737ed1ba4fce7b2875e9e93db08fe5c9c..ff58fef37887bc76f7366b6fc321e8e3ddc76e36 100644
+--- a/verl/trainer/config/reward/reward.yaml
++++ b/verl/trainer/config/reward/reward.yaml
+@@ -79,7 +79,17 @@ reward_model:
+       enabled: false
+       prefill_replicas: 1
+       decode_replicas: 1
++      decode_policy:
++        type: round_robin
+       decode_tensor_model_parallel_size: null
++      prefill_gpu_memory_utilization: null
++      decode_gpu_memory_utilization: null
++      prefill_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
++      decode_engine_kwargs:
++        max_num_batched_tokens: null
++        max_num_seqs: null
+       transfer_backend: nixl
+       bootstrap_port: null
+       ib_device: null
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index cbf45e2e8b03004cd7ad4a87087f0d6ce21ada5b..f78a0df9767f3a651a7900d4b1317e7d46c04e7d 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -461,7 +461,7 @@ mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
+ # QAT configuration (inherited from actor's engine config)
+ qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
+ 
+-# Prefill-Decode disaggregation (SGLang only; keep rollout.name=sglang and toggle enabled=True).
++# Prefill-Decode disaggregation.
+ disaggregation:
+ 
+   # Master switch for PD disaggregation.
+@@ -473,9 +473,27 @@ disaggregation:
+   # Number of decode replicas.
+   decode_replicas: 1
+ 
++  # P-to-D routing policy. round_robin preserves the original Verl behavior.
++  # Other supported values: random, power_of_two, consistent_hash,
++  # rendezvous_hash, cache_aware.
++  decode_policy:
++    type: round_robin
++
+   # Decode TP override; null = same as tensor_model_parallel_size.
+   decode_tensor_model_parallel_size: null
+ 
++  # Per-role memory utilization; null inherits rollout.gpu_memory_utilization.
++  prefill_gpu_memory_utilization: null
++  decode_gpu_memory_utilization: null
++
++  # Per-role vLLM kwargs, deep-merged over rollout.engine_kwargs.vllm.
++  prefill_engine_kwargs:
++    max_num_batched_tokens: null
++    max_num_seqs: null
++  decode_engine_kwargs:
++    max_num_batched_tokens: null
++    max_num_seqs: null
++
+   # KV cache transport: nixl | mooncake | ascend | mori | fake.
+   transfer_backend: nixl
+ 
+diff --git a/verl/workers/config/disaggregation.py b/verl/workers/config/disaggregation.py
+index a98e954d0996789df11f2044128f6dc468a9286b..98ca3a9d4a463d2f943a766b7272f3155469b905 100644
+--- a/verl/workers/config/disaggregation.py
++++ b/verl/workers/config/disaggregation.py
+@@ -11,15 +11,55 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-from dataclasses import dataclass
+-from typing import Optional
++from dataclasses import dataclass, field
++from typing import Any, Optional
+ 
+ from verl.base_config import BaseConfig
+ 
+-__all__ = ["DisaggregationConfig"]
++__all__ = ["DisaggregationConfig", "RoutingPolicyConfig"]
+ 
+ _ALLOWED_BACKENDS = ("nixl", "mooncake", "ascend", "mori", "fake")
+ _ALLOWED_MOONCAKE_PROTOCOLS = ("nvlink", "local", "rdma", "tcp")
++_ALLOWED_ROUTING_POLICIES = (
++    "random",
++    "round_robin",
++    "cache_aware",
++    "power_of_two",
++    "consistent_hash",
++    "rendezvous_hash",
++)
++
++
++@dataclass
++class RoutingPolicyConfig(BaseConfig):
++    """Decode routing settings aligned with vLLM Router policy names."""
++
++    type: str = "round_robin"
++    load_check_interval_secs: int = 5
++    virtual_nodes: int = 160
++    cache_threshold: float = 0.3
++    balance_abs_threshold: int = 64
++    balance_rel_threshold: float = 1.5
++    eviction_interval_secs: int = 120
++    max_tree_size: int = 2**26
++
++    def __post_init__(self) -> None:
++        if self.type not in _ALLOWED_ROUTING_POLICIES:
++            raise ValueError(f"routing policy type={self.type!r} not in {_ALLOWED_ROUTING_POLICIES}")
++        if self.load_check_interval_secs < 0:
++            raise ValueError("load_check_interval_secs must be non-negative")
++        if self.virtual_nodes < 1:
++            raise ValueError("virtual_nodes must be positive")
++        if not 0 <= self.cache_threshold <= 1:
++            raise ValueError("cache_threshold must be in [0, 1]")
++        if self.balance_abs_threshold < 0:
++            raise ValueError("balance_abs_threshold must be non-negative")
++        if self.balance_rel_threshold <= 0:
++            raise ValueError("balance_rel_threshold must be positive")
++        if self.eviction_interval_secs < 0:
++            raise ValueError("eviction_interval_secs must be non-negative")
++        if self.max_tree_size < 0:
++            raise ValueError("max_tree_size must be non-negative")
+ 
+ 
+ @dataclass
+@@ -30,12 +70,19 @@ class DisaggregationConfig(BaseConfig):
+     prefill_replicas: int = 1
+     decode_replicas: int = 1
+     decode_tensor_model_parallel_size: Optional[int] = None
++    prefill_gpu_memory_utilization: Optional[float] = None
++    decode_gpu_memory_utilization: Optional[float] = None
++    prefill_engine_kwargs: dict[str, Any] = field(default_factory=dict)
++    decode_engine_kwargs: dict[str, Any] = field(default_factory=dict)
+     transfer_backend: str = "nixl"
+     bootstrap_port: Optional[int] = None
+     ib_device: Optional[str] = None
+     mooncake_protocol: str = "nvlink"
++    decode_policy: RoutingPolicyConfig = field(default_factory=RoutingPolicyConfig)
+ 
+     def __post_init__(self) -> None:
++        if not isinstance(self.decode_policy, RoutingPolicyConfig):
++            object.__setattr__(self, "decode_policy", RoutingPolicyConfig(**dict(self.decode_policy)))
+         if not self.enabled:
+             return
+         if self.transfer_backend not in _ALLOWED_BACKENDS:
+@@ -45,6 +92,39 @@ class DisaggregationConfig(BaseConfig):
+                 f"disaggregation requires >=1 prefill and >=1 decode replica "
+                 f"(got prefill_replicas={self.prefill_replicas}, decode_replicas={self.decode_replicas})"
+             )
++        for role, value in (
++            ("prefill", self.prefill_gpu_memory_utilization),
++            ("decode", self.decode_gpu_memory_utilization),
++        ):
++            if value is not None and not 0 < value <= 1:
++                raise ValueError(f"{role}_gpu_memory_utilization must be in (0, 1], got {value}")
++        for role, engine_kwargs in (
++            ("prefill", self.prefill_engine_kwargs),
++            ("decode", self.decode_engine_kwargs),
++        ):
++            if not isinstance(engine_kwargs, dict):
++                raise TypeError(f"{role}_engine_kwargs must be a dict, got {type(engine_kwargs).__name__}")
++            unsupported_fields = set(engine_kwargs) - {"max_num_batched_tokens", "max_num_seqs"}
++            if unsupported_fields:
++                raise ValueError(
++                    f"unsupported {role}_engine_kwargs fields: {sorted(unsupported_fields)}; "
++                    "only max_num_batched_tokens and max_num_seqs are supported"
++                )
++            for field_name in ("max_num_batched_tokens", "max_num_seqs"):
++                value = engine_kwargs.get(field_name)
++                if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
++                    raise ValueError(f"{role}_engine_kwargs.{field_name} must be a positive integer, got {value!r}")
++            max_num_batched_tokens = engine_kwargs.get("max_num_batched_tokens")
++            max_num_seqs = engine_kwargs.get("max_num_seqs")
++            if (
++                max_num_batched_tokens is not None
++                and max_num_seqs is not None
++                and max_num_batched_tokens < max_num_seqs
++            ):
++                raise ValueError(
++                    f"{role}_engine_kwargs.max_num_batched_tokens must be >= max_num_seqs "
++                    f"(got {max_num_batched_tokens} < {max_num_seqs})"
++                )
+         if self.bootstrap_port is not None and not (0 < self.bootstrap_port < 65536):
+             raise ValueError(f"bootstrap_port out of range: {self.bootstrap_port}")
+         if self.transfer_backend == "mooncake" and self.mooncake_protocol not in _ALLOWED_MOONCAKE_PROTOCOLS:
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index d9beede7531d55247751ac2aa6295e68c680ec75..faadeb6395204fa92d2aa2d149791f7319840ff0 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -271,6 +271,9 @@ class LLMServerClient:
+             priority_kwargs = (
+                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
+             )
++            rollout_config = self.config.actor_rollout_ref.rollout
++            if rollout_config.name == "vllm" and rollout_config.disaggregation.enabled:
++                kwargs.setdefault("routing_key", request_id)
+             output: TokenOutput = await server.generate.remote(
+                 request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+                 prompt_ids=prompt_ids,
+@@ -576,10 +579,26 @@ class LLMServerManager:
+         else:
+             await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
+ 
+-        self.server_handles = [server._server_handle for server in self.rollout_replicas]
+-        self.server_addresses = [server._server_address for server in self.rollout_replicas]
++        request_endpoints = [
++            (replica, endpoint_index, address, handle)
++            for replica in self.rollout_replicas
++            for endpoint_index, (address, handle) in enumerate(replica.get_request_server_endpoints())
++        ]
++        self.server_addresses = [address for _, _, address, _ in request_endpoints]
++        self.server_handles = [handle for _, _, _, handle in request_endpoints]
+         print(f"LLMServerManager: {self.server_addresses}")
+ 
++        metrics_endpoints = [
++            (replica, address, endpoint_labels)
++            for replica in self.rollout_replicas
++            for address, endpoint_labels in replica.get_metrics_server_endpoints()
++        ]
++        metrics_addresses = [address for _, address, _ in metrics_endpoints]
++        metrics_labels = [
++            {"replica": replica.replica_rank, **endpoint_labels}
++            for replica, _, endpoint_labels in metrics_endpoints
++        ]
++
+         # Update Prometheus / rl-insight metrics with server addresses
+         needs_metrics = self.rollout_config.prometheus.enable or RLInsightLogger.enabled()
+         if self.rollout_config.disable_log_stats:
+@@ -588,13 +607,16 @@ class LLMServerManager:
+         if not self.rollout_config.disable_log_stats:
+             if self.rollout_config.prometheus.enable:
+                 update_prometheus_config(
+-                    self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name
++                    self.rollout_config.prometheus,
++                    metrics_addresses,
++                    self.rollout_config.name,
++                    labels=metrics_labels,
+                 )
+             if RLInsightLogger.enabled():
+                 RLInsightLogger.register_rollout_metrics(
+-                    self.server_addresses,
++                    metrics_addresses,
+                     self.rollout_config.name,
+-                    labels=[{"replica": server.replica_rank} for server in self.rollout_replicas],
++                    labels=metrics_labels,
+                 )
+ 
+     async def _init_global_load_balancer(self) -> None:
+diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
+index 22bb8667c11184904ecbb952a6929c7acd55bc72..b2a4071ca89902806179e7ac68aaa2c932e8c2cf 100644
+--- a/verl/workers/rollout/replica.py
++++ b/verl/workers/rollout/replica.py
+@@ -253,6 +253,22 @@ class RolloutReplica(ABC):
+         """Get rollout server handle for Token-in-token-out generation."""
+         return self._server_handle
+ 
++    def get_request_server_endpoints(self) -> list[tuple[str, ActorHandle]]:
++        """Return all endpoints that accept generation requests."""
++        if self._server_address is None or self._server_handle is None:
++            raise RuntimeError("rollout server has not been launched")
++        return [(self._server_address, self._server_handle)]
++
++    def get_metrics_server_endpoints(self) -> list[tuple[str, dict[str, Any]]]:
++        """Return metrics endpoints and their additional labels."""
++        return [
++            (
++                address,
++                {"request_endpoint": index, "pd_role": "unified", "pd_index": index},
++            )
++            for index, (address, _) in enumerate(self.get_request_server_endpoints())
++        ]
++
+     @property
+     def max_concurrency(self) -> int:
+         # 1000 is Ray's default max_concurrency for async execution.
+diff --git a/verl/workers/rollout/utils.py b/verl/workers/rollout/utils.py
+index 06a1daefeef62249390a5d5c8bb1d4fa7b376788..cdf54d63e6e3ab6b88ab9ac666525b29c1d82d2c 100644
+--- a/verl/workers/rollout/utils.py
++++ b/verl/workers/rollout/utils.py
+@@ -138,20 +138,41 @@ def get_vision_placeholder_token_ids(processor) -> list[int]:
+     return token_ids
+ 
+ 
+-def update_prometheus_config(config: PrometheusConfig, server_addresses: list[str], rollout_name: str | None = None):
++def update_prometheus_config(
++    config: PrometheusConfig,
++    server_addresses: list[str],
++    rollout_name: str | None = None,
++    labels: list[dict[str, object] | None] | None = None,
++):
+     """
+     Update Prometheus configuration file with server addresses and reload on first node.
+ 
+     server_addresses: vllm or sglang server addresses
+ 
+     rollout_name: name of the rollout backend (e.g., "vllm", "sglang")
++
++    labels: optional Prometheus labels for each server address
+     """
+ 
+     if not server_addresses:
+         logger.warning("No server addresses available to update Prometheus config")
+         return
+ 
++    if labels is not None and len(labels) != len(server_addresses):
++        raise ValueError(
++            f"The number of metric labels ({len(labels)}) must match "
++            f"the number of server addresses ({len(server_addresses)})"
++        )
++
+     try:
++        if labels is None:
++            rollout_static_configs = [{"targets": server_addresses}]
++        else:
++            rollout_static_configs = [
++                {"targets": [address], "labels": endpoint_labels or {}}
++                for address, endpoint_labels in zip(server_addresses, labels, strict=True)
++            ]
++
+         # Get Prometheus config file path from environment or use default
+         prometheus_config_json = {
+             "global": {"scrape_interval": "10s", "evaluation_interval": "10s"},
+@@ -160,7 +181,7 @@ def update_prometheus_config(config: PrometheusConfig, server_addresses: list[st
+                     "job_name": "ray",
+                     "file_sd_configs": [{"files": ["/tmp/ray/prom_metrics_service_discovery.json"]}],
+                 },
+-                {"job_name": "rollout", "static_configs": [{"targets": server_addresses}]},
++                {"job_name": "rollout", "static_configs": rollout_static_configs},
+             ],
+         }
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/pd_routing.py b/verl/workers/rollout/vllm_rollout/pd_routing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cbdcdc9eb44c09102ff1795d7af25c2568dd6429
+--- /dev/null
++++ b/verl/workers/rollout/vllm_rollout/pd_routing.py
+@@ -0,0 +1,362 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Decode routing policies for vLLM prefill-decode disaggregation.
++
++The policy names, configuration fields, defaults, and selection semantics are
++adapted from ``vllm-project/router``. Verl routes token IDs between Ray actors,
++so cache-aware routing indexes token prefixes instead of raw prompt text and
++uses actor-local in-flight counters as the vLLM Router ``Worker.load()`` value.
++"""
++
++from __future__ import annotations
++
++import bisect
++import random
++import time
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass, field
++from typing import Any, Protocol
++
++from verl.workers.config.disaggregation import RoutingPolicyConfig
++
++__all__ = ["DecodePeerSelector"]
++
++
++class _Sampler(Protocol):
++    def sample(self, population: Sequence[int], k: int) -> list[int]: ...
++
++
++@dataclass(eq=False)
++class _RadixNode:
++    text: tuple[int, ...]
++    parent: _RadixNode | None
++    children: dict[int, _RadixNode] = field(default_factory=dict)
++    tenant_access: dict[int, int] = field(default_factory=dict)
++
++
++class _TokenRadixTree:
++    """Compressed, multi-tenant radix tree adapted from vLLM Router's Tree."""
++
++    def __init__(self, num_tenants: int):
++        self._epoch = 0
++        self.root = _RadixNode((), None, tenant_access={tenant: 0 for tenant in range(num_tenants)})
++        self.tenant_sizes = [0] * num_tenants
++
++    @staticmethod
++    def _shared_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
++        return next(
++            (index for index, pair in enumerate(zip(left, right, strict=False)) if pair[0] != pair[1]),
++            min(len(left), len(right)),
++        )
++
++    def _next_epoch(self) -> int:
++        self._epoch += 1
++        return self._epoch
++
++    def insert(self, token_ids: Sequence[int], tenant: int) -> None:
++        tokens = tuple(token_ids)
++        epoch = self._next_epoch()
++        if not tokens:
++            self.root.tenant_access[tenant] = epoch
++            return
++
++        parent = self.root
++        offset = 0
++        while offset < len(tokens):
++            first_token = tokens[offset]
++            child = parent.children.get(first_token)
++            if child is None:
++                segment = tokens[offset:]
++                parent.children[first_token] = _RadixNode(segment, parent, tenant_access={tenant: epoch})
++                self.tenant_sizes[tenant] += len(segment)
++                return
++
++            shared = self._shared_prefix_len(tokens[offset:], child.text)
++            if shared < len(child.text):
++                prefix = child.text[:shared]
++                suffix = child.text[shared:]
++                split = _RadixNode(prefix, parent, {suffix[0]: child}, dict(child.tenant_access))
++                parent.children[first_token] = split
++                child.text = suffix
++                child.parent = split
++
++                if tenant not in split.tenant_access:
++                    split.tenant_access[tenant] = 0
++                    self.tenant_sizes[tenant] += len(prefix)
++
++                offset += shared
++                if offset == len(tokens):
++                    split.tenant_access[tenant] = epoch
++                    return
++
++                segment = tokens[offset:]
++                split.children[segment[0]] = _RadixNode(segment, split, tenant_access={tenant: epoch})
++                self.tenant_sizes[tenant] += len(segment)
++                return
++
++            if tenant not in child.tenant_access:
++                child.tenant_access[tenant] = 0
++                self.tenant_sizes[tenant] += len(child.text)
++            offset += shared
++            parent = child
++
++        parent.tenant_access[tenant] = epoch
++
++    def prefix_match(self, token_ids: Sequence[int]) -> tuple[int, int]:
++        node = self.root
++        offset = 0
++        while offset < len(token_ids):
++            child = node.children.get(token_ids[offset])
++            if child is None:
++                break
++            shared = self._shared_prefix_len(token_ids[offset:], child.text)
++            offset += shared
++            node = child
++            if shared < len(child.text):
++                break
++        return max(node.tenant_access, key=node.tenant_access.get), offset
++
++    def evict_tenant_by_size(self, tenant: int, max_size: int) -> None:
++        while self.tenant_sizes[tenant] > max_size:
++            leaves: list[_RadixNode] = []
++            stack = list(self.root.children.values())
++            while stack:
++                node = stack.pop()
++                stack.extend(node.children.values())
++                if tenant in node.tenant_access and not any(
++                    tenant in child.tenant_access for child in node.children.values()
++                ):
++                    leaves.append(node)
++            if not leaves:
++                return
++
++            leaf = min(leaves, key=lambda node: node.tenant_access[tenant])
++            del leaf.tenant_access[tenant]
++            self.tenant_sizes[tenant] = max(0, self.tenant_sizes[tenant] - len(leaf.text))
++            if not leaf.tenant_access and not leaf.children and leaf.parent is not None:
++                del leaf.parent.children[leaf.text[0]]
++
++
++def _murmur_hash_64a(key: bytes, seed: int = 4193360111) -> int:
++    mask = (1 << 64) - 1
++    multiplier = 0xC6A4A7935BD1E995
++    shift = 47
++    value = (seed ^ (len(key) * multiplier)) & mask
++    chunk_end = len(key) - len(key) % 8
++    for offset in range(0, chunk_end, 8):
++        chunk = int.from_bytes(key[offset : offset + 8], "little")
++        chunk = (chunk * multiplier) & mask
++        chunk ^= chunk >> shift
++        chunk = (chunk * multiplier) & mask
++        value ^= chunk
++        value = (value * multiplier) & mask
++
++    remainder = key[chunk_end:]
++    for index, byte in enumerate(remainder):
++        value ^= byte << (index * 8)
++    if remainder:
++        value = (value * multiplier) & mask
++    value ^= value >> shift
++    value = (value * multiplier) & mask
++    value ^= value >> shift
++    return value & mask
++
++
++def _murmur_rehash_64a(key: int) -> int:
++    return _murmur_hash_64a(key.to_bytes(8, "little"))
++
++
++def _furc_get_bit(key: bytes, index: int, hash_cache: list[int]) -> bool:
++    order = index >> 6
++    while len(hash_cache) <= order:
++        hash_cache.append(_murmur_hash_64a(key) if not hash_cache else _murmur_rehash_64a(hash_cache[-1]))
++    return bool((hash_cache[order] >> (index & 0x3F)) & 1)
++
++
++def _furc_hash(key: bytes, modulus: int) -> int:
++    if modulus <= 1:
++        return 0
++    depth = 0
++    while modulus > 1 << depth:
++        depth += 1
++    index = depth
++    hash_cache: list[int] = []
++    for _ in range(32):
++        while not _furc_get_bit(key, index, hash_cache):
++            if depth == 0:
++                return 0
++            depth -= 1
++            index = depth
++        index += 23
++        value = 1
++        for _ in range(max(0, depth - 1)):
++            value = (value << 1) | _furc_get_bit(key, index, hash_cache)
++            index += 23
++        if value < modulus:
++            return value
++    return 0
++
++
++def _fbi_hash(key: str) -> int:
++    furc_result = _furc_hash(key.encode(), (1 << 23) - 1)
++    return _murmur_hash_64a(furc_result.to_bytes(4, "little"))
++
++
++def _policy_config(config: RoutingPolicyConfig | Mapping[str, Any]) -> RoutingPolicyConfig:
++    return config if isinstance(config, RoutingPolicyConfig) else RoutingPolicyConfig(**dict(config))
++
++
++class DecodePeerSelector:
++    """Select a decode peer with vLLM Router-compatible policy semantics."""
++
++    def __init__(
++        self,
++        policy_config: RoutingPolicyConfig | Mapping[str, Any],
++        peer_ids: Sequence[str],
++        sampler: _Sampler = random,
++    ):
++        if not peer_ids:
++            raise ValueError("peer_ids must not be empty")
++        if len(set(peer_ids)) != len(peer_ids):
++            raise ValueError("peer_ids must be unique")
++
++        self.config = _policy_config(policy_config)
++        self.peer_ids = tuple(peer_ids)
++        self.pending_requests = [0] * len(peer_ids)
++        self._sampler = sampler
++        self._round_robin_cursor = 0
++        self._hash_ring = (
++            sorted(
++                (_fbi_hash(f"{peer_id}:{virtual_node}"), index)
++                for index, peer_id in enumerate(self.peer_ids)
++                for virtual_node in range(self.config.virtual_nodes)
++            )
++            if self.config.type == "consistent_hash"
++            else []
++        )
++        self._hash_points = [point for point, _ in self._hash_ring]
++        self._cache_tree = _TokenRadixTree(len(peer_ids)) if self.config.type == "cache_aware" else None
++        self._last_eviction = time.monotonic()
++
++    def acquire(
++        self,
++        *,
++        routing_key: str | None = None,
++        prompt_ids: Sequence[int] | None = None,
++        eligible: Sequence[int] | None = None,
++    ) -> int:
++        index = self.select(routing_key=routing_key, prompt_ids=prompt_ids, eligible=eligible)
++        self.pending_requests[index] += 1
++        return index
++
++    def select(
++        self,
++        *,
++        routing_key: str | None = None,
++        prompt_ids: Sequence[int] | None = None,
++        eligible: Sequence[int] | None = None,
++    ) -> int:
++        candidates = list(range(len(self.pending_requests))) if eligible is None else list(eligible)
++        self._validate_candidates(candidates)
++
++        policy = self.config.type
++        if policy == "random":
++            return self._sampler.sample(candidates, 1)[0]
++        if policy == "round_robin":
++            selected = candidates[self._round_robin_cursor % len(candidates)]
++            self._round_robin_cursor += 1
++            return selected
++        if policy == "power_of_two":
++            return self._select_power_of_two(candidates)
++        if policy in ("consistent_hash", "rendezvous_hash"):
++            if routing_key is None:
++                raise ValueError(f"{policy} requires routing_key")
++            if policy == "consistent_hash":
++                return self._select_consistent_hash(candidates, routing_key)
++            return max(candidates, key=lambda index: _fbi_hash(f"{routing_key}:{self.peer_ids[index]}"))
++        if prompt_ids is None:
++            raise ValueError("cache_aware requires prompt_ids")
++        return self._select_cache_aware(candidates, prompt_ids)
++
++    def _validate_candidates(self, candidates: Sequence[int]) -> None:
++        if not candidates:
++            raise RuntimeError("no eligible decode peer")
++        if len(set(candidates)) != len(candidates):
++            raise ValueError("eligible decode peer indices must be unique")
++        if any(index < 0 or index >= len(self.pending_requests) for index in candidates):
++            raise ValueError(f"eligible decode peer index out of range: {candidates}")
++
++    def _select_power_of_two(self, candidates: Sequence[int]) -> int:
++        if len(candidates) == 1:
++            return candidates[0]
++        first, second = self._sampler.sample(candidates, 2)
++        return first if self.pending_requests[first] <= self.pending_requests[second] else second
++
++    def _select_consistent_hash(self, candidates: Sequence[int], routing_key: str) -> int:
++        if not self._hash_ring:
++            raise RuntimeError("consistent-hash ring is not initialized")
++        position = bisect.bisect_left(self._hash_points, _fbi_hash(routing_key))
++        if position == len(self._hash_ring):
++            position = 0
++        selected = self._hash_ring[position][1]
++        return selected if selected in candidates else candidates[0]
++
++    def _select_cache_aware(self, candidates: Sequence[int], prompt_ids: Sequence[int]) -> int:
++        if self._cache_tree is None:
++            raise RuntimeError("cache-aware radix tree is not initialized")
++        self._evict_cache_if_due()
++        candidate_loads = [self.pending_requests[index] for index in candidates]
++        min_load = min(candidate_loads)
++        max_load = max(candidate_loads)
++        imbalanced = (
++            max_load - min_load > self.config.balance_abs_threshold
++            and max_load > min_load * self.config.balance_rel_threshold
++        )
++
++        if imbalanced:
++            selected = min(candidates, key=self.pending_requests.__getitem__)
++        else:
++            matched_tenant, matched_tokens = self._cache_tree.prefix_match(prompt_ids)
++            match_rate = matched_tokens / len(prompt_ids) if prompt_ids else 0.0
++            if match_rate > self.config.cache_threshold and matched_tenant in candidates:
++                selected = matched_tenant
++            elif match_rate > self.config.cache_threshold:
++                selected = candidates[0]
++            else:
++                selected = min(candidates, key=self.pending_requests.__getitem__)
++
++        self._cache_tree.insert(prompt_ids, selected)
++        return selected
++
++    def _evict_cache_if_due(self) -> None:
++        if self._cache_tree is None:
++            return
++        interval = self.config.eviction_interval_secs
++        now = time.monotonic()
++        if interval <= 0 or now - self._last_eviction < interval:
++            return
++        for tenant in range(len(self.pending_requests)):
++            self._cache_tree.evict_tenant_by_size(tenant, self.config.max_tree_size)
++        self._last_eviction = now
++
++    def release(self, index: int) -> None:
++        if self.pending_requests[index] < 1:
++            raise RuntimeError(f"decode peer {index} has no in-flight request to release")
++        self.pending_requests[index] -= 1
++
++    def clear_cache(self) -> None:
++        if self._cache_tree is not None:
++            self._cache_tree = _TokenRadixTree(len(self.pending_requests))
++            self._last_eviction = time.monotonic()
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 730bc606e0ec1df23c18db3be0823eb409468cce..83659a56590878658e408b7ac7428a8c4b6a242d 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -18,6 +18,7 @@ import json
+ import logging
+ import os
+ import uuid
++from collections.abc import Sequence
+ from pprint import pprint
+ from typing import Any, Callable, Optional
+ 
+@@ -53,6 +54,7 @@ from verl.workers.rollout.utils import (
+     qwen2_5_vl_dedup_image_tokens,
+     run_uvicorn,
+ )
++from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
+ from verl.workers.rollout.vllm_rollout.utils import (
+     VLLM_LORA_INT_ID,
+     VLLM_LORA_NAME,
+@@ -94,6 +96,7 @@ class vLLMHttpServer:
+         cuda_visible_devices: str,
+         disaggregation_role: str = "null",
+         disaggregation_kv_transfer_config: Optional[dict] = None,
++        disaggregation_index: int = -1,
+     ):
+         """
+         Args:
+@@ -107,6 +110,7 @@ class vLLMHttpServer:
+             cuda_visible_devices (str): cuda visible devices.
+             disaggregation_role: PD role, or ``"null"`` for normal rollout.
+             disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
++            disaggregation_index: Index within the prefill or decode pool.
+         """
+         if disaggregation_role not in ("null", "prefill", "decode"):
+             raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
+@@ -120,10 +124,12 @@ class vLLMHttpServer:
+         self._pd_decode_peers: list[ActorHandle] = []
+         self._pd_prefill_side_channel_port: Optional[int] = None
+         self._pd_prefill_engine_id: Optional[str] = None
+-        self._pd_peer_idx: int = 0
++        self._pd_decode_selector: Optional[DecodePeerSelector] = None
+ 
+         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
++        os.environ["VERL_PD_ROLE"] = "unified" if disaggregation_role == "null" else disaggregation_role
++        os.environ["VERL_PD_INDEX"] = str(disaggregation_index)
+         # Forward the Ray job id into the vLLM worker subprocess so the
+         # colocated weight-transfer IPC socket path is unique per Ray job.
+         # Without this, two concurrent verl jobs on the same node both bind
+@@ -234,8 +240,19 @@ class vLLMHttpServer:
+         )
+         assert isinstance(decode_peers, list) and decode_peers, "decode_peers must be a non-empty list"
+         self._pd_decode_peers = list(decode_peers)
++        decode_addresses = await asyncio.gather(
++            *[decode_peer.get_server_address.remote() for decode_peer in decode_peers]
++        )
++        decode_peer_ids = [
++            f"http://[{host}]:{port}" if is_valid_ipv6_address(host) else f"http://{host}:{port}"
++            for host, port in decode_addresses
++        ]
+         self._pd_prefill_side_channel_port = prefill_side_channel_port
+         self._pd_prefill_engine_id = prefill_engine_id
++        self._pd_decode_selector = DecodePeerSelector(
++            policy_config=self.config.disaggregation.decode_policy,
++            peer_ids=decode_peer_ids,
++        )
+ 
+     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+         if self.node_rank != 0:
+@@ -519,12 +536,15 @@ class vLLMHttpServer:
+         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+         priority: int = 0,
+         kv_transfer_params: Optional[dict] = None,
++        routing_key: Optional[str] = None,
+     ) -> TokenOutput:
+         """Generate sequence with token-in-token-out.
+ 
+         Args:
+             kv_transfer_params: vLLM KV-transfer payload for PD requests.
++            routing_key: Stable session identifier for hash-based decode routing.
+         """
++        prompt_ids = normalize_token_ids(prompt_ids)
+         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+             return await self._pd_dispatch(
+                 prompt_ids,
+@@ -535,10 +555,9 @@ class vLLMHttpServer:
+                 audio_data=audio_data,
+                 mm_processor_kwargs=mm_processor_kwargs,
+                 priority=priority,
++                routing_key=routing_key,
+             )
+ 
+-        prompt_ids = normalize_token_ids(prompt_ids)
+-
+         # Calculate the maximum possible new tokens based on available context space
+         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
+         # (see vllm.sampling_params.SamplingParams._verify_args), so we require at
+@@ -695,11 +714,11 @@ class vLLMHttpServer:
+             extra_fields=extra_fields,
+         )
+ 
+-    def _select_decode_peer(self) -> ActorHandle:
+-        """Round-robin across decode peers."""
+-        peer = self._pd_decode_peers[self._pd_peer_idx % len(self._pd_decode_peers)]
+-        self._pd_peer_idx += 1
+-        return peer
++    def _select_decode_peer(self, routing_key: str, prompt_ids: Sequence[int]) -> tuple[int, ActorHandle]:
++        if self._pd_decode_selector is None:
++            raise RuntimeError("decode peer selector is not initialized")
++        index = self._pd_decode_selector.acquire(routing_key=routing_key, prompt_ids=prompt_ids)
++        return index, self._pd_decode_peers[index]
+ 
+     async def _pd_dispatch(
+         self,
+@@ -711,72 +730,77 @@ class vLLMHttpServer:
+         audio_data: Optional[list[Any]] = None,
+         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+         priority: int = 0,
++        routing_key: Optional[str] = None,
+     ) -> TokenOutput:
+-        """Run prefill locally, then decode on a selected peer."""
+-        decode_peer = self._select_decode_peer()
+-        connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
+-        is_mooncake = connector == "MooncakeConnector"
+-
+-        # Prefill only materializes KV; discard its single generated token.
+-        prefill_sp = dict(sampling_params)
+-        prefill_sp.pop("max_tokens", None)
+-        prefill_sp.pop("max_new_tokens", None)
+-        prefill_sp["max_tokens"] = 1
+-        transfer_id = uuid.uuid4().hex
+-        prefill_kv_params = {
+-            "do_remote_decode": True,
+-            "do_remote_prefill": False,
+-            "transfer_id": transfer_id,
+-        }
+-
+-        prefill_out = await self.generate(
+-            prompt_ids,
+-            prefill_sp,
+-            f"{request_id}_P",
+-            image_data=image_data,
+-            video_data=video_data,
+-            audio_data=audio_data,
+-            mm_processor_kwargs=mm_processor_kwargs,
+-            priority=priority,
+-            kv_transfer_params=prefill_kv_params,
+-        )
+-        if is_mooncake:
+-            # Mooncake does not return decode params from the prefill leg.
+-            decode_kv_params = {
+-                "do_remote_decode": False,
+-                "do_remote_prefill": True,
+-                "remote_engine_id": self._pd_prefill_engine_id,
+-                # Single-node PD uses Mooncake's local bootstrap address.
+-                "remote_bootstrap_addr": f"http://127.0.0.1:{self._pd_prefill_side_channel_port}",
++        """Reserve a decode peer, run prefill locally, then dispatch decode."""
++        effective_routing_key = routing_key or request_id
++        decode_peer_index, decode_peer = self._select_decode_peer(effective_routing_key, prompt_ids)
++        assert self._pd_decode_selector is not None
++        try:
++            connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
++            is_mooncake = connector == "MooncakeConnector"
++
++            prefill_sp = dict(sampling_params)
++            prefill_sp.pop("max_tokens", None)
++            prefill_sp.pop("max_new_tokens", None)
++            prefill_sp["max_tokens"] = 1
++            transfer_id = uuid.uuid4().hex
++            prefill_kv_params = {
++                "do_remote_decode": True,
++                "do_remote_prefill": False,
+                 "transfer_id": transfer_id,
+             }
+-        else:
+-            decode_kv_params = prefill_out.extra_fields.get("kv_transfer_params")
+-            if decode_kv_params is None:
+-                raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
+-
+-        return await decode_peer.generate.remote(
+-            prompt_ids,
+-            dict(sampling_params),
+-            f"{request_id}_D",
+-            image_data=image_data,
+-            video_data=video_data,
+-            audio_data=audio_data,
+-            mm_processor_kwargs=mm_processor_kwargs,
+-            priority=priority,
+-            kv_transfer_params=decode_kv_params,
+-        )
++
++            prefill_out = await self.generate(
++                prompt_ids,
++                prefill_sp,
++                f"{request_id}_P",
++                image_data=image_data,
++                video_data=video_data,
++                audio_data=audio_data,
++                mm_processor_kwargs=mm_processor_kwargs,
++                priority=priority,
++                kv_transfer_params=prefill_kv_params,
++            )
++            if is_mooncake:
++                decode_kv_params = {
++                    "do_remote_decode": False,
++                    "do_remote_prefill": True,
++                    "remote_engine_id": self._pd_prefill_engine_id,
++                    "remote_bootstrap_addr": f"http://127.0.0.1:{self._pd_prefill_side_channel_port}",
++                    "transfer_id": transfer_id,
++                }
++            else:
++                decode_kv_params = prefill_out.extra_fields.get("kv_transfer_params")
++                if decode_kv_params is None:
++                    raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
++
++            return await decode_peer.generate.remote(
++                prompt_ids,
++                dict(sampling_params),
++                f"{request_id}_D",
++                image_data=image_data,
++                video_data=video_data,
++                audio_data=audio_data,
++                mm_processor_kwargs=mm_processor_kwargs,
++                priority=priority,
++                kv_transfer_params=decode_kv_params,
++            )
++        finally:
++            self._pd_decode_selector.release(decode_peer_index)
+ 
+     async def wake_up(self, tags: list[str] | None = None):
+         if self.node_rank != 0:
+             return
+ 
++        cache_invalidated = False
+         if self.rollout_mode == RolloutMode.HYBRID:
+             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
+             # processes across all DP shards (unlike collective_rpc which only reaches
+             # TP workers within a single shard).
+             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+             await self.engine.reset_prefix_cache(reset_connector=True)
++            cache_invalidated = True
+         elif self.rollout_mode == RolloutMode.COLOCATED:
+             # Directly call engine to wake up without sync weights.
+             await self.engine.wake_up(tags=self._get_wake_up_tags())
+@@ -785,19 +809,27 @@ class vLLMHttpServer:
+             # against the previous weights. No-op success when no connector
+             # is configured (vLLM scheduler treats it as such).
+             await self.engine.reset_prefix_cache(reset_connector=True)
++            cache_invalidated = True
+         elif self.rollout_mode == RolloutMode.STANDALONE:
+             logger.info("skip wake_up in standalone mode")
++        if cache_invalidated and self._pd_decode_selector is not None:
++            self._pd_decode_selector.clear_cache()
+ 
+     async def sleep(self):
+         if self.node_rank != 0 or not self.config.free_cache_engine:
+             return
+ 
++        cache_invalidated = False
+         if self.rollout_mode == RolloutMode.HYBRID:
+             await self._sleep_hybrid()
++            cache_invalidated = True
+         elif self.rollout_mode == RolloutMode.COLOCATED:
+             await self.engine.sleep(level=1)
++            cache_invalidated = True
+         elif self.rollout_mode == RolloutMode.STANDALONE:
+             logger.info("skip sleep in standalone mode")
++        if cache_invalidated and self._pd_decode_selector is not None:
++            self._pd_decode_selector.clear_cache()
+ 
+     async def clear_kv_cache(self):
+         if self.node_rank == 0:
+@@ -809,6 +841,8 @@ class vLLMHttpServer:
+ 
+             await self.engine.reset_mm_cache()
+             await self.engine.reset_encoder_cache()
++            if self._pd_decode_selector is not None:
++                self._pd_decode_selector.clear_cache()
+ 
+     async def release_kv_cache(self):
+         """Release only kv_cache GPU memory, keeping model weights intact.
+@@ -1199,8 +1233,11 @@ class vLLMReplica(RolloutReplica):
+ 
+     async def sleep(self):
+         """Sleep each rollout server."""
+-        # Drain DP engines for safe sleep.
+-        await self.servers[0].wait_for_requests_to_drain.remote()
++        # A prefill request remains in flight until its decode leg returns, so
++        # draining every request ingress is sufficient before all P/D engines sleep.
++        await asyncio.gather(
++            *[server.wait_for_requests_to_drain.remote() for _, server in self.get_request_server_endpoints()]
++        )
+         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+ 
+     async def abort_all_requests(self) -> dict[str, Any]:
+@@ -1247,7 +1284,9 @@ class vLLMReplica(RolloutReplica):
+     async def release_kv_cache(self):
+         # Drain all in-flight requests so that vLLM worker threads go idle
+         # before we touch engine.release_kv_cache()
+-        await self.servers[0].wait_for_requests_to_drain.remote()
++        await asyncio.gather(
++            *[server.wait_for_requests_to_drain.remote() for _, server in self.get_request_server_endpoints()]
++        )
+         await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+ 
+     # -----------------------------------------------------------------------
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_pd_replica.py b/verl/workers/rollout/vllm_rollout/vllm_pd_replica.py
+index 5a3846716d0440e733454fed42f458cac76f7789..2b447acc460d0c48e8965821115807b05f54cfdd 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_pd_replica.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_pd_replica.py
+@@ -11,15 +11,21 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""vLLM PD-disaggregated replica: 1 prefill + N decode servers per replica,
+-asymmetric TP supported. MVP: prefill_replicas=1, single-node only."""
++"""vLLM PD-disaggregated replica with one prefill and N decode servers.
++
++Asymmetric TP is supported, and the complete PD replica must fit on one node.
++GPU keeps vLLM's native NIXL/Mooncake connectors; Ascend uses
++vLLM-Ascend's MooncakeConnectorV1.
++"""
+ 
+ import asyncio
++import copy
+ import logging
+ import os
+ import uuid
++from collections.abc import Mapping
+ from dataclasses import replace as _dc_replace
+-from typing import Optional
++from typing import Any, Optional
+ 
+ import ray
+ from ray.actor import ActorHandle
+@@ -33,6 +39,30 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(logging.INFO)
+ 
+ 
++def _deep_merge_dict(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
++    """Return a recursive merge without mutating either input."""
++    merged = {key: copy.deepcopy(value) for key, value in base.items()}
++    for key, value in overrides.items():
++        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
++            merged[key] = _deep_merge_dict(merged[key], value)
++        else:
++            merged[key] = copy.deepcopy(value)
++    return merged
++
++
++def _drop_none_values(values: Mapping[str, Any]) -> dict[str, Any]:
++    """Remove unset Hydra schema values before applying role overrides."""
++    result: dict[str, Any] = {}
++    for key, value in values.items():
++        if isinstance(value, Mapping):
++            nested = _drop_none_values(value)
++            if nested:
++                result[key] = nested
++        elif value is not None:
++            result[key] = value
++    return result
++
++
+ class vLLMPDReplica(vLLMReplica):
+     """Replica that runs vLLM in prefill-decode disaggregated mode."""
+ 
+@@ -100,12 +130,21 @@ class vLLMPDReplica(vLLMReplica):
+ 
+         self._prefill_servers: list[ActorHandle] = []
+         self._decode_servers: list[ActorHandle] = []
++        self._prefill_server_addresses: list[str] = []
++        self._decode_server_addresses: list[str] = []
+ 
+     async def launch_servers(self):
+         assert len(self.workers) == self.world_size, (
+             f"worker count {len(self.workers)} != PD world size {self.world_size}"
+         )
+-        assert not is_torch_npu_available(check_device=False), "vLLM PD on NPU not validated"
++        use_ascend_mooncake_v1 = self._is_ascend_platform()
++        transfer_backend = self.config.disaggregation.transfer_backend
++        if use_ascend_mooncake_v1 and transfer_backend == "nixl":
++            logger.warning(
++                "NixlConnector is not supported for Ascend PD; falling back to "
++                "MooncakeConnectorV1"
++            )
++            transfer_backend = "mooncake"
+ 
+         worker_infos = await asyncio.gather(
+             *[
+@@ -120,16 +159,13 @@ class vLLMPDReplica(vLLMReplica):
+             ]
+         )
+ 
+-        # Bind the side-channel on the prefill worker's node.
+         prefill_host_ip = worker_infos[0][2]
+         prefill_engine_id = uuid.uuid4().hex
+-
+         prefill_end = self._prefill_tp
+-        prefill_workers = self.workers[0:prefill_end]
++        prefill_workers = self.workers[:prefill_end]
+         prefill_node_id = worker_infos[0][0]
+-        prefill_devs = self._collect_cuda_devices(worker_infos[0:prefill_end])
++        prefill_devs = self._collect_cuda_devices(worker_infos[:prefill_end])
+ 
+-        # Keep side-channel sockets reserved until all actors bind.
+         reserved_socks = []
+         prefill_side_channel_port, prefill_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
+         reserved_socks.append(prefill_sock)
+@@ -137,12 +173,17 @@ class vLLMPDReplica(vLLMReplica):
+             prefill_kv_cfg = self._build_kv_transfer_config(
+                 role="prefill",
+                 engine_id=prefill_engine_id,
+-                transfer_backend=self.config.disaggregation.transfer_backend,
++                transfer_backend=transfer_backend,
+                 mooncake_protocol=self.config.disaggregation.mooncake_protocol,
++                use_ascend_mooncake_v1=use_ascend_mooncake_v1,
++                kv_port=prefill_side_channel_port,
++                prefill_tp=self._prefill_tp,
++                decode_tp=self._decode_tp,
+             )
+             self._prefill_servers = [
+                 self._spawn_pd_server(
+                     role="prefill",
++                    pd_index=0,
+                     workers=prefill_workers,
+                     node_id=prefill_node_id,
+                     cuda_visible_devices=prefill_devs,
+@@ -168,12 +209,17 @@ class vLLMPDReplica(vLLMReplica):
+                 decode_kv_cfg = self._build_kv_transfer_config(
+                     role="decode",
+                     engine_id=uuid.uuid4().hex,
+-                    transfer_backend=self.config.disaggregation.transfer_backend,
++                    transfer_backend=transfer_backend,
+                     mooncake_protocol=self.config.disaggregation.mooncake_protocol,
++                    use_ascend_mooncake_v1=use_ascend_mooncake_v1,
++                    kv_port=decode_side_channel_port,
++                    prefill_tp=self._prefill_tp,
++                    decode_tp=self._decode_tp,
+                 )
+                 self._decode_servers.append(
+                     self._spawn_pd_server(
+                         role="decode",
++                        pd_index=i,
+                         workers=workers_i,
+                         node_id=node_id_i,
+                         cuda_visible_devices=devs_i,
+@@ -198,30 +244,77 @@ class vLLMPDReplica(vLLMReplica):
+                 sock.close()
+ 
+         await self._prefill_servers[0].set_pd_peer.remote(
+-            self._decode_servers,
+-            prefill_side_channel_port,
+-            prefill_engine_id,
++            decode_peers=self._decode_servers,
++            prefill_side_channel_port=prefill_side_channel_port,
++            prefill_engine_id=prefill_engine_id,
+         )
+ 
+         self.servers = list(self._prefill_servers) + list(self._decode_servers)
+-        prefill_address, prefill_port = await self._prefill_servers[0].get_server_address.remote()
+-        self._server_handle = self._prefill_servers[0]
+-        self._server_address = (
+-            f"[{prefill_address}]:{prefill_port}"
+-            if is_valid_ipv6_address(prefill_address)
+-            else f"{prefill_address}:{prefill_port}"
++        prefill_addresses = await asyncio.gather(
++            *[server.get_server_address.remote() for server in self._prefill_servers]
+         )
++        decode_addresses = await asyncio.gather(
++            *[server.get_server_address.remote() for server in self._decode_servers]
++        )
++        self._prefill_server_addresses = [
++            f"[{host}]:{port}" if is_valid_ipv6_address(host) else f"{host}:{port}"
++            for host, port in prefill_addresses
++        ]
++        self._decode_server_addresses = [
++            f"[{host}]:{port}" if is_valid_ipv6_address(host) else f"{host}:{port}"
++            for host, port in decode_addresses
++        ]
++        self._server_handle = self._prefill_servers[0]
++        self._server_address = self._prefill_server_addresses[0]
+ 
+         logger.info(
+-            "vLLMPDReplica rank=%s launched: prefill=%s (engine_id=%s, side_channel=%s:%d), decodes=%d",
++            "vLLMPDReplica rank=%s launched: prefills=%s, decodes=%s",
+             self.replica_rank,
+-            self._server_address,
+-            prefill_engine_id,
+-            prefill_host_ip,
+-            prefill_side_channel_port,
+-            len(self._decode_servers),
++            self._prefill_server_addresses,
++            self._decode_server_addresses,
+         )
+ 
++    def get_request_server_endpoints(self) -> list[tuple[str, ActorHandle]]:
++        """Expose every prefill server to the session-aware request router."""
++        if not self._prefill_servers or len(self._prefill_server_addresses) != len(self._prefill_servers):
++            raise RuntimeError("PD prefill servers have not been launched")
++        return list(zip(self._prefill_server_addresses, self._prefill_servers, strict=True))
++
++    async def sleep(self):
++        """Drain PD requests, then sleep all P/D servers."""
++        await asyncio.gather(
++            *[server.wait_for_requests_to_drain.remote() for _, server in self.get_request_server_endpoints()]
++        )
++        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
++
++    def get_metrics_server_endpoints(self) -> list[tuple[str, dict[str, Any]]]:
++        """Expose all P/D vLLM metrics endpoints without changing request routing."""
++        if len(self._prefill_server_addresses) != len(self._prefill_servers):
++            raise RuntimeError("PD prefill metrics endpoints are not ready")
++        if len(self._decode_server_addresses) != len(self._decode_servers):
++            raise RuntimeError("PD decode metrics endpoints are not ready")
++        return [
++            *[
++                (
++                    address,
++                    {"request_endpoint": index, "pd_role": "prefill", "pd_index": index},
++                )
++                for index, address in enumerate(self._prefill_server_addresses)
++            ],
++            *[
++                (
++                    address,
++                    {"request_endpoint": -1, "pd_role": "decode", "pd_index": index},
++                )
++                for index, address in enumerate(self._decode_server_addresses)
++            ],
++        ]
++
++    @staticmethod
++    def _is_ascend_platform() -> bool:
++        """Follow Verl's existing NPU availability convention."""
++        return is_torch_npu_available(check_device=False)
++
+     @staticmethod
+     def _collect_cuda_devices(worker_infos) -> str:
+         return ",".join(worker_info[1] for worker_info in worker_infos)
+@@ -232,29 +325,79 @@ class vLLMPDReplica(vLLMReplica):
+         engine_id: str,
+         transfer_backend: str,
+         mooncake_protocol: Optional[str] = None,
++        use_ascend_mooncake_v1: bool = False,
++        kv_port: Optional[int] = None,
++        prefill_tp: Optional[int] = None,
++        decode_tp: Optional[int] = None,
+     ) -> dict:
+         """Assemble vLLM's ``--kv-transfer-config`` payload."""
+         role_to_kv_role = {
+             "prefill": "kv_producer",
+             "decode": "kv_consumer",
+         }
+-        connector = {
+-            "nixl": "NixlConnector",
+-            "mooncake": "MooncakeConnector",
+-        }[transfer_backend]
++        if use_ascend_mooncake_v1:
++            if transfer_backend != "mooncake":
++                raise ValueError("Ascend PD requires transfer_backend='mooncake'")
++            if kv_port is None or prefill_tp is None or decode_tp is None:
++                raise ValueError(
++                    "MooncakeConnectorV1 requires kv_port, prefill_tp, and decode_tp"
++                )
++            connector = "MooncakeConnectorV1"
++        else:
++            connector = {
++                "nixl": "NixlConnector",
++                "mooncake": "MooncakeConnector",
++            }[transfer_backend]
+         cfg: dict = {
+             "kv_connector": connector,
+             "kv_role": role_to_kv_role[role],
+             "engine_id": engine_id,
+             "kv_buffer_device": get_device_name(),
+         }
+-        if transfer_backend == "mooncake" and mooncake_protocol:
++        if use_ascend_mooncake_v1:
++            cfg["kv_port"] = kv_port
++            cfg["kv_connector_extra_config"] = {
++                "prefill": {"dp_size": 1, "tp_size": prefill_tp},
++                "decode": {"dp_size": 1, "tp_size": decode_tp},
++            }
++        elif transfer_backend == "mooncake" and mooncake_protocol:
+             cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
+         return cfg
+ 
++    def _build_pd_role_config(self, role: str, tp: int) -> RolloutConfig:
++        """Apply role-local vLLM settings without mutating the shared config."""
++        if role not in ("prefill", "decode"):
++            raise ValueError(f"unknown PD role: {role!r}")
++
++        disagg = self.config.disaggregation
++        role_gpu_memory_utilization = (
++            disagg.prefill_gpu_memory_utilization
++            if role == "prefill"
++            else disagg.decode_gpu_memory_utilization
++        )
++        role_engine_kwargs = (
++            disagg.prefill_engine_kwargs if role == "prefill" else disagg.decode_engine_kwargs
++        )
++        engine_kwargs = copy.deepcopy(self.config.engine_kwargs)
++        global_vllm_kwargs = engine_kwargs.get("vllm", {}) or {}
++        role_engine_kwargs = _drop_none_values(role_engine_kwargs or {})
++        engine_kwargs["vllm"] = _deep_merge_dict(global_vllm_kwargs, role_engine_kwargs)
++
++        return _dc_replace(
++            self.config,
++            tensor_model_parallel_size=tp,
++            gpu_memory_utilization=(
++                role_gpu_memory_utilization
++                if role_gpu_memory_utilization is not None
++                else self.config.gpu_memory_utilization
++            ),
++            engine_kwargs=engine_kwargs,
++        )
++
+     def _spawn_pd_server(
+         self,
+         role: str,
++        pd_index: int,
+         workers: list[ActorHandle],
+         node_id: str,
+         cuda_visible_devices: str,
+@@ -267,7 +410,7 @@ class vLLMPDReplica(vLLMReplica):
+         zmq_base_trainer_rank: int = 0,
+     ) -> ActorHandle:
+         """Construct one PD ``vLLMHttpServer`` actor."""
+-        per_role_config = _dc_replace(self.config, tensor_model_parallel_size=tp)
++        per_role_config = self._build_pd_role_config(role, tp)
+ 
+         env_vars = {
+             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+@@ -301,5 +444,6 @@ class vLLMPDReplica(vLLMReplica):
+             nnodes=1,
+             cuda_visible_devices=cuda_visible_devices,
+             disaggregation_role=role,
++            disaggregation_index=pd_index,
+             disaggregation_kv_transfer_config=kv_transfer_config,
+         )
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout.py b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+index 6e9be3bb8da42d80f0804c72e2d63deb2644b7b0..785037a9acec90d18792260d046c1be10f3e4ac6 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+@@ -88,8 +88,7 @@ class ServerAdapter(BaseRollout):
+ 
+         # Map each trainer rank to its co-located vLLM server so weight-update
+         # IPC handles stay on the GPU where they were created. Offset math
+-        # assumes prefill_replicas == 1 (enforced by vLLMPDReplica); if that
+-        # ever lifts, update both this block and vLLMPDReplica.launch_servers.
++        # assumes prefill_replicas == 1 (enforced by vLLMPDReplica).
+         self._pd_role: Optional[str] = None
+         self._pd_server_index: Optional[int] = None
+         self._pd_tp_local_rank: Optional[int] = None

@@ -33,7 +33,7 @@ export VLLM_ASCEND_ENABLE_NZ=0
 DEFAULT_SH="./train_glm5_grpo_megatron_vllm_32nodes.sh"
 echo "Use $DEFAULT_SH"
 ulimit -n 32768
-mkdir logs
+mkdir -p logs
 
 
 # 精度用

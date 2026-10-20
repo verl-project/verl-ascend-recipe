@@ -1,0 +1,135 @@
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+index c71ee30fb0..093dacc79b 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+@@ -14,7 +14,11 @@ from vllm.config import VllmConfig
+ from vllm.distributed.parallel_state import get_tp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.platforms import current_platform
+-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    UniformTypeKVCacheSpecs,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -234,7 +238,7 @@ class RoutedExpertsManager:
+     """Scheduler-side slot-indexed buffer for routed experts.
+ 
+     Lives on CPU in the scheduler process. Each slot corresponds to
+-    ``block_id * block_size + offset_in_block`` where ``block_id`` is
++    ``block_id * block_span + offset_in_block`` where ``block_id`` is
+     drawn from the physical KV-cache block pool, so routing data is
+     tied to physical blocks and naturally survives preemption for
+     prefix-cached blocks (prefix hits re-expose the same slots).
+@@ -251,7 +255,7 @@ class RoutedExpertsManager:
+          the full per-token routing.
+ 
+     Memory: ``routed_experts_by_slot`` is sized for the whole block
+-    pool (``num_blocks * block_size`` slots). For large block pools
++    pool (``num_blocks * block_span`` slots). For large block pools
+     this can reach multiple GB; see the init log for the exact size.
+     """
+ 
+@@ -260,19 +264,30 @@ class RoutedExpertsManager:
+         vllm_config: VllmConfig,
+         kv_cache_config: KVCacheConfig,
+     ) -> None:
+-        # Pick the attention group for block/slot mapping. We require
+-        # a FullAttentionSpec group rather than any AttentionSpec to
+-        # stay consistent with the worker-side lookup in
+-        # ``GPUModelRunner._get_attention_kv_cache_gid``; hybrid models
+-        # (Mamba / linear attention) also have other AttentionSpec
+-        # groups whose slot layout differs.
++        # Pick the attention group for block/slot mapping. Unwrap
++        # UniformTypeKVCacheSpecs first: hybrid models (e.g. DeepSeek-V4
++        # on vllm-ascend) group per-layer specs into UniformTypeKVCacheSpecs,
++        # which is not itself a FullAttentionSpec.
++        def _unwrap(spec):
++            if isinstance(spec, UniformTypeKVCacheSpecs):
++                return next(iter(spec.kv_cache_specs.values()))
++            return spec
++
+         self.attn_gid = next(
+             gid
+             for gid, g in enumerate(kv_cache_config.kv_cache_groups)
+-            if isinstance(g.kv_cache_spec, FullAttentionSpec)
++            if isinstance(_unwrap(g.kv_cache_spec), FullAttentionSpec)
++        )
++        attn_spec = _unwrap(
++            kv_cache_config.kv_cache_groups[self.attn_gid].kv_cache_spec
+         )
+-        attn_group = kv_cache_config.kv_cache_groups[self.attn_gid]
+-        self.block_size = attn_group.kv_cache_spec.block_size
++        self.block_size = attn_spec.block_size
++
++        # Compressed KV blocks span more logical tokens than their physical
++        # storage block size. Route slots are indexed by logical-token span,
++        # matching vllm-ascend's worker-side raw-block slot mapping.
++        self.compress_ratio = getattr(attn_spec, "compress_ratio", 1)
++        self.block_span = self.block_size * self.compress_ratio
+ 
+         # All kv_cache_groups share the same physical block pool, so
+         # block IDs span [0, num_blocks) regardless of how many groups
+@@ -281,7 +296,7 @@ class RoutedExpertsManager:
+         hf_config = vllm_config.model_config.hf_text_config
+         num_experts = get_num_experts(hf_config)
+         num_experts_per_tok = _get_num_experts_per_tok(hf_config)
+-        max_num_slots = kv_cache_config.num_blocks * self.block_size
++        max_num_slots = kv_cache_config.num_blocks * self.block_span
+         # Expert IDs are 0..num_experts-1; uint8 fits 256 distinct
+         # values so the boundary is ``<= 256`` (NOT ``< 256``). Keeping
+         # this narrow matters because the slot buffer is sized for the
+@@ -297,9 +312,13 @@ class RoutedExpertsManager:
+         )
+         logger.info(
+             "RoutedExpertsManager CPU buffer: %.2f GB "
+-            "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
++            "(slots=%d, block_size=%d, compress_ratio=%d, block_span=%d, "
++            "layers=%d, top_k=%d, dtype=%s)",
+             self.routed_experts_by_slot.nbytes / 1e9,
+             max_num_slots,
++            self.block_size,
++            self.compress_ratio,
++            self.block_span,
+             hf_config.num_hidden_layers,
+             hf_config.num_experts_per_tok,
+             self.routed_experts_by_slot.dtype.name,
+@@ -310,9 +329,11 @@ class RoutedExpertsManager:
+ 
+         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
+         indexing handles repeated / out-of-order indices. Called once
+-        per scheduler step in ``update_from_output``.
++        per scheduler step in ``update_from_output``. ``-1`` denotes a
++        padding slot and must be ignored rather than wrapping to the last row.
+         """
+-        self.routed_experts_by_slot[slot_mapping] = data
++        mask = slot_mapping >= 0
++        self.routed_experts_by_slot[slot_mapping[mask]] = data[mask]
+ 
+     def get(
+         self,
+@@ -345,15 +366,15 @@ class RoutedExpertsManager:
+             Array of shape (num_tokens - token_start, num_layers,
+             num_experts_per_tok).
+         """
+-        bs = self.block_size
+-        block_ids_array = np.array(block_ids, dtype=np.int32)
+-        block_offsets = np.arange(bs)
+-        # slot = block_id * block_size + offset_in_block; flatten the
+-        # (num_blocks, block_size) grid and trim to num_tokens, then
++        span = self.block_span
++        block_ids_array = np.array(block_ids, dtype=np.int64)
++        block_offsets = np.arange(span)
++        # slot = block_id * block_span + offset_in_block; flatten the
++        # (num_blocks, block_span) grid and trim to num_tokens, then
+         # skip the first token_start entries so only the requested
+         # range is fetched in a single fancy-index read.
+         slot_mapping = (
+-            block_ids_array.reshape(-1, 1) * bs + block_offsets.reshape(1, -1)
++            block_ids_array.reshape(-1, 1) * span + block_offsets.reshape(1, -1)
+         ).flatten()[:num_tokens]
+         slot_mapping = slot_mapping[token_start:]
+         return self.routed_experts_by_slot[slot_mapping]

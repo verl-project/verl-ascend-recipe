@@ -17,7 +17,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_ascend import ascend_forward_context
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.activation import AscendSiluAndMul, AscendSwigluOAIAndMul
-from vllm_ascend.ops.fused_moe import experts_selector, moe_mlp
+from vllm_ascend.ops.fused_moe import experts_selector, moe_comm_method, moe_mlp
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoETokenDispatchInput,
@@ -70,7 +70,22 @@ def apply_unquantized_grouped_mlp_train_infer_consistent(
     group_list_type: int = 1,
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
-) -> torch.Tensor:
+    swiglu_limit: float = 0.0,
+    lora_context=None,
+    expanded_row_idx: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, None]:
+    # topk_ids/expanded_row_idx are only consumed by the MoE LoRA branch of
+    # vllm-ascend's unquant_apply_mlp, so they are inert while lora_context is
+    # None. swiglu_limit and an active LoRA context would change the numerics,
+    # so keep rejecting exactly those.
+    if swiglu_limit or lora_context is not None:
+        raise ValueError(
+            "apply_unquantized_grouped_mlp_train_infer_consistent does not support "
+            "swiglu_limit/lora_context. The Megatron-style grouped MLP path cannot "
+            "honor them; disable true_on_policy for this model or extend the patch."
+        )
+
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
@@ -97,7 +112,7 @@ def apply_unquantized_grouped_mlp_train_infer_consistent(
     if topk_scales is not None:
         gate_up_output *= topk_scales
 
-    return torch_npu.npu_grouped_matmul(
+    down_output = torch_npu.npu_grouped_matmul(
         x=[gate_up_output],
         weight=[w2],
         bias=[w2_bias.to(dtype=torch.float32)] if w2_bias is not None else None,
@@ -106,6 +121,9 @@ def apply_unquantized_grouped_mlp_train_infer_consistent(
         group_type=0,
         group_list=group_list,
     )[0]
+    # vllm-ascend 0.23.0's fused_experts unpacks (mlp_output, before_gmm2_evt);
+    # the unquantized path has no gmm2 event, matching upstream's `return ..., None`.
+    return down_output, None
 
 
 def select_experts_with_torch_topk_train_infer_consistent(
@@ -120,8 +138,18 @@ def select_experts_with_torch_topk_train_infer_consistent(
     scoring_func: str = "softmax",
     routed_scaling_factor=1.0,
     global_num_experts: int = -1,
+    tid2eid: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _ = hidden_states, renormalize, scoring_func, global_num_experts
+    _ = hidden_states, renormalize, scoring_func, global_num_experts, input_ids
+
+    if tid2eid is not None:
+        raise ValueError(
+            "select_experts_with_torch_topk_train_infer_consistent does not support "
+            "tid2eid (sqrtsoftplus token-to-expert routing). The torch.topk routing "
+            "path cannot honor it; disable true_on_policy for this model or extend "
+            "the patch."
+        )
 
     num_tokens, num_experts = router_logits.shape
 
@@ -272,6 +300,10 @@ def dispatch_tokens_with_all_to_all_train_infer_consistent(
         dynamic_scale_after_all_to_all,
         local_expert_indices,
         use_quant,
+        # vllm-ascend 0.23.0 added dst_type/scale_type (used only by the fp8
+        # e8m0 quant branch); keep the 0.18.0 defaults for the unquantized path.
+        torch.bfloat16,
+        torch.bfloat16,
     )
 
     _, global_weights, weights_handle = async_all_to_all(
@@ -379,8 +411,9 @@ def combine_tokens_after_all_to_all_train_infer_consistent(
 def patch_compute_logits_passthrough_train_infer_consistent(
     model,
     vocab_size: int,
+    banned_token_ids=None,
 ) -> None:
-    _ = vocab_size
+    _ = vocab_size, banned_token_ids
     original_compute_logits = model.compute_logits
 
     def compute_logits(self, *args, **kwargs) -> torch.Tensor:
@@ -443,6 +476,43 @@ def select_all_to_all_moe_comm_method_train_infer_consistent(
     return MoECommType.ALLTOALL
 
 
+# Captured at import time, before any monkey patching, so re-applying the
+# patches never wraps the wrapper itself.
+_ORIG_SETUP_MOE_COMM_METHOD = moe_comm_method.setup_moe_comm_method
+_ORIG_GET_MOE_COMM_METHOD = moe_comm_method.get_moe_comm_method
+
+
+def setup_moe_comm_method_with_alltoall_backfill_train_infer_consistent(moe_config) -> None:
+    """Register the ALLTOALL impl even when expert parallel is disabled.
+
+    Since vllm-ascend 0.23.0, setup_moe_comm_method registers ALLTOALL only
+    when ep_size > 1, but true_on_policy forces MoECommType.ALLTOALL (see the
+    select patch above) for train-infer consistency. Without this backfill the
+    forced selection resolves to None and the MoE forward crashes with
+    "AttributeError: 'NoneType' object has no attribute 'prepare'".
+    """
+    _ORIG_SETUP_MOE_COMM_METHOD(moe_config)
+    if MoECommType.ALLTOALL not in moe_comm_method._MoECommMethods:
+        moe_comm_method._MoECommMethods[MoECommType.ALLTOALL] = moe_comm_method.AlltoAllCommImpl(moe_config)
+
+
+def get_moe_comm_method_with_alltoall_fallback_train_infer_consistent(moe_comm_type):
+    """Resolve ALLTOALL even when it was never registered (ep_size == 1).
+
+    Belt-and-braces companion to the setup backfill above:
+    set_ascend_forward_context lazy-imports get_moe_comm_method inside the
+    context manager on every forward, so patching the module attribute here
+    takes effect regardless of from-import binding order anywhere else.
+    """
+    method = _ORIG_GET_MOE_COMM_METHOD(moe_comm_type)
+    if method is None and moe_comm_type == MoECommType.ALLTOALL:
+        allgather = moe_comm_method._MoECommMethods.get(MoECommType.ALLGATHER)
+        if allgather is not None:
+            method = moe_comm_method.AlltoAllCommImpl(allgather.moe_config)
+            moe_comm_method._MoECommMethods[MoECommType.ALLTOALL] = method
+    return method
+
+
 def apply_batch_consistency_patches() -> None:
     """Apply batch-consistency monkey patches for vLLM Ascend."""
 
@@ -457,3 +527,5 @@ def apply_batch_consistency_patches() -> None:
     Sampler.compute_logprobs = compute_logprobs_from_logits_train_infer_consistent
     RowParallelLinear.forward = run_row_parallel_linear_with_padded_reduce_scatter_train_infer_consistent
     ascend_forward_context.select_moe_comm_method = select_all_to_all_moe_comm_method_train_infer_consistent
+    moe_comm_method.setup_moe_comm_method = setup_moe_comm_method_with_alltoall_backfill_train_infer_consistent
+    moe_comm_method.get_moe_comm_method = get_moe_comm_method_with_alltoall_fallback_train_infer_consistent

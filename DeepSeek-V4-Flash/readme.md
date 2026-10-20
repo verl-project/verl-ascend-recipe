@@ -68,6 +68,10 @@ ln -s ../mbridge/mbridge mbridge
     bash examples/mcore/deepseek4_flash/ckpt_dequant_deepseek4_fp8_to_bf16.sh
     ```
 
+3. 减层（4层）配置生成
+    
+    仅需修改模型权重路径下的 config.json 的 num_hidden_layers 对应数值改成 4
+
 ### 启动训练
 请根据实际数据/权重等路径修改ray_start.sh 以及 train_deepseek_v4_grpo_mindspeed_vllm.sh的中相应路径
 ```bash

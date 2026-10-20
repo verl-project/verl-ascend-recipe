@@ -5,23 +5,16 @@ ray stop --force
 CANN_DIR=/usr/local/Ascend
 source $CANN_DIR/ascend-toolkit/set_env.sh
 source $CANN_DIR/nnal/atb/set_env.sh
-
-export TORCHDYNAMO_VERBOSE=1
-export TORCH_COMPILE_DEBUG=1
-export TORCHDYNAMO_DISABLE=1
-
+export TRANSFORMERS_VERBOSITY=error
+export VLLM_ASCEND_TASK_QUEUE_ENABLE=0
 # vllm路径
 export PYTHONPATH="/workspace-verl/vllm:$PYTHONPATH"
 export PYTHONPATH="/workspace-verl/vllm-ascend:$PYTHONPATH"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export CPU_AFFINITY_CONF=1
-export TASK_QUEUE_ENABLE=1
 export VLLM_USE_V1=1
 export VLLM_VERSION=0.23.0
-export HCCL_BUFFSIZE=500
-
-export HCCL_OP_EXPANSION_MODE="AIV" 
+export HCCL_BUFFSIZE=300
 export PYTORCH_NPU_ALLOC_CONF="max_split_size_mb:2048"
 
 # 修改为当前需要跑的用例路径

@@ -278,7 +278,9 @@ diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
 index c01cdd79..70adbd90 100644
 --- a/verl/workers/rollout/replica.py
 +++ b/verl/workers/rollout/replica.py
-@@ -29,2 +29,3 @@ from verl.utils.device import is_torch_npu_available
+@@ -28,3 +28,5 @@
+ from verl.utils.device import get_device_name
++from verl.utils.device import is_torch_npu_available
  from verl.workers.config import HFModelConfig, RolloutConfig
 +from verl.workers.config.rollout import ensure_rollout_config
  

@@ -1,0 +1,6 @@
+# SAPO — Smooth Advantage PO
+# Tracks verl main branch. Requires Ascend NPU hardware.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=main
+PIP_INSTALL=pip install -e .
+NOTES=Tracks verl main branch. Requires Ascend NPU hardware (Atlas 800T A3 or Atlas 900 A3 SuperPoD). Additional dependencies: Megatron-LM==0.16.1, MindSpeed==0.16.0, Megatron-Bridge==de93536e, flash-linear-attention, megatron-energon.

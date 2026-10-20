@@ -1,0 +1,278 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Cross-server retry client for elastic rollout.
+
+``RetryLLMServerClient`` is a new class kept in the recipe (it does not exist in
+verl@dfc01f85). It subclasses verl's native ``LLMServerClient``; the recipe's
+``patch.llm_server`` decorators extend the base class with the FT helpers
+(``_ft_enabled``, ``_generate_once``, ...) that this class relies on.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import logging
+from typing import Any, Optional
+from uuid import uuid4
+
+import torch
+from omegaconf import DictConfig, OmegaConf
+
+from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.tokenizer import normalize_token_ids
+from verl.workers.rollout.fault_tolerance.exceptions import is_transient_fault
+from verl.workers.rollout.llm_server import LLMServerClient
+from verl.workers.rollout.replica import TokenOutput
+
+logger = logging.getLogger(__name__)
+
+
+class RetryLLMServerClient(LLMServerClient):
+    """Cross-server retry for a single prompt, independent of fault tolerance.
+
+    When a server dies mid-generation, the partial tokens produced so far are
+    lost with the server. This client switches to a fresh server and regenerates
+    the response from the original prompt, up to ``max_retries`` times before
+    raising ``AllServersFailed``.
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        servers: dict[str, Any],
+        load_balancer_handle: Any,
+        run_id: Optional[str] = None,
+        progress_store: Optional[Any] = None,
+        max_model_len: Optional[int] = None,
+    ):
+        super().__init__(
+            config,
+            servers,
+            load_balancer_handle,
+            run_id=run_id,
+            progress_store=progress_store,
+            max_model_len=max_model_len,
+        )
+        self.max_retries = self._ft_max_request_retries()
+        self.call_timeout_s = self._ft_call_timeout_s()
+        self._last_global_step: Optional[int] = None
+
+    def _progress_enabled(self) -> bool:
+        if not self._ft_enabled():
+            return False
+        if self._run_id is None or self._progress_store is None:
+            return False
+        try:
+            return bool(OmegaConf.select(self.config, "async_training.fault_tolerance.progress.enabled", default=False))
+        except (AttributeError, KeyError, TypeError):
+            return False
+
+    def _flush_token_interval(self) -> int:
+        try:
+            return int(
+                OmegaConf.select(
+                    self.config, "async_training.fault_tolerance.progress.flush_token_interval", default=64
+                )
+            )
+        except (AttributeError, KeyError, TypeError):
+            return 64
+
+    def _model_version_policy(self):
+        from verl.workers.rollout.fault_tolerance import ModelVersionPolicy
+
+        try:
+            node = OmegaConf.select(self.config, "async_training.fault_tolerance.progress.model_version_policy")
+            if node is not None:
+                mode = node.get("mode", "exact") if hasattr(node, "get") else "exact"
+                return ModelVersionPolicy(mode=mode)
+        except (AttributeError, KeyError, TypeError):
+            pass
+        return ModelVersionPolicy(mode="exact")
+
+    async def _weights_version(self) -> Optional[str]:
+        if self._last_global_step is not None:
+            return str(self._last_global_step)
+        for handle in list(self._server_id_to_handle.values()):
+            try:
+                gs = await asyncio.wait_for(handle.get_global_steps.remote(), timeout=5.0)
+                if gs is not None:
+                    self._last_global_step = int(gs)
+                    return str(gs)
+            except Exception:
+                continue
+        return None
+
+    @rollout_trace_op
+    async def generate(
+        self,
+        request_id,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        **kwargs: Any,
+    ) -> TokenOutput:
+        from verl.workers.rollout.fault_tolerance import (
+            AllServersFailed,
+            ProgressContext,
+            ServerUnavailable,
+            VLLMProgressCheckPoint,
+        )
+
+        progress_on = self._progress_enabled()
+        max_retries = self.max_retries
+
+        original_prompt = normalize_token_ids(prompt_ids)
+        original_sampling = copy.deepcopy(sampling_params)
+
+        recovery_id = f"{request_id}:{uuid4().hex[:8]}"
+
+        retries = 0
+        while True:
+            progress_ctx = None
+            prefix_for_call = original_prompt
+            call_sampling = original_sampling
+            if progress_on:
+                sp_for_checkpoint = dict(original_sampling)
+                resolved = self._resolve_original_max_tokens(original_prompt)
+                if resolved is not None:
+                    sp_for_checkpoint[self._generation_budget_key()] = resolved
+                else:
+                    logger.warning(
+                        "[FT] RetryLLMServerClient: cannot resolve generation budget from rollout config; "
+                        "checkpoint continuation will treat the budget as unbounded"
+                    )
+                try:
+                    result = await VLLMProgressCheckPoint.create_or_resume(
+                        store=self._progress_store,
+                        run_id=self._run_id,
+                        recovery_id=recovery_id,
+                        prompt_token_ids=original_prompt,
+                        sampling_params=sp_for_checkpoint,
+                        model_weight_version=await self._weights_version(),
+                        flush_token_interval=self._flush_token_interval(),
+                        model_version_policy=self._model_version_policy(),
+                    )
+                except Exception as e:
+                    if not is_transient_fault(e):
+                        raise
+                    logger.warning(
+                        "[FT] RetryLLMServerClient: progress store unavailable (%s), "
+                        "degrading to fresh attempt (run=%s, recovery_id=%s)",
+                        type(e).__name__,
+                        self._run_id,
+                        recovery_id,
+                    )
+                else:
+                    checkpoint = result.checkpoint
+                    progress_ctx = ProgressContext(checkpoint=checkpoint)
+                    prefix_for_call = checkpoint.resume_prefix_token_ids()
+                    call_sampling = copy.deepcopy(original_sampling)
+                    call_sampling[self._generation_budget_key()] = checkpoint.remaining_max_tokens()
+                    if result.inherited_prefix_len > 0:
+                        logger.warning(
+                            "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
+                            "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
+                            result.inherited_prefix_len,
+                            self._run_id,
+                            recovery_id,
+                            result.attempt_id,
+                            len(prefix_for_call),
+                            call_sampling.get(self._generation_budget_key()),
+                        )
+            try:
+                output, server_id = await self._generate_once(
+                    request_id,
+                    prompt_ids=prefix_for_call,
+                    sampling_params=call_sampling,
+                    image_data=image_data,
+                    video_data=video_data,
+                    kwargs=dict(kwargs),
+                    call_timeout_s=self.call_timeout_s,
+                    translate_fault=True,
+                    progress_ctx=progress_ctx,
+                )
+            except AllServersFailed:
+                raise
+            except ServerUnavailable as e:
+                if e.server_id == "<lb>":
+                    # The LB itself is unavailable; there is no healthy server to retry
+                    raise
+                retries += 1
+                if retries > max_retries:
+                    logger.warning(
+                        "[FT] prompt retries exhausted: request_id=%s failed_server=%s "
+                        "retries=%d/%d, raising AllServersFailed",
+                        request_id,
+                        e.server_id,
+                        retries,
+                        max_retries,
+                    )
+                    raise AllServersFailed(
+                        f"RetryLLMServerClient: retries exhausted after {retries} attempts"
+                    ) from None
+                logger.warning(
+                    "[FT] prompt retry %d/%d: server %s failed (%s: %s) for request_id=%s, "
+                    "resetting to original prompt and retrying on a fresh server",
+                    retries,
+                    max_retries,
+                    e.server_id,
+                    type(e.cause).__name__ if e.cause is not None else "server-fault",
+                    e.cause,
+                    request_id,
+                )
+                continue
+
+            gs = output.extra_fields.get("global_steps", None)
+            if gs is not None:
+                self._last_global_step = gs
+            if progress_on and progress_ctx is not None:
+                cp = progress_ctx.checkpoint
+                inherited_ids = list(cp.cumulative_token_ids)
+                new_ids = list(output.token_ids)
+                lp_inherited = list(cp.cumulative_log_probs) if cp.cumulative_log_probs else []
+                lp_new = list(output.log_probs) if output.log_probs else []
+                re_inherited = cp.cumulative_routed_experts
+                re_new = output.routed_experts
+                if re_inherited is not None and re_new is not None:
+                    routed_experts = torch.cat([re_inherited, re_new], dim=0)
+                elif re_new is not None:
+                    routed_experts = re_new
+                else:
+                    routed_experts = re_inherited
+                final = TokenOutput(
+                    token_ids=inherited_ids + new_ids,
+                    log_probs=(lp_inherited + lp_new) or None,
+                    routed_experts=routed_experts,
+                    num_preempted=(cp.num_preempted or 0) + (output.num_preempted or 0),
+                    stop_reason=output.stop_reason,
+                    extra_fields=dict(output.extra_fields),
+                )
+            else:
+                final = output
+            final.extra_fields["llm_generate_attempts"] = retries + 1
+            final.extra_fields["llm_generate_retries"] = retries
+            if retries > 0:
+                logger.warning(
+                    "[FT] RetryLLMServerClient.generate completed after recovery: request_id=%s "
+                    "attempts=%d retries=%d tokens=%d stop_reason=%s",
+                    request_id,
+                    retries + 1,
+                    retries,
+                    len(final.token_ids),
+                    final.stop_reason,
+                )
+            return final
