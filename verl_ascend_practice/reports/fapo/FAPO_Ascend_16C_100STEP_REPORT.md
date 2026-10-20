@@ -6,7 +6,7 @@ This report records the validation run for issue #16:
 Qwen2.5-Math-7B + FAPO-GenRM-4B, Megatron training, vLLM-Ascend rollout,
 and a reward model in a separate resource pool on the same 16-card Ascend 910C node.
 
-The paths below describe the original deployment. See `../README.md` for
+The paths below describe the original deployment. See `../../../fapo/README.md` for
 the mapping to this repository's scripts, reward function and bundled core patch.
 This report is historical evidence, not a rerun of the relocated entry points.
 
@@ -37,6 +37,14 @@ This report is historical evidence, not a rerun of the relocated entry points.
 | FAPO-GenRM-4B | 4 | vLLM-Ascend TP=2 |
 
 ## Validation result
+
+Full logs, all 100 step metrics and regenerated curves are linked in
+[the report index](README.md). The first/last 10-step mean reward is
+-1.065026 / -0.447369. Time-weighted throughput across the full run is
+119.435 tokens/s per allocated NPU (1910.966 tokens/s aggregated over 16 NPUs).
+Some steps are below 100 tokens/s/NPU; the full-run mean is not a per-step guarantee.
+
+![Training curves](assets/training_curves.png)
 
 | Item | Result |
 |---|---|

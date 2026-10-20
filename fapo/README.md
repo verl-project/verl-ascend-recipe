@@ -21,7 +21,7 @@ or replacement of verl's `recipe` submodule is required.
 | `verl/utils/vllm/npu_vllm_patch.py` | `patches/verl.patch` | NPU vLLM version detection and compatibility |
 | Two `tests/utils/test_*_on_cpu.py` files | `patches/verl.patch` | QKV conversion and vLLM version regression tests |
 | `.pre-commit-config.yaml`, device API sanity checker | `patches/verl.patch` | Device API checks also cover scripts |
-| Two Markdown experiment reports | `reports/` | Historical 8-card and 16-card results |
+| Two Markdown experiment reports | `../verl_ascend_practice/reports/fapo/` | Historical 8-card and 16-card results, logs and curves |
 | Core `recipe` gitlink update | Removed from delivery | The reward implementation is resolved here by absolute path |
 
 ## Setup
@@ -71,7 +71,8 @@ saving, matching the recorded run; it does not produce a saved trained model.
 The previous deployment completed smoke job `1279516` (4 steps) and job
 `1280184` (100 steps, 16 x 910C). The training loop took 2:02:05;
 step 100 throughput was 98.3 tokens/s normalized over all 16 devices.
-See [the 16-card report](reports/FAPO_Ascend_16C_100STEP_REPORT.md).
+See [the report index](../verl_ascend_practice/reports/fapo/README.md) for logs,
+step metrics, training curves and both experiment reports.
 These are results from the pre-migration deployment; the newly packaged
 entry points have not been rerun for 100 steps.
 
