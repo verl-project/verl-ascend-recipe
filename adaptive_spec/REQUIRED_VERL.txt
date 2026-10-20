@@ -1,0 +1,6 @@
+# AdaptiveSpec uses the public AgentLoopManager and router hooks at this pin.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=d040717b21af2e23e8e789a3e354cff2394ae2de
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@d040717b21af2e23e8e789a3e354cff2394ae2de
+NOTES=Source-contract checked; newly extracted recipe has CPU tests, not a new full-stack NPU validation.

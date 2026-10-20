@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "phase_map_path": "adaptive_spec/examples/phase_map.schema-v1.example.json",
+  "model_fingerprint": "sha256:model-and-drafter-config",
+  "topology_fingerprint": "ascend-tp2-dp4-eager",
+  "require_eager": true,
+  "window_responses": 16,
+  "minimum_responses": 1,
+  "minimum_live_blocks": 64,
+  "prior_strength": 8.0,
+  "response_decay": 1.0,
+  "confirmations": 2,
+  "minimum_dwell_rounds": 64,
+  "one_rung_per_switch": true,
+  "minimum_score_gain": 0.01,
+  "evidence_exchange_directory": null,
+  "evidence_exchange_poll_decisions": 64
+}
