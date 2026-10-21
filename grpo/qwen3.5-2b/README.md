@@ -32,7 +32,7 @@ Open-R1 图像与数学问题 → vLLM-Ascend TP1（每 prompt 5 条 response）
 | Triton / Triton-Ascend | 3.5.0 / 3.2.2 |
 | transformers | 5.10.4 |
 | xgrammar | 0.1.33 |
-| verl | `0.10.0.dev` |
+| verl | `0.10.0.dev`, `main` @ `fc72e2f384212470868a9928b62baedb9bcc3ff0` |
 
 安装流程见 [verl Ascend 安装指南](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/zh/get_start/install_guidance.rst)。启动前加载 CANN 环境并激活安装上述组件的 Python 环境：
 
@@ -112,7 +112,7 @@ bash /path/to/verl-ascend-recipe/grpo/qwen3.5-2b/run_qwen3_5_2b_openr1_fsdp2_npu
 
 默认从初始权重开始，在第 100 步保存最终 actor checkpoint，仅保留一份。每 10 步验证一次，console logger 输出完整训练和验证指标，`LOG_FILE` 保存框架控制台日志。
 
-训练日志：https://gist.github.com/SkyTD256/45a9a974aa4869d1b1f7c63be4bf7db6。
+训练日志：https://gist.github.com/SkyTD256/45a9a974aa4869d1b1f7c63be4bf7db6
 
 ## 指标与结果
 
