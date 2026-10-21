@@ -31,7 +31,7 @@ GSM8K / MATH prompt → vLLM-Ascend TP1（每 prompt 4 条 response）→ 数学
 | Ray | 2.58.0 |
 | Triton / Triton-Ascend | 3.5.0 / 3.2.2 |
 | transformers | 5.3.0 |
-| verl | `0.10.0.dev` |
+| verl | `0.10.0.dev`, `main` @ `fc72e2f384212470868a9928b62baedb9bcc3ff0`|
 
 安装流程见 [verl Ascend 安装指南](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/zh/get_start/install_guidance.rst)。启动前加载 CANN 环境并激活安装上述组件的 Python 环境：
 
