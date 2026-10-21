@@ -71,6 +71,16 @@ class PredictorReviewRegressionTests(unittest.TestCase):
         self.assertIn("ImportError", update_source)
         self.assertIn("kendalltau", update_source)
 
+    def test_epws_cold_start_skips_prompt_hydration(self):
+        fit_source = _function_source(TRAINER, "fit")
+
+        active_guard = fit_source.index("if self._predictor_active(epoch):")
+        hydrate = fit_source.index("self._hydrate_gen_batch_model_inputs(predictor_input_batch)", active_guard)
+        cold_fallback = fit_source.index('gen_batch_output.meta_info["epws_predictor_active"] = False', active_guard)
+
+        self.assertLess(active_guard, hydrate)
+        self.assertLess(hydrate, cold_fallback)
+
 
 if __name__ == "__main__":
     unittest.main()
