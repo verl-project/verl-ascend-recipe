@@ -35,7 +35,7 @@ GSM8K / MATH prompt → vLLM-Ascend TP2（每 prompt 2 条 response）→ 数学
 | MindSpeed | 0.12.1 |
 | TransformerEngineNPU | 2.13.0 |
 | emerging-optimizers | 0.5.0a0 |
-| verl | `0.10.0.dev` |
+| verl | `0.10.0.dev`, `main` @ `fc72e2f384212470868a9928b62baedb9bcc3ff0` |
 
 安装流程见 [verl Ascend 安装指南](https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/zh/get_start/install_guidance.rst)。启动前加载 CANN 环境并激活安装上述组件的 Python 环境：
 
@@ -122,7 +122,7 @@ trainer.save_freq=-1
 
 默认从初始权重开始，在第 100 步保存最终 actor checkpoint，仅保留一份。每 10 步验证一次，console logger 输出完整训练和验证指标，`LOG_FILE` 保存框架控制台日志。
 
-训练日志：https://gist.github.com/SkyTD256/13b21aa8005d0be63c377048370d37dd。
+训练日志：https://gist.github.com/SkyTD256/13b21aa8005d0be63c377048370d37dd
 
 ## 指标与结果
 
@@ -151,7 +151,7 @@ reward 使用 `critic/rewards/mean`，比较首 10 步和末 10 步均值；acto
 
 Muon 的 actor 峰值显存比 AdamW 对照低 8.94%。
 
-AdamW 对照日志：https://gist.github.com/SkyTD256/13b21aa8005d0be63c377048370d37dd。
+AdamW 对照日志：https://gist.github.com/SkyTD256/13b21aa8005d0be63c377048370d37dd
 
 ![Reward curve](assets/reward_curve.png)
 
