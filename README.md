@@ -59,6 +59,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | grpo/lora | [`grpo/lora/REQUIRED_VERL.txt`](grpo/lora/REQUIRED_VERL.txt) |
 | r1_ascend | [`recipe/r1_ascend/REQUIRED_VERL.txt`](r1_ascend/REQUIRED_VERL.txt) |
 | grpo/router_replay | [`grpo/router_replay/REQUIRED_VERL.txt`](grpo/router_replay/REQUIRED_VERL.txt) |
+| mopd | [`mopd/REQUIRED_VERL.txt`](mopd/REQUIRED_VERL.txt) — [Qwen3 multi-teacher FSDP recipe](verl_ascend_practice/reports/mopd/README.md) |
 | retool | [`recipe/retool/REQUIRED_VERL.txt`](retool/REQUIRED_VERL.txt) |
 
 ## Contribution
