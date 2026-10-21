@@ -1,4 +1,5 @@
-# Measured software for the 2026-09-11 four-NPU run; apply both patches in README.md.
+# Measured software for the 2026-09-11 four-NPU run.
+# Apply the two runtime patches described in verl_ascend_practice/reports/mopd/README.md.
 # IMAGE records the historical environment; current registry availability is not guaranteed.
 UPSTREAM=https://github.com/verl-project/verl.git
 MODE=pinned_commit
@@ -6,12 +7,11 @@ COMMIT=bc72e38edba78e778bfbd462638f9634b9140a76
 PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bc72e38edba78e778bfbd462638f9634b9140a76
 IMAGE=quay.io/ascend/verl:latest-cann9.0.0-torch_npu2.9.0post2-910b-ubuntu22.04-py3.11-vllm
 RECIPE_FOLDER=mopd
+VERL_PATCH=patches/0001-get_npu_versions-first-visible-npu-id.patch
 VLLM_ASCEND_COMMIT=a43c8cc8057f490ed1df2c6ed66253e2d7817da4
 VLLM_ASCEND_PATCH=patches/vllm-ascend/0001-record-sampler-stream.patch
-VLLM_ASCEND_DEPENDENCY_PATCH=patches/vllm-ascend/0002-align-tested-numpy.patch
 IMAGE_ID=sha256:25cdc80fb496290267a07dd270023caf9a473c4167959b90b8ffe2bc3fbda27c
 VLLM_COMMIT=bcf2be96120005e9aea171927f85055a6a5c0cf6
-VLLM_DEPENDENCY_PATCH=patches/vllm/0001-align-tested-npu-dependencies.patch
 CANN_VERSION=9.0.0
 DRIVER_VERSION=26.0.rc1
 TORCH_VERSION=2.9.0
@@ -24,3 +24,14 @@ VLLM_ASCEND_VERSION=0.18.1.dev44
 NUMPY_VERSION=2.4.6
 OPENCV_PYTHON_HEADLESS_VERSION=4.11.0.86
 TRITON_ASCEND_VERSION=3.2.1
+
+# The pinned source packaging requirements differ from the installed run:
+# vLLM: transformers >=4.56,<5; opencv-python-headless >=4.13; build torch ==2.10.0.
+# vLLM-Ascend: numpy <2; opencv-python-headless <=4.11.0.86; torch ==2.9.0.
+# verl: transformers >=5.5.3,<5.11; numpy >=2.
+# These are packaging conflicts, not additional MOPD algorithm requirements.
+# The versions above describe the tested environment; this recipe does not modify
+# dependency declarations or establish a fresh installation of this exact stack.
+# Use an existing compatible environment and verify actual versions and imports.
+# The tested triton-ascend 3.2.1 wheel was not available on public PyPI when checked
+# on 2026-10-16; this delivery does not provide that binary or validate a substitute.
