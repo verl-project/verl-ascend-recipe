@@ -1,0 +1,47 @@
+diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
+index 26a96f457..f8cbc5fd4 100644
+--- a/megatron/core/pipeline_parallel/p2p_communication.py
++++ b/megatron/core/pipeline_parallel/p2p_communication.py
+@@ -43,11 +43,11 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
+     send_next_shape_tensor = None
+     if recv_prev:
+         recv_prev_shape_tensor = torch.empty(
+-            (3), device=torch.cuda.current_device(), dtype=torch.int64
++            (4), device=torch.cuda.current_device(), dtype=torch.int64
+         )
+     if recv_next:
+         recv_next_shape_tensor = torch.empty(
+-            (3), device=torch.cuda.current_device(), dtype=torch.int64
++            (4), device=torch.cuda.current_device(), dtype=torch.int64
+         )
+     if tensor_send_prev is not None:
+         send_prev_shape_tensor = torch.tensor(
+@@ -105,11 +105,11 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
+         # should take this out once the bug with batch_isend_irecv is resolved.
+         torch.cuda.synchronize()
+ 
+-    recv_prev_shape = [0, 0, 0]
++    recv_prev_shape = [0, 0, 0, 0]
+     if recv_prev_shape_tensor is not None:
+         recv_prev_shape = recv_prev_shape_tensor.tolist()
+ 
+-    recv_next_shape = [0, 0, 0]
++    recv_next_shape = [0, 0, 0, 0]
+     if recv_next_shape_tensor is not None:
+         recv_next_shape = recv_next_shape_tensor.tolist()
+ 
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 2b68a5a5f..e6cf2469b 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -568,8 +568,8 @@ class TransformerConfig(ModelParallelConfig):
+         if self.kv_channels is None:
+             self.kv_channels = self.hidden_size // self.num_attention_heads
+ 
+-        if self.num_query_groups is None:
+-            self.num_query_groups = self.num_attention_heads
++        #if self.num_query_groups is None:
++        self.num_query_groups = self.num_attention_heads
+ 
+         if self.num_query_groups % self.tensor_model_parallel_size != 0:
+             raise ValueError(
