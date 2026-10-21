@@ -49,8 +49,9 @@ flowchart TB
     end
 
     subgraph layer1b [Layer 1b: vllm-ascend 源码 patch]
+        VASEL["vllm_ascend_patch_selector.py"]
         VAPPLY["apply_vllm_ascend_source_patches.py"]
-        BIPATCH["vllm_ascend_true_on_policy.patch"]
+        BIPATCH["vllm_ascend_true_on_policy_v0.18.0 / v0.23.0.patch"]
     end
 
     subgraph layer2 [Layer 2: vLLM 运行时 patch]
@@ -67,7 +68,7 @@ flowchart TB
     APPLY --> COMBINED
     APPLY --> MS
     APPLY --> SEED_FB
-    IMPORT --> VAPPLY --> BIPATCH
+    IMPORT --> VASEL --> VAPPLY --> BIPATCH
     IMPORT --> RUNTIME
     RUNTIME --> BI_ENV
     HYDRA -.->|"scripts/*.sh 注入"| layer3
@@ -76,7 +77,7 @@ flowchart TB
 | 层级 | 作用对象 | 解决的问题 |
 | --- | --- | --- |
 | Layer 1 | verl 框架源码 | NPU 上 vLLM PP 可启动；MindSpeed repatch 与 FA3 不冲突；per-request rollout seed |
-| Layer 1b | vLLM-Ascend 源码 | `batch_invariant.py` + FA3 backend + platform 路由（训推对齐） |
+| Layer 1b | vLLM-Ascend 源码 | `batch_invariant.py` + FA3 backend（v0.18.0 另含 platform 路由；v0.23.0 已上游）（训推对齐） |
 | Layer 2 | vLLM-Ascend 推理 runtime | MoE / logprob / TP 等数值路径与训练侧对齐 |
 | Layer 3 | MindSpeed 训练配置 | 训练侧启用 batch-invariant 路径（由启动脚本 Hydra 参数控制） |
 
@@ -199,15 +200,31 @@ batch-invariant 算子注册见 **Layer 1b**（`vllm_ascend/batch_invariant.py` 
 
 ### Layer 1b：vLLM-Ascend 训推一致性源码 patch
 
-`apply_vllm_ascend_source_patches.py` 对 vLLM-Ascend 仓库执行幂等 `git apply`：
+`apply_vllm_ascend_source_patches.py` 对 vLLM-Ascend 仓库执行幂等 `git apply`；`vllm_ascend_patch_selector.py` 按树上特性选择 variant（特性检测优先于版本号，源码 checkout 无 `_version.py`，版本号仅用于日志）：
 
-| 文件 | Patch |
-| --- | --- |
-| `vllm_ascend/batch_invariant.py` | AscendC batch-invariant ATen 算子注册 |
-| `vllm_ascend/attention/fa3_v1.py` | FA3 attention backend（`flash_attn_npu_v3`） |
-| `vllm_ascend/platform.py` | FA3 路由与 `VLLM_BATCH_INVARIANT` 联动 |
+```
+batch_invariant.py 含 BatchInvariantSumFunction 且 fa3_v1.py 含 AscendFABackend
+└── 已应用 → 跳过
+否则按上游状态选择：
+├── platform.py 含 _validate_fa3_backend 且 batch_invariant.py 为新风格（含 use_deterministic_algorithms）
+│   └── v0.23.0 上游形态 → vllm_ascend_true_on_policy_v0.23.0.patch
+├── 两者皆无（vanilla v0.18.0）
+│   └── → vllm_ascend_true_on_policy_v0.18.0.patch
+└── 只居其一（如仅合入 FA3 PR 的 0.18 杂交树）
+    → 报 RuntimeError，提示改用 vanilla v0.18.0 / v0.23.0 树
+```
 
-特性检测：`batch_invariant.py` 含 `BatchInvariantSumFunction` 且 `fa3_v1.py` 含 `AscendFABackend` 则跳过。
+两个 variant 的内容差异：
+
+| 文件 | v0.18.0 patch | v0.23.0 patch |
+| --- | --- | --- |
+| `vllm_ascend/batch_invariant.py` | AscendC batch-invariant ATen 算子注册（同） | 同左（rebase 到 0.23.0 重构版：保留 `envs.VLLM_BATCH_INVARIANT` 门控与 ascend_config 确定性设置） |
+| `vllm_ascend/attention/fa3_v1.py` | 新建 FA3 attention backend（`flash_attn_npu_v3`） | 上游已含，仅补 `accept_output_buffer = True` |
+| `vllm_ascend/platform.py` | 新增 FA3 路由与 `VLLM_BATCH_INVARIANT` 联动 | 上游已含，不改 |
+
+背景：FA3 backend 与 platform 路由已随 pr-10375 上游，自 v0.23.0 起由官方发布，因此 v0.23.0 patch 不再包含这两部分。
+
+特性检测：`batch_invariant.py` 含 `BatchInvariantSumFunction` 且 `fa3_v1.py` 含 `AscendFABackend` 则跳过（两个 variant 打完后均满足）。
 
 当 `VLLM_BATCH_INVARIANT=1` 时，`init_batch_invariance()` 会：
 
@@ -273,7 +290,9 @@ patch/
 │   ├── verl_mindspeed_batch_invariant.patch
 │   ├── verl_per_request_seed_v0.8.0.patch      # fallback：PP 已 upstream 时仅补 seed
 │   └── verl_per_request_seed_main.patch
+├── vllm_ascend_patch_selector.py       # Layer 1b：vllm-ascend 版本与特性检测
 ├── vllm_ascend_patches/
-│   └── vllm_ascend_true_on_policy.patch
+│   ├── vllm_ascend_true_on_policy_v0.18.0.patch
+│   └── vllm_ascend_true_on_policy_v0.23.0.patch
 ├── npu_true_on_policy_patch.py        # Layer 2：vLLM runtime monkey patch
 ```

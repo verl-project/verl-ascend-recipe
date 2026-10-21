@@ -326,9 +326,7 @@ def make_on_dead(
     Args:
         lb_handle: Ray actor handle for the GlobalRequestLoadBalancer.
         replica_to_server_ids: Maps `replica_id` → list of server IDs (str).
-        ckpt_mgr_handle: Optional Ray actor handle for CheckpointEngineManager.
-        replica_by_id: Maps `replica_id` → replica object for
-            `ckpt_mgr.remove_replicas`. Required iff `ckpt_mgr_handle` is set.
+        ckpt_mgr_callback: Optional `async (replica_id) -> None`.
         spawner: Optional `async (dead_replica_id) -> new_replica_obj`. When
             present, on_dead schedules a background spawn task. Step 3 is
             skipped if None.

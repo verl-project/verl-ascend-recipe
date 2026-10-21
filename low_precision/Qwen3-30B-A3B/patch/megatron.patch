@@ -1,0 +1,78 @@
+diff --git a/megatron/core/dist_checkpointing/strategies/filesystem_async.py b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+index 2af90a65b..c67f7908a 100644
+--- a/megatron/core/dist_checkpointing/strategies/filesystem_async.py
++++ b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+@@ -17,7 +17,7 @@ import psutil
+ import torch
+ from torch import multiprocessing as mp
+ from torch.distributed.checkpoint import FileSystemWriter
+-from torch.distributed.checkpoint.filesystem import DEFAULT_SUFFIX, _StoragePrefix, _write_item
++from torch.distributed.checkpoint.filesystem import DEFAULT_SUFFIX, _StoragePrefix, _write_item, SerializationFormat
+ from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteItem, WriteItemType
+ from torch.distributed.checkpoint.storage import WriteResult
+ from torch.futures import Future
+@@ -317,13 +317,13 @@ class FileSystemWriterAsync(FileSystemWriter):
+             with open(file_name, "wb") as stream:
+                 for write_item, data in bytes_data:
+                     local_results.append(
+-                        _write_item(*transform_list, stream, data, write_item, storage_key)
++                        _write_item(*transform_list, stream, data, write_item, storage_key, SerializationFormat.TORCH_SAVE)
+                     )
+ 
+                 for write_item, tensor in tensor_data:
+                     assert tensor.is_cpu
+                     local_results.append(
+-                        _write_item(*transform_list, stream, tensor, write_item, storage_key)
++                        _write_item(*transform_list, stream, tensor, write_item, storage_key, SerializationFormat.TORCH_SAVE)
+                     )
+ 
+                 if use_fsync:
+diff --git a/megatron/core/dist_checkpointing/strategies/torch.py b/megatron/core/dist_checkpointing/strategies/torch.py
+index 06c262a8f..52832b355 100644
+--- a/megatron/core/dist_checkpointing/strategies/torch.py
++++ b/megatron/core/dist_checkpointing/strategies/torch.py
+@@ -747,7 +747,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
+             None,
+             coordinator,
+             planner=MCoreSavePlanner(
+-                dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
++                dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False,
++                can_run_decentralized_global_plan=False,
+             ),
+             cached_ckpt_structure=args_cached_plans,
+             loaded_all_plans=loaded_all_plans,
+@@ -812,12 +813,24 @@ def get_reformulation_metadata(
+             as stored in `mcore_data` in the checkpoint.
+     """
+     ckpt_metadata = FileSystemReader(checkpoint_dir).read_metadata()
++    ckpt_mcore_data = getattr(ckpt_metadata, 'mcore_data', None)
++    if ckpt_mcore_data is None:
++        # Checkpoints saved through the decentralized planner path
++        # (MCoreSavePlanner.create_decentralized_global_plan) never attach
++        # mcore_data. In this version the stored tensor size equals the
++        # original global shape (see _sharded_tensor_to_torch_sharded_tensor),
++        # so rebuild the missing entries from state_dict_metadata.
++        ckpt_mcore_data = {
++            k: {'nd_reformulated_orig_global_shape': tuple(v.size)}
++            for k, v in ckpt_metadata.state_dict_metadata.items()
++            if isinstance(v, TensorStorageMetadata)
++        }
+     reformulation_metadata = {}
+     for sh_ten in nested_values(sharded_state_dict):
+         if not is_nd_flattened_tensor(sh_ten):
+             continue
+         try:
+-            ckpt_global_shape = ckpt_metadata.mcore_data[sh_ten.key][
++            ckpt_global_shape = ckpt_mcore_data[sh_ten.key][
+                 'nd_reformulated_orig_global_shape'
+             ]
+         except KeyError as e:
+@@ -829,7 +842,7 @@ def get_reformulation_metadata(
+                 continue
+             raise CheckpointingException(
+                 f'Cannot find global shape metadata for N-D flattened tensor {sh_ten} '
+-                f'in checkpoint metadata: {ckpt_metadata.mcore_data}'
++                f'in checkpoint metadata: {ckpt_mcore_data}'
+             ) from e
+ 
+         reformulation_metadata[sh_ten.key] = TensorReformulationMetadata(

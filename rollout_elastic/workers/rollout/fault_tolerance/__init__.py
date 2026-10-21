@@ -74,6 +74,7 @@ __all__ = [
     "LoadFailure",
     "LoadResult",
     "ModelVersionPolicy",
+    "PlacementConfig",
     "ProgressConfig",
     "ProgressContext",
     "RAY_FAULT_EXCEPTIONS",

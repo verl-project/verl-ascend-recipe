@@ -101,22 +101,6 @@ class RetryLLMServerClient(LLMServerClient):
             pass
         return ModelVersionPolicy(mode="exact")
 
-    def _resolve_original_max_tokens(self, sampling_params: dict, original_prompt: list[int]) -> int:
-        if "max_tokens" in sampling_params:
-            raw = sampling_params["max_tokens"]
-        elif "max_new_tokens" in sampling_params:
-            raw = sampling_params["max_new_tokens"]
-        else:
-            rollout_cfg = self.config.actor_rollout_ref.rollout
-            raw = min(
-                rollout_cfg.response_length,
-                rollout_cfg.prompt_length + rollout_cfg.response_length - len(original_prompt),
-            )
-        raw = int(raw)
-        if self.max_model_len is not None:
-            raw = min(raw, self.max_model_len - len(original_prompt))
-        return max(0, raw)
-
     async def _weights_version(self) -> Optional[str]:
         if self._last_global_step is not None:
             return str(self._last_global_step)
@@ -163,7 +147,14 @@ class RetryLLMServerClient(LLMServerClient):
             call_sampling = original_sampling
             if progress_on:
                 sp_for_checkpoint = dict(original_sampling)
-                sp_for_checkpoint["max_tokens"] = self._resolve_original_max_tokens(original_sampling, original_prompt)
+                resolved = self._resolve_original_max_tokens(original_prompt)
+                if resolved is not None:
+                    sp_for_checkpoint[self._generation_budget_key()] = resolved
+                else:
+                    logger.warning(
+                        "[FT] RetryLLMServerClient: cannot resolve generation budget from rollout config; "
+                        "checkpoint continuation will treat the budget as unbounded"
+                    )
                 try:
                     result = await VLLMProgressCheckPoint.create_or_resume(
                         store=self._progress_store,
@@ -190,7 +181,7 @@ class RetryLLMServerClient(LLMServerClient):
                     progress_ctx = ProgressContext(checkpoint=checkpoint)
                     prefix_for_call = checkpoint.resume_prefix_token_ids()
                     call_sampling = copy.deepcopy(original_sampling)
-                    call_sampling["max_tokens"] = checkpoint.remaining_max_tokens()
+                    call_sampling[self._generation_budget_key()] = checkpoint.remaining_max_tokens()
                     if result.inherited_prefix_len > 0:
                         logger.warning(
                             "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
@@ -200,7 +191,7 @@ class RetryLLMServerClient(LLMServerClient):
                             recovery_id,
                             result.attempt_id,
                             len(prefix_for_call),
-                            call_sampling.get("max_tokens"),
+                            call_sampling.get(self._generation_budget_key()),
                         )
             try:
                 output, server_id = await self._generate_once(

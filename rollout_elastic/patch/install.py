@@ -32,11 +32,27 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 from typing import Iterable
 
 from ._mount import mount_fault_tolerance
 
 logger = logging.getLogger(__file__)
+
+# Set to "1" on the head pod by the vcjob launcher script; worker pods leave
+# it unset (or falsy) so that they apply the full patch set.
+HEAD_POD_ENV_VAR = "ROLLOUT_ELASTIC_HEAD_POD"
+
+_TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
+
+# Head-only patch modules, in dependency order. Only applied when
+# ``HEAD_POD_ENV_VAR`` is set to a truthy value.
+_HEAD_AREA_MODULES: tuple[str, ...] = (
+    "replica",  # RolloutReplica.health / get_ray_class_with_init_args
+    "llm_server",  # LLMServerClient / LLMServerManager / load balancer / FullyLLMServerClient
+    "checkpoint",  # CheckpointEngineManager / CheckpointEngineWorker / hccl / nccl
+    "experimental",  # fully_async / one_step_off / separation / agent_loop
+)
 
 # Area patch modules, in dependency order. Each module applies its decorators
 # as a side effect of being imported.
@@ -55,6 +71,14 @@ def _apply_area(name: str) -> None:
     importlib.import_module(f"{__package__}.{name}")
 
 
+def _is_head_pod() -> bool:
+    """Whether this process runs on the head pod.
+
+    The vcjob launcher script sets ``HEAD_POD_ENV_VAR=1`` on the head pod only.
+    """
+    return os.environ.get(HEAD_POD_ENV_VAR, "").strip().lower() in _TRUTHY_VALUES
+
+
 def install(areas: Iterable[str] | None = None) -> None:
     """Apply all rollout_elastic patches to the running verl process.
 
@@ -62,7 +86,8 @@ def install(areas: Iterable[str] | None = None) -> None:
         areas: Optional subset of area names to apply (defaults to all).
     """
     mount_fault_tolerance()
-    for name in _AREA_MODULES if areas is None else areas:
+    area_modules = _HEAD_AREA_MODULES if _is_head_pod() else _AREA_MODULES
+    for name in area_modules if areas is None else areas:
         try:
             _apply_area(name)
         except Exception:

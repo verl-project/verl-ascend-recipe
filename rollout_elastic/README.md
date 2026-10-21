@@ -57,7 +57,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export VERL_USE_EXTERNAL_MODULES=rollout_elastic.patch
 
 # 3. fully-async
-python3 -m verl.experimental.fully_async_policy.fully_async_main \
+python3 -m rollout_elastic.fully_async_main \
     --config-path=config --config-name='fully_async_ppo_trainer' \
     actor_rollout_ref.model.path=<MODEL_PATH> \
     data.train_files=<TRAIN_FILES> \
@@ -75,6 +75,30 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
 `__init__`, whose side effect is calling `install()` to mount the recipe-owned
 `fault_tolerance` package into `verl.workers.rollout` and apply every decorator
 patch. The patches are idempotent, so re-imports are safe.
+
+Use `rollout_elastic.fully_async_main` for fully-async, including the command
+after `ray job submit --`. It calls the upstream Hydra entrypoint with the same
+configuration and overrides. Running the upstream fully-async module directly
+with `python -m` defines another TaskRunner under `__main__`, bypassing the
+canonical class patched by this recipe. Keep the external-module environment
+variable in the Ray worker runtime environment as well.
+
+The three fully-async actors are rebuilt after their patches are installed,
+using the original Python classes and upstream CPU/concurrency options. Install
+before creating actors; existing running actors are not updated. With
+`async_training.fault_tolerance.enabled=False` or absent, the fully-async entry
+methods and generation clients delegate to their original verl implementations.
+
+Run the patch regression tests in the pinned verl environment with Ray 2.55.1:
+
+```bash
+python3 -m unittest discover -s rollout_elastic/tests -p 'test_*patch*.py' -v
+python3 -m pytest -q rollout_elastic/tests/test_load_balancer.py
+```
+
+The patch tests cover native dispatch, actor registration/RPCs, and the canonical
+Hydra launcher. Training and fault-recovery validation still require the target
+GPU/NPU environment.
 
 ## Configuration
 
@@ -94,6 +118,28 @@ async_training:
     heartbeat_interval_s: 5.0
     heartbeat_miss_threshold: 3
     max_weight_sync_retries: 2
+    # Node-label based scheduling isolation (strict, whitelist-style). Give
+    # every node a role label at ray start time
+    # (`ray start --labels='{"verl.io/role": "<role>"}'`):
+    #   head nodes:    "head"    — run no business workload; excluded by both
+    #                              constraints below because they carry neither
+    #                              the trainer nor the rollout label.
+    #   trainer nodes: "trainer" — training + all CPU-side coordination actors
+    #                              (task runner, rollouter, trainer, message
+    #                              queue, agent/reward loop workers, LB,
+    #                              progress store).
+    #   rollout nodes: "rollout" — standalone rollout replicas (CKE workers and
+    #                              the vLLM HTTP servers that follow them).
+    # Requires Ray >= 2.49 (placement-group bundle_label_selector; the pinned
+    # test environment uses Ray 2.55.1). Startup fails fast on older Ray.
+    # Hybrid (colocated) rollout keeps native scheduling: it shares the
+    # trainer pool by design.
+    placement:
+      enabled: True
+      node_label_key: "verl.io/role"
+      # empty value disables the corresponding constraint
+      trainer_label_value: "trainer"
+      rollout_label_value: "rollout"
 actor_rollout_ref:
   rollout:
     # standalone async rollout

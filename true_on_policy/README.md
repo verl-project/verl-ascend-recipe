@@ -12,7 +12,7 @@
 | Python | 3.11 |                            |
 | PyTorch / torch_npu | 2.9.0 | 随 PTA B120                 |
 | vLLM | 0.18.0 |                            |
-| vLLM-Ascend | v0.18.0 + true_on_policy patch | FA3 + batch-invariant 训推一致性适配 |
+| vLLM-Ascend | v0.18.0 或 v0.23.0 + true_on_policy patch | FA3 + batch-invariant 训推一致性适配；patch 按树上特性自动选择 variant |
 | Megatron-LM | `3bec9aa97dda898d16ff5a89bac0ed2b6682b172` |                            |
 | MindSpeed | `core_r0.16.0` |                            |
 | verl | `release/v0.8.0` 或 `main` | main可能会因为迭代重构的原因导致patch出问题 |
@@ -39,8 +39,10 @@ true_on_policy/
 │   │   ├── verl_mindspeed_batch_invariant.patch
 │   │   ├── verl_per_request_seed_v0.8.0.patch   # PP 已 upstream 时的 seed 增量
 │   │   └── verl_per_request_seed_main.patch
+│   ├── vllm_ascend_patch_selector.py      # vllm-ascend 版本检测 + 上游特性检测
 │   ├── vllm_ascend_patches/
-│   │   └── vllm_ascend_true_on_policy.patch
+│   │   ├── vllm_ascend_true_on_policy_v0.18.0.patch
+│   │   └── vllm_ascend_true_on_policy_v0.23.0.patch
 │   ├── per_request_seed.md
 │   └── npu_true_on_policy_patch.py
 └── scripts/
@@ -69,14 +71,14 @@ pip install vllm==0.18.0
 
 git clone https://github.com/vllm-project/vllm-ascend.git
 cd vllm-ascend
-git checkout releases/v0.18.0
+git checkout releases/v0.18.0   # 或 releases/v0.23.0
 pip install -r requirements.txt
 export COMPILE_CUSTOM_KERNELS=1
 pip install -v -e .
 cd ..
 ```
 
-启动训练时，`VERL_USE_EXTERNAL_MODULES=verl_ascend_recipe.true_on_policy.patch` 会自动对 vllm-ascend 源码 apply `vllm_ascend_true_on_policy.patch`（含 FA3 backend 与 batch-invariant 算子注册）
+启动训练时，`VERL_USE_EXTERNAL_MODULES=verl_ascend_recipe.true_on_policy.patch` 会按 vllm-ascend 树上特性自动选择并 apply 对应 variant（v0.18.0：新建 FA3 backend + platform 路由 + batch-invariant 算子注册；v0.23.0：FA3 与路由已上游，仅 batch-invariant 注册并补齐 `fa3_v1.py`）
 
 ```bash
 pip install triton-ascend==3.2.1 \

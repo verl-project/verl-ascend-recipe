@@ -1,0 +1,29 @@
+diff --git a/mindspeed_llm/core/transformer/transformer_block.py b/mindspeed_llm/core/transformer/transformer_block.py
+index 1097d4c9..b370a0e7 100644
+--- a/mindspeed_llm/core/transformer/transformer_block.py
++++ b/mindspeed_llm/core/transformer/transformer_block.py
+@@ -117,9 +117,22 @@ def get_layer_offset_wrapper(fn):
+ 
+     @wraps(fn)
+     def wrapper(config):
+-        if config.num_layer_list:
++        raw_num_layer_list = getattr(config, "num_layer_list", None)
++        if raw_num_layer_list:
++            if isinstance(raw_num_layer_list, str):
++                num_layer_list = [
++                    int(value.strip())
++                    for value in raw_num_layer_list.strip("'\"").replace(";", ",").split(",")
++                    if value.strip()
++                ]
++            else:
++                num_layer_list = [int(value) for value in raw_num_layer_list]
+             pp_stage = parallel_state.get_pipeline_model_parallel_rank()
+-            return config.layer_offset[pp_stage]
++            return sum(num_layer_list[:pp_stage])
++
++        # if config.num_layer_list:
++        #     pp_stage = parallel_state.get_pipeline_model_parallel_rank()
++        #     return config.layer_offset[pp_stage]
+         return fn(config)
+ 
+     return wrapper

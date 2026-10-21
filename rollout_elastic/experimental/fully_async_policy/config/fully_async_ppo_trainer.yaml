@@ -40,6 +40,8 @@ async_training:
     heartbeat_interval_s: 5.0
     heartbeat_miss_threshold: 3
     replace_dead_replicas: True
+    # Give-up timeout for replacement: training stays with N-1 replicas.
+    replacement_give_up_timeout_s: 180.0
     # Mode C (token continuation): resume partial rollout from the persisted progress
     # checkpoint after a fault. Only active when BOTH fault_tolerance.enabled and
     # progress.enabled are True.

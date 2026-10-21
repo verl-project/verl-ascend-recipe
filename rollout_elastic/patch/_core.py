@@ -26,11 +26,12 @@ Three primitives are provided:
   receives the original implementation as its first argument.
 
 All patchers are idempotent: a method that has already been patched (its
-``_orig_<name>`` slot exists) is left untouched on re-import.
+``_orig_<name>`` slot exists on that class) is left untouched on re-import.
 
-``@ray.remote``-decorated classes are handled transparently: the decorators
-unwrap ``ActorClass`` to its ``__ray_actor_class__`` before patching, so the
-same call site works for plain and Ray-actor classes.
+For ``@ray.remote``-decorated classes, these helpers only modify the underlying
+plain class. The area module must then recreate the ActorClass from that class
+and rebind its consumers before any actor is started. Existing Ray wrappers and
+method metadata cannot be updated by changing the original class alone.
 """
 
 from __future__ import annotations
@@ -44,8 +45,8 @@ def unwrap_ray_remote(cls: type) -> type:
 
     ``@ray.remote class Foo`` rebinds ``Foo`` to an ``ActorClass`` object whose
     methods cannot be ``setattr``-ed directly. Ray keeps the original class at
-    ``ActorClass.__ray_actor_class__``, so we patch that instead — the actor
-    serializes the same class object when ``Foo.remote()`` is called.
+    ``ActorClass.__ray_actor_class__``. Patching it does not refresh the existing
+    ActorClass; callers must reconstruct and publish the actor after patching.
     """
     return getattr(cls, "__ray_actor_class__", cls)
 
@@ -55,45 +56,7 @@ def _mark_patched(cls: type, name: str) -> None:
 
 
 def _is_patched(cls: type, name: str) -> bool:
-    return hasattr(cls, f"_orig_{name}")
-
-
-def _ray_method_meta(target: type) -> Optional[Any]:
-    """Return Ray's per-method metadata table of ``target`` (``None`` if absent).
-
-    ``@ray.remote`` actors keep their per-method options (signatures,
-    num_returns, retry config, ...) in ``__ray_metadata__.method_meta``; a
-    method must be registered there before it can be called via
-    ``actor.<method>.remote()``.
-    """
-    meta = getattr(target, "__ray_metadata__", None)
-    if meta is None:
-        return None
-    return getattr(meta, "method_meta", None)
-
-
-def _register_actor_method(target: type, name: str, method: Callable) -> None:
-    """Register ``method`` in Ray's method metadata for ``target``.
-
-    ``@patch``/``@add`` only ``setattr`` the underlying plain class, which is
-    invisible to Ray's actor dispatch. Declaring the method in ``method_meta``
-    with default options lets ``actor.<name>.remote()`` resolve and execute it.
-    Idempotent: an existing entry is left untouched.
-    """
-    method_meta = _ray_method_meta(target)
-    if method_meta is None or name in method_meta.methods:
-        return
-    from ray._common.signature import extract_signature
-
-    method_meta.methods[name] = method
-    method_meta.signatures[name] = extract_signature(method, ignore_first=True)
-    method_meta.decorators[name] = None
-    method_meta.method_is_generator[name] = False
-    method_meta.num_returns[name] = None
-    method_meta.max_task_retries[name] = 0
-    method_meta.retry_exceptions[name] = False
-    method_meta.generator_backpressure_num_objects[name] = -1
-    method_meta.enable_task_events[name] = False
+    return f"_orig_{name}" in cls.__dict__
 
 
 def patch(cls: type, name: Optional[str] = None) -> Callable[[Callable], Callable]:
@@ -114,7 +77,6 @@ def patch(cls: type, name: Optional[str] = None) -> Callable[[Callable], Callabl
         if not _is_patched(target, method_name):
             _mark_patched(target, method_name)
             setattr(target, method_name, fn)
-            _register_actor_method(cls, method_name, fn)
         return fn
 
     return decorator
@@ -132,7 +94,6 @@ def add(cls: type, name: Optional[str] = None) -> Callable[[Callable], Callable]
         target = unwrap_ray_remote(cls)
         if not hasattr(target, method_name):
             setattr(target, method_name, fn)
-            _register_actor_method(cls, method_name, fn)
         return fn
 
     return decorator
