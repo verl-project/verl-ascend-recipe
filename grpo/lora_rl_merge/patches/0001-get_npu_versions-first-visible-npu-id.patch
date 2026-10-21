@@ -1,0 +1,53 @@
+diff --git a/verl/utils/device.py b/verl/utils/device.py
+index 33f0743f..f388c8ec 100644
+--- a/verl/utils/device.py
++++ b/verl/utils/device.py
+@@ -182,6 +182,28 @@ def get_device_capability(device_id: int = 0) -> tuple[int | None, int | None]:
+     return get_platform().get_device_capability(device_id)
+ 
+ 
++def get_first_visible_npu_id() -> int | None:
++    """Return the NPU ID of the first card visible to ``npu-smi``, or None if it cannot be determined.
++
++    ``npu-smi info -m`` lists one row per chip as ``NPU ID | Chip ID | Chip Logic ID | Chip Name``.
++    Rows whose ``Chip Logic ID`` is ``-`` are auxiliary chips (e.g. Mcu) and are skipped. Containers
++    that only mount a subset of cards (e.g. ``/dev/davinci4``-``/dev/davinci7``) keep the physical
++    NPU IDs, so the first logical chip's NPU ID is the correct argument for ``npu-smi info -i``.
++    """
++    try:
++        result = subprocess.run(["npu-smi", "info", "-m"], capture_output=True, text=True, check=True)
++    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
++        return None
++    for line in str(result.stdout).splitlines():
++        parts = line.split()
++        if len(parts) < 4 or not parts[0].isdigit() or not parts[1].isdigit():
++            continue
++        if parts[2] == "-":
++            continue
++        return int(parts[0])
++    return None
++
++
+ def get_npu_versions() -> tuple[str, str]:
+     """Get the software version and CANN toolkit version for NPU devices.
+ 
+@@ -191,13 +213,16 @@ def get_npu_versions() -> tuple[str, str]:
+     Raises:
+         RuntimeError: If unable to retrieve version information
+     """
+-    # Check npu-smi software version
++    # Check npu-smi software version. Query the first card that npu-smi can actually see; fall back to
++    # the historical default "1" when the mapping table is unavailable (e.g. older npu-smi, mocked runs).
++    first_npu_id = get_first_visible_npu_id()
++    probe_npu_id = str(first_npu_id) if first_npu_id is not None else "1"
+     try:
+         result = subprocess.run(
+-            ["npu-smi", "info", "-t", "board", "-i", "1"], capture_output=True, text=True, check=True
++            ["npu-smi", "info", "-t", "board", "-i", probe_npu_id], capture_output=True, text=True, check=True
+         )
+     except subprocess.CalledProcessError:
+-        # Card 1 not found (common in K8s with non-consecutive device IDs)
++        # Probed card not found (common in K8s with non-consecutive device IDs)
+         # Try first device from ASCEND_VISIBLE_DEVICES env var
+         visible_devices = os.environ.get("ASCEND_VISIBLE_DEVICES")
+         if not visible_devices:
