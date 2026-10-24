@@ -46,7 +46,7 @@ cd ..
 ```bash
 git clone https://github.com/vllm-project/vllm.git -b v0.18.0
 cd vllm
-git apply ../verl-ascend-recipe/GLM5/patch/vllm.patch
+git apply ../verl-ascend-recipe/GLM5/vllm_0180/patch/vllm.patch
 pip3 install -r requirements/common.txt
 pip3 install -r requirements/build.txt
 pip install torch==2.9.0
@@ -60,7 +60,7 @@ cd ..
 ```bash
 git clone https://github.com/vllm-project/vllm-ascend.git -b releases/v0.18.0
 cd vllm-ascend
-git apply ../verl-ascend-recipe/GLM5/patch/vllm-ascend.patch
+git apply ../verl-ascend-recipe/GLM5/vllm_0180/patch/vllm-ascend.patch
 pip install -r requirements-dev.txt
 pip install -v -e . --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple --trusted-host triton-ascend.osinfra.cn
 cd ..
@@ -81,7 +81,7 @@ cd ..
 ```bash
 git clone https://gitcode.com/Ascend/MindSpeed.git -b core_r0.16.0
 cd MindSpeed
-git apply ../verl-ascend-recipe/GLM5/patch/mindspeed.patch
+git apply ../verl-ascend-recipe/GLM5/vllm_0180/patch/mindspeed.patch
 pip install -e .
 cd ..
 ```
@@ -98,7 +98,7 @@ cp -r Megatron-LM/megatron verl/
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git -b v0.3.1
 cd Megatron-Bridge
-git apply ../verl-ascend-recipe/GLM5/patch/megatron-bridge.patch
+git apply ../verl-ascend-recipe/GLM5/vllm_0180/patch/megatron-bridge.patch
 cd ..
 cp -r Megatron-Bridge/src/megatron/bridge verl/megatron
 ```
@@ -154,5 +154,5 @@ export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2
 ```bash
 cd verl
 # 修改ray_start.sh中对应的网卡、主节点IP、权重、数据集地址
-bash ../verl-ascend-recipe/GLM5/scripts/ray_start.sh
+bash ../verl-ascend-recipe/GLM5/vllm_0180/scripts/ray_start.sh
 ```

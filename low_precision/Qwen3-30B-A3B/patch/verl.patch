@@ -1,0 +1,17 @@
+diff --git a/verl/utils/reward_score/gsm8k.py b/verl/utils/reward_score/gsm8k.py
+index 98a8c24d..35c58741 100644
+--- a/verl/utils/reward_score/gsm8k.py
++++ b/verl/utils/reward_score/gsm8k.py
+@@ -20,12 +20,6 @@ _SOLUTION_CLIP_CHARS = 300
+ def extract_solution(solution_str, method="strict"):
+     assert method in ["strict", "flexible"]
+ 
+-    # Optimization: Regular expression matching on very long strings can be slow.
+-    # For math problems, the final answer is usually at the end.
+-    # We only match on the last 300 characters, which is a safe approximation for 300 tokens.
+-    if len(solution_str) > _SOLUTION_CLIP_CHARS:
+-        solution_str = solution_str[-_SOLUTION_CLIP_CHARS:]
+-
+     if method == "strict":
+         # this also tests the formatting of the model
+         solutions = re.findall("#### (\\-?[0-9\\.\\,]+)", solution_str)

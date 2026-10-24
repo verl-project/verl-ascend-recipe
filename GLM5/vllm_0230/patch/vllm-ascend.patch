@@ -1,0 +1,24 @@
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 8709cfc36..ab5e7354f 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -779,7 +779,7 @@ class AscendSFAImpl(MLAAttentionImpl):
+         # self.W_UV = maybe_trans_nz(self.W_UV)
+ 
+         # Dispose kv_b_proj since it is replaced by W_UV and W_UK_T to save memory
+-        dispose_layer(self.kv_b_proj)
++        # Keep kv_b_proj for VERL dynamic weight synchronization.
+         if self.enable_dsa_cp:
+             if self.enable_dsa_cp_with_layer_shard:
+                 for layer in self.layer_sharding_kwargs or []:
+@@ -909,8 +909,8 @@ class AscendSFAImpl(MLAAttentionImpl):
+         if self.is_kv_consumer:
+             # Decode-only workers only execute Prolog. Drop the native Linear
+             # weights after their Prolog layouts and scales have been copied.
+-            dispose_layer(self.fused_qkv_a_proj)
+-            dispose_layer(self.q_proj)
++            # Keep fused_qkv_a_proj for VERL dynamic weight synchronization.
++            # Keep q_proj for VERL dynamic weight synchronization.
+             torch.npu.empty_cache()
+ 
+     # Processing the input parameters for MLAPO by reordering and transposing

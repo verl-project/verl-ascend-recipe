@@ -27,7 +27,9 @@ This area replaces the LB actor and extends the native client/manager classes:
   (retry on a fresh server) and token-continuation aware (mode C).
 - ``LLMServerManager``: tracks a process-level ``run_id``, can assemble the
   ``RolloutProgressStoreActor``, and can spawn replacement replicas
-  (``spawn_replacement`` / ``_reclaim_ray_resources``).
+  (``spawn_replacement`` / ``_reclaim_ray_resources``). Its control-plane
+  ``clear_kv_cache`` isolates transient rollout faults via the trainer-wired
+  callback (one-step) instead of failing the weight-sync step.
 
 The LB actor is defined completely before Ray decorates it. The core and retry
 client live under ``fault_tolerance``; native clients and the manager are extended
@@ -37,6 +39,7 @@ through decorators.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import socket
@@ -47,6 +50,7 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.llm_server import (
@@ -68,6 +72,22 @@ def _read_ft_enabled(config: Any) -> bool:
         return bool(config.async_training.fault_tolerance.enabled)
     except (AttributeError, KeyError):
         return False
+
+
+def _native_when_ft_disabled(cls):
+    """Dispatch before recipe tracing; capture this class's own native method."""
+    native = cls.generate
+
+    def decorate(ft_generate):
+        @functools.wraps(ft_generate)
+        async def generate(self, *args, **kwargs):
+            if not self._ft_enabled():
+                return await native(self, *args, **kwargs)
+            return await ft_generate(self, *args, **kwargs)
+
+        return generate
+
+    return decorate
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +188,40 @@ def _ft_max_request_retries(self) -> int:
         return int(self.config.async_training.fault_tolerance.max_request_retries)
     except (AttributeError, KeyError):
         return 3
+
+
+@add(LLMServerClient, "_resolve_original_max_tokens")
+def _resolve_original_max_tokens(self, original_prompt: list[int]) -> Optional[int]:
+    """
+    Agent loops never put max_tokens/max_new_tokens in sampling_params, so the
+    budget must come from the config for token continuation (abort resume /
+    checkpoint resume) to have a well-defined remaining budget. Returns None
+    when the rollout config is unavailable.
+    """
+    try:
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        raw = min(
+            rollout_cfg.response_length,
+            rollout_cfg.prompt_length + rollout_cfg.response_length - len(original_prompt),
+        )
+    except (AttributeError, KeyError, TypeError):
+        return None
+    raw = int(raw)
+    if self.max_model_len is not None:
+        raw = min(raw, self.max_model_len - len(original_prompt))
+    return max(0, raw)
+
+
+@add(LLMServerClient, "_generation_budget_key")
+def _generation_budget_key(self) -> str:
+    """Sampling-params key the client pins the generation budget under.
+
+    The server (patch/vllm.py) accepts both max_tokens and max_new_tokens;
+    the client always writes this single key so token-continuation
+    bookkeeping (checkpoint resume, budget decrement) stays unambiguous.
+    Override in a subclass to adapt to another server dialect.
+    """
+    return "max_tokens"
 
 
 @add(LLMServerClient, "_call_server")
@@ -295,6 +349,7 @@ async def _mark_server_failed(self, server_id: str) -> None:
 
 
 @patch(LLMServerClient, "generate")
+@_native_when_ft_disabled(LLMServerClient)
 @rollout_trace_op
 async def generate(
     self,
@@ -395,6 +450,7 @@ def _model_version_policy(self):
 
 
 @patch(FullyLLMServerClient, "generate")
+@_native_when_ft_disabled(FullyLLMServerClient)
 @rollout_trace_op
 async def _fully_generate(
     self,
@@ -421,14 +477,19 @@ async def _fully_generate(
     max_retries = self._ft_max_request_retries()
 
     original_prompt = normalize_token_ids(prompt_ids)
-    original_sampling = copy.deepcopy(sampling_params)
 
-    limit_key = None
-    if "max_tokens" in sampling_params:
-        limit_key = "max_tokens"
-    elif "max_new_tokens" in sampling_params:
-        limit_key = "max_new_tokens"
-    original_max_tokens = sampling_params.get(limit_key) if limit_key else None
+    sampling_params = dict(sampling_params)
+    budget_key = self._generation_budget_key()
+    original_max_tokens = self._resolve_original_max_tokens(original_prompt)
+    if original_max_tokens is not None:
+        sampling_params[budget_key] = original_max_tokens
+    else:
+        logger.warning(
+            "[FT] FullyLLMServerClient: cannot resolve generation budget from rollout config; "
+            "token continuation will fall back to the server-side per-attempt default "
+            "(each attempt may re-earn a full response_length)"
+        )
+    original_sampling = copy.deepcopy(sampling_params)
 
     final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
     min_global_steps, max_global_steps, global_steps = None, None, None
@@ -477,8 +538,8 @@ async def _fully_generate(
                 progress_ctx = ProgressContext(checkpoint=checkpoint)
                 prefix_for_call = checkpoint.resume_prefix_token_ids()
                 call_sampling = copy.deepcopy(original_sampling)
-                if limit_key is not None:
-                    call_sampling[limit_key] = checkpoint.remaining_max_tokens()
+                if original_max_tokens is not None:
+                    call_sampling[budget_key] = checkpoint.remaining_max_tokens()
                 # Seed final_output with inherited cumulative so that after fault reset
                 # (where final_output was cleared) the persisted tokens are not lost.
                 # On the abort path this is idempotent (cumulative == existing final_output).
@@ -491,7 +552,7 @@ async def _fully_generate(
                         recovery_id,
                         checkpoint.attempt_id,
                         len(prefix_for_call),
-                        call_sampling.get(limit_key) if limit_key else None,
+                        call_sampling.get(budget_key),
                     )
                     final_output = TokenOutput(
                         token_ids=list(checkpoint.cumulative_token_ids),
@@ -591,10 +652,10 @@ async def _fully_generate(
         max_global_steps = global_steps
         model_weight_version = global_steps
 
-        # 3. update max_new_tokens; truncate (FT only) to the original budget
-        if original_max_tokens is not None and limit_key is not None:
+        # 3. update the generation budget; truncate (FT only) to the original budget
+        if original_max_tokens is not None:
             if not progress_on:
-                sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)
+                sampling_params[budget_key] = original_max_tokens - len(final_output.token_ids)
             if len(final_output.token_ids) >= original_max_tokens:
                 if ft_on and len(final_output.token_ids) > original_max_tokens:
                     final_output.token_ids = final_output.token_ids[:original_max_tokens]
@@ -670,19 +731,26 @@ def _resolve_max_model_len(self) -> Optional[int]:
     return None
 
 
+def _ft_coordination_scheduling_strategy(config: Any, label: str):
+    """Soft node affinity for coordination actors (LB, progress store).
+
+    They must never colocate with inference replicas (K8s deletes the whole
+    pod on a replica fault). See
+    ``experimental._ft_non_inference_scheduling_strategy`` for the placement
+    policy; returns ``None`` when placement is disabled.
+    """
+    from .experimental import _ft_non_inference_scheduling_strategy
+
+    return _ft_non_inference_scheduling_strategy(config, label)
+
+
 @add(LLMServerManager, "_init_progress_store")
 async def _init_progress_store(self, progress_cfg) -> None:
     """Mode C: create and initialise the StoreActor. Called during FT assembly."""
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
     from verl.workers.rollout.fault_tolerance import RolloutProgressStoreActor
 
-    try:
-        node_id = ray.get_runtime_context().get_node_id()
-        scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
-    except Exception:
-        scheduling_strategy = None
     options = {"max_restarts": 3, "max_task_retries": 3}
+    scheduling_strategy = _ft_coordination_scheduling_strategy(self.config, "the progress store actor")
     if scheduling_strategy is not None:
         options["scheduling_strategy"] = scheduling_strategy
     self._progress_store = RolloutProgressStoreActor.options(**options).remote()
@@ -695,20 +763,29 @@ def _manager_ft_enabled(self) -> bool:
     return _read_ft_enabled(self.config)
 
 
+@add(LLMServerManager, "_ft_replacement_give_up_timeout_s")
+def _manager_ft_replacement_give_up_timeout_s(self) -> float:
+    """Give-up timeout for replacement: training stays with N-1 replicas."""
+    try:
+        return float(
+            OmegaConf.select(
+                self.config,
+                "async_training.fault_tolerance.replacement_give_up_timeout_s",
+                default=180.0,
+            )
+        )
+    except (AttributeError, KeyError, TypeError):
+        return 180.0
+
+
 @patch(LLMServerManager, "_init_global_load_balancer")
 async def _init_global_load_balancer(self) -> None:
     if not self._ft_enabled():
         await self._orig__init_global_load_balancer()
         return
 
-    try:
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-        node_id = ray.get_runtime_context().get_node_id()
-        scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=True)
-    except Exception:
-        scheduling_strategy = None
     options: dict[str, Any] = {"max_restarts": 3, "max_task_retries": 3}
+    scheduling_strategy = _ft_coordination_scheduling_strategy(self.config, "the global load balancer")
     if scheduling_strategy is not None:
         options["scheduling_strategy"] = scheduling_strategy
     self.global_load_balancer = ElasticGlobalRequestLoadBalancer.options(**options).remote(
@@ -749,6 +826,72 @@ def get_client(self, fully_async: bool = False, retry: bool = False) -> LLMServe
     return LLMServerClient(config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer)
 
 
+@patch(LLMServerManager, "clear_kv_cache")
+@auto_await
+async def _manager_clear_kv_cache(self) -> None:
+    """FT-aware KV-cache clear: isolate transient rollout faults, keep survivors.
+
+    The native method gathers over every replica in ``rollout_replicas`` and
+    lets the first failure fail the whole call. The Manager deliberately keeps
+    dead replicas listed (``spawn_replacement`` needs the old object), so the
+    one-step trainer's post-sync clear would raise ActorDiedError and kill the
+    training loop while a replacement is still being spawned.
+
+    With FT on, transient rollout faults (``is_transient_fault``) are handed to
+    ``_ft_clear_kv_fault_callback`` — wired by the trainer's Supervisor wiring
+    (one-step only; fully-async never calls this control-plane clear). Ordinary
+    code bugs, cancellation signals, a missing callback, or a failed isolation
+    all propagate: a control-plane clear must never be silently "successful"
+    when nothing was cleared.
+    """
+    callback = getattr(self, "_ft_clear_kv_fault_callback", None)
+    if not self._ft_enabled() or callback is None:
+        return await self._orig_clear_kv_cache()
+
+    from verl.workers.rollout.fault_tolerance.exceptions import is_transient_fault
+
+    # Snapshot: CKE prunes its own member copy; the Manager list must stay
+    # untouched so spawn_replacement can still find the dead replica object.
+    replicas = list(self.rollout_replicas)
+    results = await asyncio.gather(*[replica.clear_kv_cache() for replica in replicas], return_exceptions=True)
+
+    transient: list[tuple[Any, BaseException]] = []
+    fatal: list[BaseException] = []
+    for replica, exc in zip(replicas, results, strict=True):
+        if not isinstance(exc, BaseException):
+            continue
+        if isinstance(exc, asyncio.CancelledError):
+            raise exc
+        if is_transient_fault(exc):
+            transient.append((replica, exc))
+        else:
+            fatal.append(exc)
+
+    if fatal:
+        # Not a rollout fault (ordinary exception inside a replica clear):
+        # isolating it would hide a real bug — propagate as-is.
+        raise fatal[0]
+
+    for replica, exc in transient:
+        replica_id = replica._server_address
+        try:
+            await callback(replica_id)
+        except Exception as cb_exc:
+            # Un-isolated (Supervisor not running / LB unreachable): surface the
+            # original fault chained with the isolation failure — never swallow.
+            raise exc from cb_exc
+        logger.warning(
+            "[FT] clear_kv_cache: replica %s failed (%r); isolated, surviving replicas continue",
+            replica_id,
+            exc,
+        )
+
+    if len(transient) == len(replicas):
+        # Every replica failed: the rollout tier is gone. Isolation has been
+        # attempted, but this must not masquerade as a successful clear.
+        raise transient[0][1]
+
+
 @add(LLMServerManager, "spawn_replacement")
 async def spawn_replacement(self, dead_id: str) -> RolloutReplica:
     """Spawn a replacement RolloutReplica for ``dead_id`` (standalone mode only).
@@ -759,17 +902,15 @@ async def spawn_replacement(self, dead_id: str) -> RolloutReplica:
     if self.worker_group is not None:
         raise RuntimeError("spawn_replacement is standalone-mode only")
 
-    if dead_id not in self.server_addresses:
+    dead_replica = next((r for r in self.rollout_replicas if r._server_address == dead_id), None)
+    if dead_replica is None:
         raise ValueError(f"unknown dead_id={dead_id!r}; have {self.server_addresses}")
-    dead_rank = self.server_addresses.index(dead_id)
+    # List position != replica_rank after any replacement, so read both from the object.
+    dead_rank = dead_replica.replica_rank
+    dead_suffix = dead_replica.name_suffix
     log.warning("[FT] spawn_replacement: dead_id=%s rank=%s — beginning respawn", dead_id, dead_rank)
 
-    self.rollout_replicas = [r for r in self.rollout_replicas if r._server_address != dead_id]
-    kept = {r._server_address for r in self.rollout_replicas}
-    self.server_addresses = [a for a in self.server_addresses if a in kept]
-    self.server_handles = [r._server_handle for r in self.rollout_replicas]
-
-    await self._reclaim_ray_resources(dead_rank, log)
+    await self._reclaim_ray_resources(dead_rank, dead_suffix, log)
 
     # A killed named Ray actor can remain in Ray's name registry briefly.
     # Do not reuse the dead replica's fixed name prefix: on multi-node replicas
@@ -787,9 +928,11 @@ async def spawn_replacement(self, dead_id: str) -> RolloutReplica:
     if not bool(await asyncio.wait_for(new_replica.health(), timeout=30.0)):
         raise RuntimeError(f"new replica for {dead_id} (rank={dead_rank}) failed health check")
 
-    self.rollout_replicas.append(new_replica)
-    self.server_addresses.append(new_replica._server_address)
-    self.server_handles.append(new_replica._server_handle)
+    # Swap in place only on success: failures leave the lists untouched so the same dead_id can be retried.
+    idx = self.rollout_replicas.index(dead_replica)
+    self.rollout_replicas[idx] = new_replica
+    self.server_addresses[idx] = new_replica._server_address
+    self.server_handles[idx] = new_replica._server_handle
     log.warning(
         "[FT] spawn_replacement: new replica %s (rank=%s) up and healthy",
         new_replica._server_address,
@@ -799,7 +942,7 @@ async def spawn_replacement(self, dead_id: str) -> RolloutReplica:
 
 
 @add(LLMServerManager, "_reclaim_ray_resources")
-async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> None:
+async def _reclaim_ray_resources(self, dead_rank: int, name_suffix: str, log: logging.Logger) -> None:
     """Kill stale actors, remove their placement groups, then await a full replica's resources."""
     from ray.util.placement_group import get_placement_group, placement_group_table, remove_placement_group
 
@@ -807,15 +950,18 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
 
     nnodes = int(self.rollout_config.nnodes)
     local_world_size = int(self.rollout_config.n_gpus_per_node)
+    worker_prefix = f"rollout_standalone_{dead_rank}{name_suffix}"
     candidate_names = (
         [
-            f"rollout_standalone_{dead_rank}{cls}{pg_idx}:{local_rank}"
+            f"{worker_prefix}{cls}{pg_idx}:{local_rank}"
             for cls in ("CheckpointEngineWorker", "vLLMHttpServer")
             for pg_idx in range(nnodes)
             for local_rank in range(local_world_size)
         ]
+        # vLLM HTTP server actor names differ across verl versions (with or without suffix).
         + [f"vllm_server_{dead_rank}_{i}" for i in range(nnodes)]
-        + [f"rollout_standalone_{dead_rank}"]
+        + [f"vllm_server_{dead_rank}_{i}{name_suffix}" for i in range(nnodes)]
+        + [worker_prefix]
     )
     for name in candidate_names:
         try:
@@ -825,7 +971,7 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
         ray.kill(handle, no_restart=True)
         log.warning("[FT] spawn_replacement: ray.kill stale actor %s", name)
 
-    pg_prefix = f"rollout_pool_{dead_rank}"
+    pg_prefix = f"rollout_pool_{dead_rank}{name_suffix}"
     for pg_id, info in placement_group_table().items():
         name = info.get("name", "")
         if not name.startswith(pg_prefix):
@@ -844,8 +990,9 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
         * self.rollout_config.pipeline_model_parallel_size
     ) // nnodes
     required_accelerators = rollout_world_size
+    timeout_s = self._ft_replacement_give_up_timeout_s()
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 180.0
+    deadline = loop.time() + timeout_s
     last_seen = -1.0
     while True:
         accelerator_avail = float(ray.available_resources().get(resource_name, 0.0))
@@ -859,7 +1006,7 @@ async def _reclaim_ray_resources(self, dead_rank: int, log: logging.Logger) -> N
             return
         if loop.time() > deadline:
             raise RuntimeError(
-                "dead replica resources not freed after 180s "
+                f"dead replica resources not freed after {timeout_s}s "
                 f"(available {resource_name}={accelerator_avail}, required={required_accelerators})"
             )
         if abs(accelerator_avail - last_seen) > 0.01:

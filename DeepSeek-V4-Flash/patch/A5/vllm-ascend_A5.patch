@@ -1,0 +1,1395 @@
+diff --git a/vllm_ascend/ascend_forward_context.py b/vllm_ascend/ascend_forward_context.py
+index 0b51455e6..cc3de07c0 100644
+--- a/vllm_ascend/ascend_forward_context.py
++++ b/vllm_ascend/ascend_forward_context.py
+@@ -1,4 +1,5 @@
+ import math
++import os
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from enum import Enum
+@@ -142,6 +143,7 @@ def set_ascend_forward_context(
+         moe_comm_type = select_moe_comm_method(
+             max_num_tokens,
+             vllm_config,
++            is_graph_execution=aclgraph_runtime_mode != CUDAGraphMode.NONE,
+         )
+ 
+         forward_context.moe_comm_type = moe_comm_type
+@@ -314,6 +316,7 @@ def _select_a5_moe_comm_method(
+     num_tokens: int,
+     vllm_config: VllmConfig,
+     mc2_tokens_capacity: int,
++    is_graph_execution: bool = False,
+ ) -> MoECommType:
+     num_experts_per_tok = getattr(
+         vllm_config.model_config.hf_text_config,
+@@ -321,6 +324,27 @@ def _select_a5_moe_comm_method(
+         getattr(vllm_config.model_config.hf_text_config, "top_k_experts", 1),
+     )
+     world_size = vllm_config.parallel_config.world_size_across_dp
++    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
++    # MoeDistributeDispatch/Combine (MC2) deadlocks in the eager warmup runs
++    # before A5 graph capture (507034 vector-core timeout, data-independent),
++    # PIECEWISE graph mode keeps the static-shape all-gather implementation.
++    # Debug knob: VLLM_ASCEND_A5_FULL_CAPTURE_MC2=1 keeps MC2 in
++    # FULL_DECODE_ONLY graph execution. Use the explicit graph runtime mode
++    # supplied by the model runner: communication selection happens before
++    # entering torch.npu.graph(), so is_current_stream_capturing() is still
++    # false at this point and cannot identify capture reliably. Meanwhile,
++    # FULL_DECODE_ONLY eager execution (capture warmup, prefill) uses all-to-all
++    # to avoid the EP-wide all-gather memory amplification at large scale.
++    if cudagraph_mode is not None:
++        if cudagraph_mode.name == "PIECEWISE":
++            return MoECommType.ALLGATHER
++        if cudagraph_mode.name == "FULL_DECODE_ONLY":
++            if (
++                os.environ.get("VLLM_ASCEND_A5_FULL_CAPTURE_MC2") == "1"
++                and is_graph_execution
++            ):
++                return MoECommType.MC2
++            return MoECommType.ALLTOALL
+     if (num_tokens is None or num_tokens <= mc2_tokens_capacity) and world_size > 1:
+         return MoECommType.MC2
+     if world_size <= num_experts_per_tok:
+@@ -328,7 +352,11 @@ def _select_a5_moe_comm_method(
+     return MoECommType.ALLTOALL
+ 
+ 
+-def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommType | None:
++def select_moe_comm_method(
++    num_tokens: int,
++    vllm_config: VllmConfig,
++    is_graph_execution: bool = False,
++) -> MoECommType | None:
+     """Select the MoE communication method according to parallel settings,
+     device generation, and token count.
+ 
+@@ -378,7 +406,12 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
+             vllm_config,
+         )
+     elif soc_version == AscendDeviceType.A5:
+-        moe_comm_type = _select_a5_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
++        moe_comm_type = _select_a5_moe_comm_method(
++            num_tokens,
++            vllm_config,
++            mc2_tokens_capacity,
++            is_graph_execution,
++        )
+     elif soc_version == AscendDeviceType._310P:
+         moe_comm_type = MoECommType.ALLGATHER
+ 
+diff --git a/vllm_ascend/attention/context_parallel/dsa_cp.py b/vllm_ascend/attention/context_parallel/dsa_cp.py
+index 4687c9a51..b46dc96d6 100644
+--- a/vllm_ascend/attention/context_parallel/dsa_cp.py
++++ b/vllm_ascend/attention/context_parallel/dsa_cp.py
+@@ -15,8 +15,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec
+ from vllm_ascend.attention import dsa_v1
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.dsa_attn_kv_plan import (
++    dsa_indexer_uses_quant,
++    dsa_unquant_indexer_key_seq_lens,
++    fill_dsv4_indexer_key_seq_lens,
+     get_dsa_attn_kv_plan,
+     is_a5_bf16_kv_enabled,
++    select_dsa_indexer_unquant_topk,
+ )
+ from vllm_ascend.attention.dsa_v1 import (
+     _dsa_layout_kv,
+@@ -123,6 +127,7 @@ class AscendDSAReqMetadata:
+     attn_mask: torch.Tensor | None = None
+     ori_win_left: int | None = None
+     ori_win_right: int = 0
++    indexer_key_seq_lens: torch.Tensor | None = None
+     dspark_swa_indices: torch.Tensor | None = None
+ 
+ 
+@@ -233,6 +238,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+         self.start_pos_prefill = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+         self.req_sas_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
+         self.req_qli_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
++        self.indexer_key_seq_lens = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+         self.cu_seqlens_ori_kv = torch.tensor([], device=self.device)
+         self.cu_seqlens_cmp_kv = torch.tensor([], device=self.device)
+         self.seqused_q = torch.tensor([], device=self.device)
+@@ -817,6 +823,11 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+             sas_metadata=sas_metadata,
+             qli_metadata=qli_metadata,
+             cu_cmp_seqlen_list=cu_cmp_seqlens,
++            indexer_key_seq_lens=(
++                fill_dsv4_indexer_key_seq_lens(self.indexer_key_seq_lens, local_seq_lens)
++                if self.compressor_ratio == 4
++                else None
++            ),
+         )
+ 
+     def _build_local_token_metadata(
+@@ -1005,7 +1016,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+         return self.req_sas_metadata[:1024]
+ 
+     def _build_qli_metadata(self, query_start_loc, seq_lens, seq_lens_q, num_reqs):
+-        if self.compressor_ratio != 4:
++        if self.compressor_ratio != 4 or not dsa_indexer_uses_quant(self.vllm_config):
+             return None
+ 
+         cache_key = "cp_qli"
+@@ -1828,6 +1839,16 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
+         if self.indexer.compressor.rotate:
+             kv = rotate_activation(kv, indexer_kv_scale_metadata.hadamard)
+ 
++        if is_a5_bf16_kv_enabled(self.vllm_config):
++            if kv.dtype != indexer_k_cache.dtype:
++                kv = kv.to(dtype=indexer_k_cache.dtype)
++            get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
++                indexer_k_cache,
++                kv,
++                indexer_slot_mapping,
++            )
++            return
++
+         _, kv_scale = DeviceOperator.indexer_quant_scatter_part1(
+             kv,
+             indexer_k_cache,
+@@ -1884,11 +1905,21 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
+         q = rotate_activation(q, indexer_kv_scale_metadata.hadamard)
+         weights = self.weights_proj(x) * (self.indexer_softmax_scale * self.indexer_heads**-0.5)
+ 
+-        q, q_scale = DeviceOperator.indexer_quantize_query(q)
+-
+         assert indexer_kv_scale_metadata.req_metadata is not None
+-        qli_metadata = indexer_kv_scale_metadata.req_metadata.qli_metadata
+         block_table = indexer_kv_scale_metadata.req_metadata.block_table
++        if is_a5_bf16_kv_enabled(self.vllm_config):
++            return select_dsa_indexer_unquant_topk(
++                query=q,
++                key_cache=indexer_k_cache,
++                weights=weights,
++                actual_seq_lengths_query=actual_seq_lengths_query[1:],
++                actual_seq_lengths_key=dsa_unquant_indexer_key_seq_lens(indexer_kv_scale_metadata.req_metadata),
++                block_table=block_table,
++                index_topk=self.index_topk,
++            )
++
++        q, q_scale = DeviceOperator.indexer_quantize_query(q)
++        qli_metadata = indexer_kv_scale_metadata.req_metadata.qli_metadata
+         topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
+             query=q,
+             key=indexer_k_cache,
+diff --git a/vllm_ascend/attention/dsa_attn_kv_plan.py b/vllm_ascend/attention/dsa_attn_kv_plan.py
+index 810662ff7..9181bdd18 100644
+--- a/vllm_ascend/attention/dsa_attn_kv_plan.py
++++ b/vllm_ascend/attention/dsa_attn_kv_plan.py
+@@ -57,13 +57,88 @@ def get_dsv4_attn_kv_dtype(vllm_config) -> torch.dtype:
+     )
+ 
+ 
++def get_dsv4_indexer_kv_dtype(vllm_config) -> torch.dtype:
++    """Return the indexer K cache dtype for the selected DSV4 cache mode."""
++    if not _supports_dsv4_compressed_cache():
++        return torch.int8
++    return torch.bfloat16 if is_a5_bf16_kv_enabled(vllm_config) else torch.float8_e4m3fn
++
++
++def dsa_indexer_uses_quant(vllm_config) -> bool:
++    """Return whether indexer K uses the int8/FP8 quantized path."""
++    return not is_a5_bf16_kv_enabled(vllm_config)
++
++
++DSA_INDEXER_CMP_RATIO = 4
++# The unquantized lightning indexer has no cmp_ratio argument. Mode 3 would
++# compare original-token query lengths with compressed-key lengths and mask all
++# valid keys during prefill, so score the stored compressed key range directly.
++DSA_INDEXER_UNQUANT_SPARSE_MODE = 0
++
++
++def get_dsv4_indexer_key_seq_lens(
++    seq_lens: torch.Tensor,
++    cmp_ratio: int = DSA_INDEXER_CMP_RATIO,
++) -> torch.Tensor:
++    """Convert original token lengths to stored compressed-key lengths."""
++    return torch.div(seq_lens, cmp_ratio, rounding_mode="floor")
++
++
++def fill_dsv4_indexer_key_seq_lens(out: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
++    """Write compressed indexer lengths into a persistent graph input buffer."""
++    n = seq_lens.shape[0]
++    out[:n].copy_(get_dsv4_indexer_key_seq_lens(seq_lens))
++    return out[:n]
++
++
++def dsa_unquant_indexer_key_seq_lens(metadata) -> torch.Tensor:
++    key_seq_lens = getattr(metadata, "indexer_key_seq_lens", None)
++    if key_seq_lens is not None:
++        return key_seq_lens
++    return get_dsv4_indexer_key_seq_lens(metadata.seq_lens)
++
++
++def _unquant_lightning_indexer(**kwargs):
++    op = getattr(torch_npu, "npu_lightning_indexer", None)
++    if callable(op):
++        return op(**kwargs)
++    return torch.ops._C_ascend.npu_lightning_indexer(**kwargs)
++
++
++def select_dsa_indexer_unquant_topk(
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    weights: torch.Tensor,
++    actual_seq_lengths_query: torch.Tensor,
++    actual_seq_lengths_key: torch.Tensor,
++    block_table: torch.Tensor,
++    index_topk: int,
++) -> torch.Tensor:
++    """Select TopK from an unquantized BF16 indexer cache."""
++    if query.dtype != key_cache.dtype:
++        query = query.to(dtype=key_cache.dtype)
++    topk_idxs, _ = _unquant_lightning_indexer(
++        query=query,
++        key=key_cache,
++        weights=weights.to(dtype=key_cache.dtype),
++        actual_seq_lengths_query=actual_seq_lengths_query,
++        actual_seq_lengths_key=actual_seq_lengths_key,
++        block_table=block_table,
++        layout_query="TND",
++        layout_key="PA_BSND",
++        sparse_count=index_topk,
++        sparse_mode=DSA_INDEXER_UNQUANT_SPARSE_MODE,
++    )
++    return topk_idxs
++
++
+ DSA_COMPRESSOR_SLOT_MAPPING_FLAT = 1
+ DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET = 2
+ 
+ 
+ @dataclass(frozen=True)
+ class DsaAttnKvPlan:
+-    """The attention-KV plan only; indexer KV remains independently FP8."""
++    """Attention-KV plan. A5 BF16 mode also stores indexer K in BF16."""
+ 
+     uses_sparse_flash_mla: bool
+     uses_kv_compress_epilog: bool
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index b2359a09b..d75747cbb 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -20,6 +20,8 @@ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.dsa_attn_kv_plan import (
++    dsa_indexer_uses_quant,
++    fill_dsv4_indexer_key_seq_lens,
+     get_dsa_attn_kv_plan,
+     is_a5_bf16_kv_enabled,
+ )
+@@ -88,14 +90,50 @@ def _has_weight_scale(linear) -> bool:
+     return getattr(linear, "weight_scale", None) is not None
+ 
+ 
++def _dsa_o_proj_weight_for_batch_matmul(
++    weight: torch.Tensor,
++    n_local_groups: int,
++    input_dim: int,
++) -> torch.Tensor:
++    """Return an A5 BF16 grouped weight in ``[groups, K, N]`` layout."""
++    if weight.dim() == 3:
++        if weight.shape[-2] == input_dim:
++            return weight
++        if weight.shape[-1] == input_dim:
++            return weight.transpose(-1, -2)
++        raise ValueError(
++            "DSA wo_a weight has no axis matching the input K dimension, "
++            f"got weight {tuple(weight.shape)} and K={input_dim}."
++        )
++    if weight.dim() != 2:
++        raise ValueError(f"DSA wo_a weight must be 2D or 3D, got shape {tuple(weight.shape)}.")
++    if weight.shape[0] == n_local_groups * input_dim:
++        return weight.view(n_local_groups, input_dim, -1)
++    if weight.shape[1] == input_dim:
++        return weight.view(n_local_groups, -1, input_dim).transpose(-1, -2)
++    raise ValueError(
++        "DSA wo_a weight cannot be reshaped to grouped [K, N], "
++        f"got weight {tuple(weight.shape)}, groups={n_local_groups}, K={input_dim}."
++    )
++
++
++def _dsa_o_proj_matmul(
++    o_proj_input: torch.Tensor,
++    weight: torch.Tensor,
++    n_local_groups: int,
++) -> torch.Tensor:
++    grouped_weight = _dsa_o_proj_weight_for_batch_matmul(weight, n_local_groups, o_proj_input.shape[-1])
++    return torch.matmul(o_proj_input.transpose(0, 1), grouped_weight).transpose(0, 1)
++
++
+ def _dsa_layout_kv(vllm_config: VllmConfig) -> str:
+     return get_dsa_attn_kv_plan(vllm_config).layout_kv
+ 
+ 
+ def _dsa_swa_only_cmp_ratio(compress_ratio: int, vllm_config: VllmConfig) -> int:
+-    """BF16 SWA-only attention takes no compressed stream; otherwise keep main's value."""
+-    if is_a5_bf16_kv_enabled(vllm_config) and compress_ratio <= 1:
+-        return 0
++    """SWA-only layers have no compressed stream; the kernels require
++    cmp_ratio >= 1, so report 1 (no compression) instead of the raw 0.
++    Passing 0 reaches aclnnSparseFlashMla, which rejects it (EZ0026)."""
+     return max(compress_ratio, 1)
+ 
+ 
+@@ -241,6 +279,7 @@ class AscendDSAReqMetadata:
+     ori_win_left: int | None = None
+     ori_win_right: int | None = None
+     dspark_swa_indices: torch.Tensor | None = None
++    indexer_key_seq_lens: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -422,6 +461,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+         self.qli_metadata_buffer: torch.Tensor = torch.zeros(
+             DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=self.device
+         )
++        self.indexer_key_seq_lens = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+         self.cu_seqlens_ori_kv = torch.tensor([], device=self.device)
+         self.cu_seqlens_cmp_kv = torch.tensor([], device=self.device)
+         self.seqused_q = torch.tensor([], device=self.device)
+@@ -676,7 +716,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+         seq_lens: torch.Tensor,
+         max_seqlen_q: int,
+         max_seqlen_kv: int,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | None:
++        if not dsa_indexer_uses_quant(self.vllm_config):
++            return None
+         qli_metadata = metadata_cache.get("qli")
+         if qli_metadata is None:
+             qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
+@@ -786,6 +828,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+             max_seqlen_q=max_seqlen_q,
+             max_seqlen_kv=max_seqlen_kv,
+         )
++        indexer_key_seq_lens = (
++            fill_dsv4_indexer_key_seq_lens(self.indexer_key_seq_lens, seq_lens) if self.compressor_ratio == 4 else None
++        )
+ 
+         full_compress_cos, full_compress_sin = None, None
+         if self.compressor_ratio > 1:
+@@ -816,6 +861,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+             ori_win_left=ori_win_left,
+             ori_win_right=ori_win_right,
+             dspark_swa_indices=dspark_swa_indices,
++            indexer_key_seq_lens=indexer_key_seq_lens,
+         )
+ 
+     def build_for_drafting(
+@@ -1217,6 +1263,15 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+         elif olora_tp_enable():
+             o_proj_input = self.wo_a(o_proj_input)
+             output[...] = self.wo_b(o_proj_input)
++        elif self.support_fp8_attention:
++            # Ascend 950 with a BF16 checkpoint has no weight_scale.  Its
++            # wo_a is a regular 2D parameter, while the A2/A3 transpose-bmm
++            # kernel below requires a 3D weight and fails during FULL graph
++            # capture.  Reconstruct the grouped view and use the equivalent
++            # batched matmul, matching the validated pre-refactor A5 path.
++            o_proj_input = _dsa_o_proj_matmul(o_proj_input, self.wo_a.weight, self.n_local_groups)
++            o_proj_input = o_proj_input.reshape(num_tokens, -1)
++            output[...] = self.wo_b(o_proj_input)
+         else:
+             # A5 BF16 wo_a is reshaped to [groups, hidden, rank] at load time,
+             # matching the A3 layout expected by npu_transpose_batchmatmul.
+diff --git a/vllm_ascend/attention/sparse_flash_mla.py b/vllm_ascend/attention/sparse_flash_mla.py
+index 7161d4bef..e98dd96af 100644
+--- a/vllm_ascend/attention/sparse_flash_mla.py
++++ b/vllm_ascend/attention/sparse_flash_mla.py
+@@ -40,6 +40,10 @@ def sparse_flash_mla_metadata(**kwargs):
+     # This adapter is only selected for the BF16 paged-KV path. SparseFlashMla
+     # accepts PA_BBND for this cache; PA_ND belongs to the FP8 quantized op.
+     kwargs["layout_kv"] = "PA_BBND"
++    # cu_seqlens KV inputs are only valid for the TND layout; on the paged
++    # PA_BBND path sequence info comes from seqused/block_table instead.
++    kwargs.pop("cu_seqlens_ori_kv", None)
++    kwargs.pop("cu_seqlens_cmp_kv", None)
+     if "seqused_kv" in kwargs:
+         kwargs["seqused_ori_kv"] = kwargs.pop("seqused_kv")
+     if "max_seqlen_kv" in kwargs:
+@@ -55,6 +59,9 @@ def sparse_flash_mla(q: torch.Tensor, **kwargs):
+     kwargs.pop("tile_size", None)
+     kwargs.pop("rope_head_dim", None)
+     kwargs["layout_kv"] = "PA_BBND"
++    # See sparse_flash_mla_metadata: cu_seqlens KV inputs are TND-only.
++    kwargs.pop("cu_seqlens_ori_kv", None)
++    kwargs.pop("cu_seqlens_cmp_kv", None)
+     if "seqused_kv" in kwargs:
+         kwargs["seqused_ori_kv"] = kwargs.pop("seqused_kv")
+     _add_compressed_kv_lengths(kwargs)
+diff --git a/vllm_ascend/attention/utils.py b/vllm_ascend/attention/utils.py
+index d6e772779..7a049578a 100644
+--- a/vllm_ascend/attention/utils.py
++++ b/vllm_ascend/attention/utils.py
+@@ -22,6 +22,28 @@ from vllm_ascend.utils import (
+ SFA_QSFA_TILE_SIZE = 128
+ 
+ 
++def _create_sleep_persistent_buffer(factory: Callable[[], torch.Tensor]) -> torch.Tensor:
++    """Create an attention control buffer that survives sleep/wake cycles.
++
++    Attention control buffers (e.g. the DSA hadamard matrices) are created
++    outside the weights mem-pool, so CaMem would unmap them on sleep and never
++    remap them (wake only covers the weights/kv_cache tags). Any later access
++    — including the level-2 buffer restore copy — would touch an unmapped VA
++    and fail with aclrtMemcpy errors (507899). Tagging the allocation as
++    sleep-persistent keeps it mapped across sleep/wake. The buffers are tiny
++    control structures, so the extra resident memory is negligible.
++    """
++    try:
++        from vllm_ascend.device_allocator.camem import CaMemAllocator
++
++        allocator = CaMemAllocator.get_instance()
++        with allocator.use_allocation_tag(CaMemAllocator.sleep_persistent_tag):
++            return factory()
++    except Exception:
++        # CaMem unavailable (sleep mode disabled / non-NPU): plain allocation.
++        return factory()
++
++
+ def get_or_register_attention_buffer(
+     vllm_config: VllmConfig,
+     layer_names: list[str],
+@@ -45,7 +67,7 @@ def get_or_register_attention_buffer(
+ 
+     buffer = next((getattr(module, name) for module in modules if hasattr(module, name)), None)
+     if buffer is None:
+-        buffer = factory()
++        buffer = _create_sleep_persistent_buffer(factory)
+ 
+     for module in modules:
+         existing = getattr(module, name, None)
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index 4c9083868..b2bf0aa31 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -531,8 +531,8 @@ class BaseDeviceAdaptor:
+             kv_scale_out = kv_scale_out.unsqueeze(-1).to(torch.float16)
+             if kv_scale_out.ndim < 4:
+                 kv_scale_out = kv_scale_out.unsqueeze(-1)
+-            torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_out)
+-            torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_out)
++            torch_npu.npu_scatter_nd_update_(indexer_k_cache, slot_mapping, kv_out)
++            torch_npu.npu_scatter_nd_update_(indexer_scale_cache, slot_mapping, kv_scale_out)
+ 
+         return q, q_scale, kv_out, kv_scale_out
+ 
+@@ -545,7 +545,7 @@ class BaseDeviceAdaptor:
+             return None, None
+         kv_out, kv_scale = torch_npu.npu_dynamic_quant(kv, dst_type=torch.int8)
+         kv_scale = kv_scale.unsqueeze(-1)
+-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_out)
++        torch_npu.npu_scatter_nd_update_(indexer_k_cache, slot_mapping, kv_out)
+         return kv_out, kv_scale
+ 
+     @staticmethod
+@@ -555,7 +555,7 @@ class BaseDeviceAdaptor:
+         kv_scale = kv_scale.to(torch.float16)
+         if kv_scale.ndim < 4:
+             kv_scale = kv_scale.unsqueeze(-1)
+-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale)
++        torch_npu.npu_scatter_nd_update_(indexer_scale_cache, slot_mapping, kv_scale)
+ 
+     @staticmethod
+     def warmup_indexer_quant_scatter(hidden_states, slot_mapping):
+@@ -568,8 +568,8 @@ class BaseDeviceAdaptor:
+         dummy_shape = (1, 1, 1, kv_dummy.shape[-1])
+         indexer_k_cache = torch.zeros(dummy_shape, dtype=kv_dummy.dtype, device=hidden_states.device)
+         indexer_scale_cache = torch.zeros(dummy_shape, dtype=torch.float16, device=hidden_states.device)
+-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_dummy)
+-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_dummy)
++        torch_npu.npu_scatter_nd_update_(indexer_k_cache, slot_mapping, kv_dummy)
++        torch_npu.npu_scatter_nd_update_(indexer_scale_cache, slot_mapping, kv_scale_dummy)
+ 
+     # ===== Lightning Indexer Dtype Prep =====
+ 
+diff --git a/vllm_ascend/models/deepseek_v4/indexer.py b/vllm_ascend/models/deepseek_v4/indexer.py
+index 610382d2b..1a9d4b965 100644
+--- a/vllm_ascend/models/deepseek_v4/indexer.py
++++ b/vllm_ascend/models/deepseek_v4/indexer.py
+@@ -39,7 +39,14 @@ from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
+ from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+ from vllm.v1.kv_cache_interface import KVCacheSpec
+ 
+-from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
++from vllm_ascend.attention.dsa_attn_kv_plan import (
++    dsa_indexer_uses_quant,
++    dsa_unquant_indexer_key_seq_lens,
++    get_dsa_attn_kv_plan,
++    get_dsv4_indexer_kv_dtype,
++    is_a5_bf16_kv_enabled,
++    select_dsa_indexer_unquant_topk,
++)
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata, Compressor
+ from vllm_ascend.ops.cv_linear import CVLinearWrapper
+@@ -90,15 +97,16 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
+         super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
++        use_bf16_indexer_kv = is_a5_bf16_kv_enabled(vllm_config)
+         if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
+-            self.dtype = torch.float8_e4m3fn
+-            if not is_a5_bf16_kv_enabled(vllm_config):
++            self.dtype = torch.bfloat16 if use_bf16_indexer_kv else torch.float8_e4m3fn
++            if not use_bf16_indexer_kv:
+                 vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
+ 
+         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+-        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
++        from vllm_ascend.models.layer.attention.layer import dsv4_block_sizes
+ 
+-        storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
++        storage_block_size = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][0][0]
+         return AscendMLAAttentionSpec(
+             block_size=storage_block_size * self.compress_ratio,
+             num_kv_heads=1,
+@@ -107,7 +115,7 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
+             model_version="deepseek_v4",
+             compress_ratio=self.compress_ratio,
+             cache_dtype_str=self.cache_config.cache_dtype,
+-            scale_dim=1 if self.head_dim == 128 else 0,
++            scale_dim=0 if use_bf16_indexer_kv or self.head_dim != 128 else 1,
+             scale_dtype=torch.float
+             if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+             else torch.float16,
+@@ -143,16 +151,33 @@ class IndexerOverlapPlan:
+ 
+ 
+ class AscendIndexerOps:
+-    def __init__(self, index_topk: int) -> None:
++    def __init__(self, index_topk: int, vllm_config: VllmConfig | None = None) -> None:
+         from vllm_ascend.device.device_op import DeviceOperator
+ 
+         self.device_operator = DeviceOperator
+         self.index_topk = index_topk
++        self.vllm_config = vllm_config
++
++    def _uses_quant(self) -> bool:
++        return self.vllm_config is None or dsa_indexer_uses_quant(self.vllm_config)
++
++    def _scatter_unquant_key(
++        self,
++        key: torch.Tensor,
++        key_cache: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> None:
++        if key.dtype != key_cache.dtype:
++            key = key.to(dtype=key_cache.dtype)
++        assert self.vllm_config is not None
++        get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(key_cache, key, slot_mapping)
+ 
+     def unpack_dsa_indexer_kv_cache(self, kv_cache: tuple[torch.Tensor, ...]):
+         return self.device_operator.unpack_dsa_indexer_kv_cache(kv_cache)
+ 
+-    def quantize_query(self, query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    def quantize_query(self, query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
++        if not self._uses_quant():
++            return query, None
+         return self.device_operator.indexer_quantize_query(query)
+ 
+     def quantize_key_and_update_cache(
+@@ -162,6 +187,9 @@ class AscendIndexerOps:
+         full_cache: torch.Tensor | None,
+         slot_mapping: torch.Tensor,
+     ):
++        if not self._uses_quant():
++            self._scatter_unquant_key(key, key_cache, slot_mapping)
++            return key, None
+         return self.device_operator.indexer_quant_scatter_part1(
+             key,
+             key_cache,
+@@ -171,10 +199,12 @@ class AscendIndexerOps:
+ 
+     def update_scale_cache(
+         self,
+-        key_scale: torch.Tensor,
+-        scale_cache: torch.Tensor,
++        key_scale: torch.Tensor | None,
++        scale_cache: torch.Tensor | None,
+         slot_mapping: torch.Tensor,
+     ) -> None:
++        if key_scale is None or not self._uses_quant():
++            return
+         self.device_operator.dsa_indexer_scatter_scale_part3(
+             key_scale,
+             scale_cache,
+@@ -185,11 +215,21 @@ class AscendIndexerOps:
+         self,
+         query: torch.Tensor,
+         weights: torch.Tensor,
+-        query_scale: torch.Tensor,
++        query_scale: torch.Tensor | None,
+         key_cache: torch.Tensor,
+-        scale_cache: torch.Tensor,
++        scale_cache: torch.Tensor | None,
+         metadata: typing.Any,
+     ) -> torch.Tensor:
++        if not self._uses_quant():
++            return select_dsa_indexer_unquant_topk(
++                query=query,
++                key_cache=key_cache,
++                weights=weights,
++                actual_seq_lengths_query=metadata.query_start_loc[1:],
++                actual_seq_lengths_key=dsa_unquant_indexer_key_seq_lens(metadata),
++                block_table=metadata.block_table,
++                index_topk=self.index_topk,
++            )
+         topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
+             query=query,
+             key=key_cache,
+@@ -224,6 +264,17 @@ class AscendIndexerOps:
+         slot_mapping: torch.Tensor,
+         metadata: typing.Any,
+     ) -> torch.Tensor:
++        if not self._uses_quant():
++            if key is not None:
++                self._scatter_unquant_key(key, key_cache, slot_mapping)
++            return self.select_topk(
++                query,
++                weights,
++                None,
++                key_cache,
++                None,
++                metadata,
++            )
+         query, query_scale, _, _ = self.device_operator.indexer_quant_scatter(
+             query,
+             key,
+@@ -281,7 +332,7 @@ class DeepseekV4Indexer(nn.Module):
+         self.topk_indices_buffer = topk_indices_buffer
+         if self.skip_topk and self.topk_indices_buffer is None:
+             raise ValueError("skip_topk requires topk_indices_buffer")
+-        self.ops = AscendIndexerOps(index_topk=self.index_topk)
++        self.ops = AscendIndexerOps(index_topk=self.index_topk, vllm_config=vllm_config)
+         self.weights_proj = ReplicatedLinear(
+             config.hidden_size,
+             self.n_heads,
+@@ -290,14 +341,9 @@ class DeepseekV4Indexer(nn.Module):
+             prefix=f"{prefix}.weights_proj",
+             return_bias=False,
+         )
+-        k_dtype = (
+-            torch.float8_e4m3fn
+-            if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+-            else torch.int8
+-        )
++        k_dtype = get_dsv4_indexer_kv_dtype(vllm_config)
+ 
+         if self.compress_ratio == 4:
+-            # TODO(cmq): change the dtype of cache
+             self.k_cache = AscendDeepseekV4IndexerCache(
+                 head_dim=self.head_dim,
+                 dtype=k_dtype,
+diff --git a/vllm_ascend/models/deepseek_v4/model.py b/vllm_ascend/models/deepseek_v4/model.py
+index 5d72477b4..1d307d2da 100644
+--- a/vllm_ascend/models/deepseek_v4/model.py
++++ b/vllm_ascend/models/deepseek_v4/model.py
+@@ -537,6 +537,7 @@ class DeepseekV4Attention(nn.Module):
+             head_size=self.rope_head_dim,
+             rotary_dim=self.rope_head_dim,
+             max_position_embeddings=max_position_embeddings,
++            original_seq_len=max_position_embeddings if self.compress_ratio > 1 else 0,
+             is_neox_style=False,
+             scaling_factor=config.rope_parameters["factor"],
+             base=config.rope_parameters["rope_theta"],
+@@ -966,6 +967,7 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
+ 
+ 
+ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle3):
++    supports_level2_reload = True
+     packed_modules_mapping = {
+         "gate_up_proj": ["gate_proj", "up_proj"],
+     }
+@@ -1237,7 +1239,13 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
+                         # We should ask the weight loader to return success or
+                         # not here since otherwise we may skip experts with
+                         # other available replicas.
+-                        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
++                        weight_loader = getattr(param, "weight_loader", None)
++                        if weight_loader is None:
++                            module_path, _, _ = name_mapped.rpartition(".")
++                            experts = self.get_submodule(module_path)
++                            weight_loader = experts.weight_loader
++                            param.weight_loader = weight_loader
++                        weight_loader = typing.cast(Callable[..., bool], weight_loader)
+                         success = weight_loader(
+                             param,
+                             weight_to_load,
+diff --git a/vllm_ascend/models/layer/attention/layer.py b/vllm_ascend/models/layer/attention/layer.py
+index f4daa99fc..bfdc257b2 100644
+--- a/vllm_ascend/models/layer/attention/layer.py
++++ b/vllm_ascend/models/layer/attention/layer.py
+@@ -42,9 +42,11 @@ def get_dsv4_block_sizes(use_a5_bf16_kv: bool = False):
+         32: [[32, 32, 2, 4], [4224, 20480]],
+     }
+     _DSV4_BLOCK_SIZES_A5_BF16 = {
+-        128: [[128, 128, 8, 16], [16896, 131072]],
+-        64: [[64, 64, 4, 8], [8448, 65536]],
+-        32: [[32, 32, 2, 4], [4224, 32768]],
++        # t1 is BF16 indexer K: block_size * 128 elements * 2 bytes.
++        # t2 remains the BF16 attention page.
++        128: [[128, 128, 8, 16], [32768, 131072]],
++        64: [[64, 64, 4, 8], [16384, 65536]],
++        32: [[32, 32, 2, 4], [8192, 32768]],
+     }
+     if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
+         if use_a5_bf16_kv:
+diff --git a/vllm_ascend/ops/dsa.py b/vllm_ascend/ops/dsa.py
+index 0f3f21ef8..d97678387 100644
+--- a/vllm_ascend/ops/dsa.py
++++ b/vllm_ascend/ops/dsa.py
+@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm.v1.attention.backend import AttentionMetadata
+ 
++from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.models.layer.attention.layer import DSAAttention
+ 
+@@ -206,7 +207,7 @@ direct_register_custom_op(
+ 
+ 
+ def _build_kv_cache(self, forward_context):
+-    """Construct the 6-tuple KV cache used by impl.forward()."""
++    """Construct the KV cache tuple used by impl.forward()."""
+     compress_kv_cache = None
+     swa_kv_cache = self.swa_cache_layer.kv_cache
+     state_cache = None
+@@ -223,10 +224,14 @@ def _build_kv_cache(self, forward_context):
+             compress_kv_cache = compress_kv_cache[virtual_engine]
+     if self.compress_ratio == 4:
+         indexer_state_cache = self.indexer.compressor.state_cache.kv_cache
++        unfolded_indexer_cache = unfold_kvcache(self.indexer.k_cache.kv_cache)
+         if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
+-            indexer_k_cache, indexer_scale_cache, indexer_full_cache = unfold_kvcache(self.indexer.k_cache.kv_cache)
++            if is_a5_bf16_kv_enabled(self.indexer.vllm_config):
++                indexer_k_cache = unfolded_indexer_cache
++            else:
++                indexer_k_cache, indexer_scale_cache, indexer_full_cache = unfolded_indexer_cache
+         else:
+-            indexer_k_cache, indexer_scale_cache = unfold_kvcache(self.indexer.k_cache.kv_cache)
++            indexer_k_cache, indexer_scale_cache = unfolded_indexer_cache
+ 
+     if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
+         kv_cache = tuple(
+diff --git a/vllm_ascend/ops/fused_moe/moe_mlp.py b/vllm_ascend/ops/fused_moe/moe_mlp.py
+index 998dbcdcc..5437776fc 100644
+--- a/vllm_ascend/ops/fused_moe/moe_mlp.py
++++ b/vllm_ascend/ops/fused_moe/moe_mlp.py
+@@ -15,6 +15,8 @@
+ # This file is a part of the vllm-ascend project.
+ 
+ 
++import os
++
+ import torch
+ import torch_npu
+ from torch.nn.functional import pad
+@@ -36,6 +38,7 @@ from vllm_ascend.utils import (
+ ASCEND_DEVICE_TYPE = get_ascend_device_type()
+ # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
+ SITU_MX_DST_TYPE_E4M3FN = 36
++_DSV4_CLIPPED_SWIGLU_LOGGED = False
+ 
+ 
+ def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation=None):
+@@ -743,6 +746,23 @@ def unquant_apply_mlp(
+     elif activation == MoEActivation.GELU_TANH:
+         gate, up = gate_up_out.chunk(2, dim=-1)
+         gate_up_out = torch.nn.functional.gelu(gate, approximate="tanh") * up
++    elif os.getenv("VLLM_ASCEND_DSV4_CLIPPED_SWIGLU", "0") == "1" and swiglu_limit > 0:
++        # DeepSeek-V4 trains with swiglu_limit.  The ordinary unquantized
++        # vLLM SiLU path otherwise ignores that limit and diverges from actor.
++        global _DSV4_CLIPPED_SWIGLU_LOGGED
++        if not _DSV4_CLIPPED_SWIGLU_LOGGED:
++            print(
++                "[DSV4-ALIGN] applying clipped SwiGLU in unquantized MoE "
++                f"limit={swiglu_limit} alpha={swiglu_alpha} beta={swiglu_beta}",
++                flush=True,
++            )
++            _DSV4_CLIPPED_SWIGLU_LOGGED = True
++        gate_up_out = _apply_clipped_swiglu(
++            gate_up_out,
++            swiglu_limit=swiglu_limit,
++            swiglu_alpha=swiglu_alpha,
++            swiglu_beta=swiglu_beta,
++        )
+     else:
+         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+ 
+diff --git a/vllm_ascend/ops/fused_moe/token_dispatcher.py b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+index 066b033be..a68dabedf 100644
+--- a/vllm_ascend/ops/fused_moe/token_dispatcher.py
++++ b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+@@ -22,6 +22,7 @@
+ # limitations under the License.
+ from abc import ABC, abstractmethod
+ from typing import Generic
++from weakref import WeakSet
+ 
+ import torch
+ import torch_npu
+@@ -57,6 +58,29 @@ from vllm_ascend.utils import (
+ 
+ EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
+ EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
++_TOKEN_DISPATCHERS: WeakSet = WeakSet()
++
++
++def capture_token_dispatcher_tensors():
++    saved = []
++    for dispatcher in list(_TOKEN_DISPATCHERS):
++        tensors = {
++            name: value.detach().cpu().clone()
++            for name, value in vars(dispatcher).items()
++            if isinstance(value, torch.Tensor) and value.device.type == "npu"
++        }
++        if tensors:
++            saved.append((dispatcher, tensors))
++    return saved
++
++
++def restore_token_dispatcher_tensors(saved) -> None:
++    for dispatcher, tensors in saved:
++        for name, cpu_tensor in tensors.items():
++            current = getattr(dispatcher, name, None)
++            if not isinstance(current, torch.Tensor):
++                raise RuntimeError(f"Missing MoE token-dispatcher tensor during wake: {name}")
++            current.copy_(cpu_tensor)
+ 
+ 
+ def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
+@@ -74,6 +98,7 @@ class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
+         """
+         self.top_k = kwargs.get("top_k", 0)
+         self.num_experts = kwargs.get("num_experts", 0)
++        _TOKEN_DISPATCHERS.add(self)
+         self.lora_context = None
+ 
+     def set_lora_context(self, lora_context) -> None:
+diff --git a/vllm_ascend/ops/linear.py b/vllm_ascend/ops/linear.py
+index d29c71e6f..9721b9e10 100644
+--- a/vllm_ascend/ops/linear.py
++++ b/vllm_ascend/ops/linear.py
+@@ -95,7 +95,18 @@ class AscendUnquantizedLinearMethod(TPWeightSwitchMixin, UnquantizedLinearMethod
+         # must use fp32 to avoid accuracy degradation in dsv4.
+         if getattr(layer, "precast_fp32_weight", False):
+             weight_fp32 = layer.weight.data.to(torch.float32)
+-            layer.weight_fp32 = weight_fp32 if keep_nd_weight else maybe_trans_nz(weight_fp32)
++            new_fp32 = weight_fp32 if keep_nd_weight else maybe_trans_nz(weight_fp32)
++            old_fp32 = getattr(layer, "weight_fp32", None)
++            if (
++                isinstance(old_fp32, torch.Tensor)
++                and old_fp32.data_ptr() != new_fp32.data_ptr()
++                and old_fp32.shape == new_fp32.shape
++                and old_fp32.dtype == new_fp32.dtype
++            ):
++                # RL weight-update path: copy the new weight to the existing fp32 weight tensor
++                old_fp32.copy_(new_fp32)
++            else:
++                layer.weight_fp32 = new_fp32
+         if "conv1d" not in layer.prefix:
+             # 310P torch_npu rejects FRACTAL_NZ matmul when the weight-side
+             # matrix has n=1 or k=1. Keep scalar gates such as Qwen MoE's
+diff --git a/vllm_ascend/ops/rope_dsv4.py b/vllm_ascend/ops/rope_dsv4.py
+index 77eb57ae4..cf575ca39 100644
+--- a/vllm_ascend/ops/rope_dsv4.py
++++ b/vllm_ascend/ops/rope_dsv4.py
+@@ -21,6 +21,22 @@ class RopeGlobalState:
+ _ROPE_STATE = RopeGlobalState()
+ 
+ 
++def capture_full_rope_cache() -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
++    return {
++        key: tuple(tensor.detach().cpu().clone() for tensor in value)
++        for key, value in _ROPE_STATE.full_rope_cache.items()
++    }
++
++
++def restore_full_rope_cache(saved: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> None:
++    for key, cpu_tensors in saved.items():
++        current = _ROPE_STATE.full_rope_cache.get(key)
++        if current is None:
++            continue
++        for tensor, cpu_tensor in zip(current, cpu_tensors):
++            tensor.copy_(cpu_tensor)
++
++
+ class RopeDataProxy:
+     def __init__(self, data_map, is_cos=True):
+         self._data = data_map
+@@ -169,6 +185,7 @@ class ComplexExpRotaryEmbedding(nn.Module):
+         head_size: int,
+         rotary_dim: int,
+         max_position_embeddings: int,
++        original_seq_len: int,
+         base: int,
+         scaling_factor: float,
+         rope_groups: list[str] | None = None,
+@@ -194,7 +211,7 @@ class ComplexExpRotaryEmbedding(nn.Module):
+ 
+         if config_key not in _ROPE_STATE.full_rope_cache:
+             inv_freq = self.precompute_freqs_cis(
+-                rotary_dim, max_position_embeddings, max_position_embeddings, base, scaling_factor, beta_fast, beta_slow
++                rotary_dim, max_position_embeddings, original_seq_len, base, scaling_factor, beta_fast, beta_slow
+             )
+             t = torch.arange(
+                 max_position_embeddings * scaling_factor,
+@@ -277,6 +294,9 @@ class ComplexExpRotaryEmbedding(nn.Module):
+         inv_freq_extrapolation = 1.0 / pos_freqs
+         inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+ 
++        if original_seq_len==0:
++            return inv_freq_extrapolation
++
+         low, high = yarn_find_correction_range(
+             beta_fast,
+             beta_slow,
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index c74915923..a2f501e3e 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -519,6 +519,26 @@ if vllm_version_is("0.27.1"):
+         # compatibility; platform validation guarantees that it is one.
+         del pcp_world_size
+         token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
++        # A truncated DeepSeek-V4 can contain only one cache type (for
++        # example, two C0/SWA layers).  Such a model is not hybrid and must
++        # use the ordinary coordinator.  Keep this check before the DSV4
++        # specialization, whose coordinator requires at least two distinct
++        # attention groups.
++        if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
++            orig_kwargs = dict(
++                kv_cache_config=kv_cache_config,
++                max_model_len=max_model_len,
++                use_eagle=use_eagle,
++                enable_caching=enable_caching,
++                enable_kv_cache_events=enable_kv_cache_events,
++                dcp_world_size=dcp_world_size,
++                pcp_world_size=1,
++                hash_block_size=hash_block_size,
++                metrics_collector=metrics_collector,
++            )
++            orig_kwargs["max_in_flight_tokens"] = token_budget
++            orig_kwargs["scheduler_block_size"] = scheduler_block_size
++            return _orig_get_kv_cache_coordinator(**orig_kwargs)
+         if _is_deepseek_v4_kv_cache_config(kv_cache_config):
+             return AscendHybridKVCacheCoordinator(
+                 kv_cache_config,
+@@ -536,22 +556,6 @@ if vllm_version_is("0.27.1"):
+                 scheduler_block_size=scheduler_block_size,
+             )
+ 
+-        if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
+-            orig_kwargs = dict(
+-                kv_cache_config=kv_cache_config,
+-                max_model_len=max_model_len,
+-                use_eagle=use_eagle,
+-                enable_caching=enable_caching,
+-                enable_kv_cache_events=enable_kv_cache_events,
+-                dcp_world_size=dcp_world_size,
+-                pcp_world_size=1,
+-                hash_block_size=hash_block_size,
+-                metrics_collector=metrics_collector,
+-            )
+-            orig_kwargs["max_in_flight_tokens"] = token_budget
+-            orig_kwargs["scheduler_block_size"] = scheduler_block_size
+-            return _orig_get_kv_cache_coordinator(**orig_kwargs)
+-
+         return AscendHybridKVCacheCoordinator(
+             kv_cache_config,
+             max_model_len,
+@@ -590,6 +594,24 @@ else:
+         # compatibility; platform validation guarantees that it is one.
+         del pcp_world_size
+         token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
++        # See the v0.27.1 branch above: a one-cache-type truncated DSV4 is
++        # not a hybrid model and must not enter AscendHybridKVCacheCoordinator.
++        if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
++            orig_kwargs = dict(
++                kv_cache_config=kv_cache_config,
++                max_model_len=max_model_len,
++                use_eagle=use_eagle,
++                enable_caching=enable_caching,
++                enable_kv_cache_events=enable_kv_cache_events,
++                dcp_world_size=dcp_world_size,
++                pcp_world_size=1,
++                hash_block_size=hash_block_size,
++                metrics_collector=metrics_collector,
++            )
++            orig_kwargs["max_in_flight_tokens"] = token_budget
++            orig_kwargs["scheduler_block_size"] = scheduler_block_size
++            orig_kwargs["num_prefill_lookahead"] = num_prefill_lookahead
++            return _orig_get_kv_cache_coordinator(**orig_kwargs)
+         if _is_deepseek_v4_kv_cache_config(kv_cache_config):
+             return AscendHybridKVCacheCoordinator(  # type: ignore[call-arg]
+                 kv_cache_config,
+@@ -608,23 +630,6 @@ else:
+                 num_prefill_lookahead=num_prefill_lookahead,
+             )
+ 
+-        if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
+-            orig_kwargs = dict(
+-                kv_cache_config=kv_cache_config,
+-                max_model_len=max_model_len,
+-                use_eagle=use_eagle,
+-                enable_caching=enable_caching,
+-                enable_kv_cache_events=enable_kv_cache_events,
+-                dcp_world_size=dcp_world_size,
+-                pcp_world_size=1,
+-                hash_block_size=hash_block_size,
+-                metrics_collector=metrics_collector,
+-            )
+-            orig_kwargs["max_in_flight_tokens"] = token_budget
+-            orig_kwargs["scheduler_block_size"] = scheduler_block_size
+-            orig_kwargs["num_prefill_lookahead"] = num_prefill_lookahead
+-            return _orig_get_kv_cache_coordinator(**orig_kwargs)
+-
+         return AscendHybridKVCacheCoordinator(  # type: ignore[call-arg]
+             kv_cache_config,
+             max_model_len,
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 582bcb7dc..3f7d8387c 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -575,6 +575,7 @@ class NPUPlatform(Platform):
+         moe_comm_type = select_moe_comm_method(
+             max_tokens_across_dp,
+             vllm_config,
++            is_graph_execution=cudagraph_runtime_mode != CUDAGraphMode.NONE,
+         )
+         moe_comm_method = get_moe_comm_method(moe_comm_type)
+ 
+diff --git a/vllm_ascend/worker/block_table.py b/vllm_ascend/worker/block_table.py
+index dcf8b4fa0..8174afe45 100644
+--- a/vllm_ascend/worker/block_table.py
++++ b/vllm_ascend/worker/block_table.py
+@@ -6,6 +6,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.kv_cache_interface import (
+     KVCacheGroupSpec,
+     KVCacheSpecKind,
++    UniformTypeKVCacheSpecs,
+     get_kv_cache_spec_kind,
+ )
+ from vllm.v1.utils import CpuGpuBuffer
+@@ -46,6 +47,10 @@ class BlockTable:
+         self.pin_memory = pin_memory
+         self.device = device
+         self.physical_block_size = block_size
++        kv_cache_spec = kv_cache_group.kv_cache_spec if kv_cache_group is not None else None
++        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
++            kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()), None)
++        self.compress_ratio = getattr(kv_cache_spec, "compress_ratio", 1)
+         self.is_mamba_group = is_mamba_group
+ 
+         # If kernel_sizes is None or [0], use physical block size (no splitting)
+@@ -93,6 +98,10 @@ class BlockTable:
+             self.max_num_batched_tokens + num_mtp_draft_slots,
+             dtype=torch.int32,
+         )
++        self.track_raw_block_ids = self.compress_ratio > 1
++        if self.track_raw_block_ids:
++            self.raw_block_ids = np.zeros((max_num_reqs, self.max_num_blocks_per_req), dtype=np.int32)
++            self.raw_num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+ 
+         self.kernel_sizes = kernel_sizes
+         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+@@ -105,6 +114,11 @@ class BlockTable:
+         if not block_ids:
+             return
+         block_ids = np.array(block_ids)
++        if self.track_raw_block_ids:
++            raw_start = self.raw_num_blocks_per_row[row_idx]
++            num_raw = len(block_ids)
++            self.raw_block_ids[row_idx, raw_start : raw_start + num_raw] = block_ids
++            self.raw_num_blocks_per_row[row_idx] += num_raw
+         if self.use_hybrid_blocks:
+             block_ids = self._convert_physical_to_logical_blocks(block_ids)
+ 
+@@ -116,6 +130,8 @@ class BlockTable:
+ 
+     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+         self.num_blocks_per_row[row_idx] = 0
++        if self.track_raw_block_ids:
++            self.raw_num_blocks_per_row[row_idx] = 0
+         self.append_row(block_ids, row_idx)
+ 
+     def clear_row(self, row_idx: int) -> None:
+@@ -123,11 +139,20 @@ class BlockTable:
+         if num_blocks > 0:
+             self.block_table.np[row_idx, :num_blocks] = 0
+         self.num_blocks_per_row[row_idx] = 0
++        if self.track_raw_block_ids:
++            raw_blocks = self.raw_num_blocks_per_row[row_idx]
++            if raw_blocks > 0:
++                self.raw_block_ids[row_idx, :raw_blocks] = 0
++            self.raw_num_blocks_per_row[row_idx] = 0
+ 
+     def move_row(self, src: int, tgt: int) -> None:
+         num_blocks = self.num_blocks_per_row[src]
+         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
+         self.num_blocks_per_row[tgt] = num_blocks
++        if self.track_raw_block_ids:
++            raw_blocks = self.raw_num_blocks_per_row[src]
++            self.raw_block_ids[tgt, :raw_blocks] = self.raw_block_ids[src, :raw_blocks]
++            self.raw_num_blocks_per_row[tgt] = raw_blocks
+ 
+     def swap_row(self, src: int, tgt: int) -> None:
+         num_blocks_src = self.num_blocks_per_row[src]
+@@ -136,6 +161,12 @@ class BlockTable:
+         self.num_blocks_per_row[tgt] = num_blocks_src
+ 
+         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
++        if self.track_raw_block_ids:
++            raw_src = self.raw_num_blocks_per_row[src]
++            raw_tgt = self.raw_num_blocks_per_row[tgt]
++            self.raw_num_blocks_per_row[src] = raw_tgt
++            self.raw_num_blocks_per_row[tgt] = raw_src
++            self.raw_block_ids[[src, tgt]] = self.raw_block_ids[[tgt, src]]
+ 
+     def compute_slot_mapping(
+         self,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index e52539d98..06ca04f0c 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -2274,6 +2274,29 @@ class NPUModelRunner(GPUModelRunner):
+                         self.query_pos.np[:total_num_scheduled_tokens],
+                         out=dsa_positions_np,
+                     )
++                    if (
++                        self.model_config.enable_return_routed_experts
++                        and self.routed_experts_initialized
++                    ):
++                        c4_block_table = self.input_batch.block_table[0]
++                        if c4_block_table.track_raw_block_ids:
++                            block_span = (
++                                c4_block_table.physical_block_size
++                                * c4_block_table.compress_ratio
++                            )
++                            block_idx = np.clip(
++                                dsa_positions_np // block_span,
++                                0,
++                                c4_block_table.raw_block_ids.shape[1] - 1,
++                            )
++                            re_slot_mapping_np = (
++                                c4_block_table.raw_block_ids[req_indices, block_idx].astype(np.int64)
++                                * block_span
++                                + dsa_positions_np % block_span
++                            )
++                            self.routed_experts_slot_mapping_device[:total_num_scheduled_tokens].copy_(
++                                torch.from_numpy(re_slot_mapping_np)
++                            )
+ 
+                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+@@ -3157,13 +3180,9 @@ class NPUModelRunner(GPUModelRunner):
+                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+             if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
+                 if self.routed_experts_initialized:
+-                    # snapshot slot_mapping into a private device
+-                    # buffer so the next ``_prepare_inputs`` does not
+-                    # overwrite it while D2H is still pending.
+-                    n = slot_mapping.shape[0]
+-                    self.routed_experts_slot_mapping_device[:n].copy_(
+-                        slot_mapping
+-                    )
++                    if not (self.use_compress and blk_table.track_raw_block_ids):
++                        n = slot_mapping.shape[0]
++                        self.routed_experts_slot_mapping_device[:n].copy_(slot_mapping)
+             return blk_table_tensor, slot_mapping
+ 
+         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 6429bbf6f..93a854e26 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandsha
+ from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
+ from vllm.logger import logger
+ from vllm.lora.request import LoRARequest
++from vllm.model_executor.utils import replace_parameter
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+@@ -170,6 +171,11 @@ class NPUWorker(WorkerBase):
+         # is available, since the engine needs a reference to the model.
+         self.weight_transfer_engine = None
+         self._weight_update_active = False
++        self._sleep_saved_level2_constants = []
++        self._sleep_saved_token_dispatchers = []
++        self._sleep_saved_rope_cache = {}
++        self._level2_reload_pending = False
++        self._level2_graph_recapture_pending = False
+ 
+         # FixMe: this is a patch to fix the issue cause by https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170
+         from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED
+@@ -232,22 +238,53 @@ class NPUWorker(WorkerBase):
+ 
+     def sleep(self, level: int = 1) -> None:
+         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+-        model = self.model_runner.model
++        model = self.get_model()
+         if level == 1:
+-            self._sleep_saved_buffers = {
+-                name: buffer.cpu().clone()
+-                for name, buffer in model.named_buffers()
+-                if name.rsplit(".", maxsplit=1)[-1] in _allowed_names
+-            }
++            # 
++            #  _dsa_hadamard buffer 恢复在 wake_up 里 copy_ 回 NPU 时会报 507899
++            self._sleep_saved_buffers = {}
+         else:
+             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
++            runtime_constant_attrs = {"q_range", "k_range", "v_range"}
++            self._sleep_saved_level2_constants = []
++            for module_name, module in model.named_modules():
++                for attr_name, value in vars(module).items():
++                    is_q_norm_constant = (
++                        module_name.endswith("q_norm_without_weight")
++                        and attr_name == "weight"
++                    )
++                    if not (attr_name in runtime_constant_attrs or is_q_norm_constant):
++                        continue
++                    if isinstance(value, torch.Tensor) and value.device.type == "npu":
++                        self._sleep_saved_level2_constants.append(
++                            (module, attr_name, value.detach().cpu().clone())
++                        )
++            if getattr(model, "supports_level2_reload", False):
++                from vllm_ascend.ops.fused_moe.token_dispatcher import (
++                    capture_token_dispatcher_tensors,
++                )
++                from vllm_ascend.ops.rope_dsv4 import capture_full_rope_cache
++
++                self._sleep_saved_token_dispatchers = capture_token_dispatcher_tensors()
++                self._sleep_saved_rope_cache = capture_full_rope_cache()
++                self._level2_reload_pending = True
+ 
+         rl_config = get_ascend_config().rl_config
+         cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+         if cleanup_enabled:
+             self.sleep_wakeup_manager.sleep()
++        elif level == 2 and self.model_runner.use_aclgraph:
++            self.sleep_wakeup_manager.acl_graph.sleep()
++            self._level2_graph_recapture_pending = True
+ 
+         allocator = CaMemAllocator.get_instance()
++        # Diagnostic: log per-tag allocation sizes before sleeping, so the
++        # level-1 host-memory backup size (offloaded weights pool) can be
++        # attributed precisely.
++        tag_bytes: dict[str, int] = {}
++        for data in allocator.pointer_to_data.values():
++            tag_bytes[data.tag] = tag_bytes.get(data.tag, 0) + data.handle[1]
++        logger.info("CAMEM_LAYOUT before sleep level=%s tag_bytes=%s", level, tag_bytes)
+         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+         free_bytes_after_sleep, total = torch.npu.mem_get_info()
+         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+@@ -273,14 +310,89 @@ class NPUWorker(WorkerBase):
+         allocator = CaMemAllocator.get_instance()
+         allocator.wake_up(tags=tags)
+ 
+-        # Restore the buffers after level 2 sleep
++        model = self.get_model()
++        for module, attr_name, saved in self._sleep_saved_level2_constants:
++            live = getattr(module, attr_name, None)
++            if isinstance(live, torch.Tensor):
++                live.copy_(saved)
++        self._sleep_saved_level2_constants = []
++
+         if len(self._sleep_saved_buffers):
+-            model = self.model_runner.model
++            logger.info("wake_up: restoring %d saved buffers (tags=%s)", len(self._sleep_saved_buffers), tags)
+             for name, buffer in model.named_buffers():
+                 if name in self._sleep_saved_buffers:
+-                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
++                    try:
++                        buffer.data.copy_(self._sleep_saved_buffers[name].data)
++                    except Exception as e:
++                        logger.error(
++                            "wake_up: restore buffer %r failed: shape=%s dtype=%s device=%s saved_shape=%s: %s",
++                            name,
++                            tuple(buffer.shape),
++                            buffer.dtype,
++                            buffer.device,
++                            tuple(self._sleep_saved_buffers[name].shape),
++                            e,
++                        )
++                        raise
+             self._sleep_saved_buffers = {}
+ 
++        if self._sleep_saved_token_dispatchers:
++            from vllm_ascend.ops.fused_moe.token_dispatcher import (
++                restore_token_dispatcher_tensors,
++            )
++
++            restore_token_dispatcher_tensors(self._sleep_saved_token_dispatchers)
++            self._sleep_saved_token_dispatchers = []
++
++        level2_reload = (
++            self._level2_reload_pending
++            and getattr(model, "supports_level2_reload", False)
++            and (tags is None or "weights" in tags)
++        )
++        needs_moe_checkpoint_layout = level2_reload or (
++            self.vllm_config.quant_config is None and (tags is None or "weights" in tags)
++        )
++        hidden_size = (
++            self.vllm_config.model_config.hf_text_config.hidden_size
++            if needs_moe_checkpoint_layout
++            else None
++        )
++        if level2_reload:
++            from vllm_ascend.ops.rope_dsv4 import restore_full_rope_cache
++
++            restore_full_rope_cache(self._sleep_saved_rope_cache)
++            self._sleep_saved_rope_cache = {}
++            for name, param in list(model.named_parameters()):
++                needs_checkpoint_layout = param.ndim == 3 and (
++                    ("w2_weight" in name and param.shape[2] == hidden_size)
++                    or ("w13_weight" in name and param.shape[1] == hidden_size)
++                )
++                if needs_checkpoint_layout:
++                    parts = name.split(".")
++                    replace_parameter(
++                        model.get_submodule(".".join(parts[:-1])),
++                        parts[-1],
++                        param.transpose(1, 2),
++                    )
++            self._level2_reload_pending = False
++        elif self.vllm_config.quant_config is None and (tags is None or "weights" in tags):
++            # Ascend MoE keeps w13/w2 in the transposed runtime layout after
++            # process_weights_after_loading(). Online RL updates arrive in
++            # checkpoint layout, so expose checkpoint-layout parameter views
++            # before model.load_weights() writes the new expert shards.
++            for name, param in list(model.named_parameters()):
++                needs_checkpoint_layout = param.ndim == 3 and (
++                    ("w2_weight" in name and param.shape[2] == hidden_size)
++                    or ("w13_weight" in name and param.shape[1] == hidden_size)
++                )
++                if needs_checkpoint_layout:
++                    parts = name.split(".")
++                    replace_parameter(
++                        model.get_submodule(".".join(parts[:-1])),
++                        parts[-1],
++                        param.transpose(1, 2),
++                    )
++
+         if tags is None or "kv_cache" in tags:
+             self.model_runner.post_kv_cache_wake_up()
+ 
+@@ -288,6 +400,9 @@ class NPUWorker(WorkerBase):
+         cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+         if cleanup_enabled:
+             self.sleep_wakeup_manager.wakeup(tags)
++        elif self._level2_graph_recapture_pending and (tags is None or "kv_cache" in tags):
++            self.sleep_wakeup_manager.acl_graph.wakeup(tags)
++            self._level2_graph_recapture_pending = False
+ 
+     def _check_weight_transfer_engine(self) -> None:
+         if self.weight_transfer_engine is None:

@@ -1,0 +1,1572 @@
+diff --git a/docs/ascend_tutorial/profiling/ascend_profiling_en.rst b/docs/ascend_tutorial/profiling/ascend_profiling_en.rst
+index f201acc2..04cf1fcc 100644
+--- a/docs/ascend_tutorial/profiling/ascend_profiling_en.rst
++++ b/docs/ascend_tutorial/profiling/ascend_profiling_en.rst
+@@ -63,6 +63,8 @@ Use parameters in each role's ``profiler.tool_config.npu`` to control npu profil
+ 
+ -  analysis: Enables automatic data parsing.
+ -  discrete: Whether to enable discrete mode.
++-  profile_token_start: Effective only for the rollout role; defines the start response-token index for rollout decoding collection. It is applied only when valid (0-based, ``profile_token_end > profile_token_start``, and the window is within response length).
++-  profile_token_end: Effective only for the rollout role; defines the stop response-token index (exclusive) for rollout decoding collection. It is applied only when valid (0-based, ``profile_token_end > profile_token_start``, and the window is within response length).
+ 
+ 
+ Examples
+@@ -122,6 +124,9 @@ Discrete Mode Collection
+                tool_config:
+                   npu:
+                      discrete: True  # Must be enabled in Agent Loop mode
++                     # Optional response-token window for engine-side collection; if not set, the entire rollout stage is collected
++                     profile_token_start: 12
++                     profile_token_end: 46
+          # ref follow actor settings
+ 
+ **Agent Loop Mode Description**:
+@@ -392,4 +397,4 @@ The Megatron backend supports collection at the Mini-Batch granularity.
+                   # ... self.actor_optimizer.step() ...
+ 
+   +               # Drive schedule to collect mini batch
+-  +               self.prof_npu.step()
+\ No newline at end of file
++  +               self.prof_npu.step()
+diff --git a/docs/ascend_tutorial/profiling/ascend_profiling_zh.rst b/docs/ascend_tutorial/profiling/ascend_profiling_zh.rst
+index 8d28be0d..fba47520 100644
+--- a/docs/ascend_tutorial/profiling/ascend_profiling_zh.rst
++++ b/docs/ascend_tutorial/profiling/ascend_profiling_zh.rst
+@@ -55,6 +55,8 @@ Last updated: 12/20/2025.
+ 
+ -  analysis: 启用自动数据解析。
+ -  discrete: 使用离散模式。
++-  profile_token_start：仅在 rollout role 下生效，用于指定 rollout 解码阶段的采集起始 response token；参数合法时生效（从 0 开始，满足 ``profile_token_end > profile_token_start``，且区间在 response 长度内）。
++-  profile_token_end：仅在 rollout role 下生效，用于指定 rollout 解码阶段的采集结束 response token（右边界不包含）；参数合法时生效（从 0 开始，满足 ``profile_token_end > profile_token_start``，且区间在 response 长度内）。
+ 
+ 示例
+ ----
+@@ -114,6 +116,9 @@ Last updated: 12/20/2025.
+                tool_config:
+                   npu:
+                      discrete: True  # Agent Loop 模式下必须开启离散模式
++                     # 可选：按 response token 区间采集；不设置 start/stop 时采集整个 rollout 阶段
++                     profile_token_start: 12
++                     profile_token_end: 46
+          # ref follow actor settings
+ 
+ **Agent Loop 模式说明**：
+diff --git a/docs/perf/torch_profiling.md b/docs/perf/torch_profiling.md
+index cef455de..8a121faf 100644
+--- a/docs/perf/torch_profiling.md
++++ b/docs/perf/torch_profiling.md
+@@ -34,6 +34,8 @@ You can customize the PyTorch Profiler behavior using the following fields under
+     *   **`memory`**: Track tensor memory allocation/free.
+     *   **`shapes`**: Record shapes of operator inputs.
+     *   **`stack`**: Record source code file and line number.
++* **`profile_token_start`**: Effective only for the rollout role; defines the start response-token index for rollout decoding collection. It is applied only when valid (0-based, `profile_token_end > profile_token_start`, and within response length).
++* **`profile_token_end`**: Effective only for the rollout role; defines the stop response-token index (exclusive) for rollout decoding collection. It is applied only when valid (0-based, `profile_token_end > profile_token_start`, and within response length).
+ * **`schedule`**: (Advanced) configuration for `wait`, `warmup`, `active`, `repeat` cycles.
+ 
+ ## Examples
+@@ -86,6 +88,11 @@ actor_rollout_ref:
+       tool_config:
+         torch:
+           discrete: True # REQUIRED 
++          # Optional response-token window for rollout engine side collection.
++          # If start/stop are not set, the entire rollout stage is collected.
++          # Collect tokens in [12, 46), i.e. token index 12~45.
++          profile_token_start: 12
++          profile_token_end: 46
+   # ref follow actor settings
+ ```
+ 
+diff --git a/tests/utils/test_server_profiler.py b/tests/utils/test_server_profiler.py
+index 50d28451..530f93de 100644
+--- a/tests/utils/test_server_profiler.py
++++ b/tests/utils/test_server_profiler.py
+@@ -18,6 +18,7 @@ import unittest
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ from verl.utils.profiler.config import (
++    NPUToolConfig,
+     ProfilerConfig,
+     TorchProfilerToolConfig,
+     build_sglang_profiler_args,
+@@ -48,6 +49,25 @@ class TestServerProfilerArgs(unittest.TestCase):
+             self.assertTrue(profiler_config_dict["torch_profiler_with_stack"])
+             self.assertTrue(profiler_config_dict["torch_profiler_record_shapes"])
+             self.assertTrue(profiler_config_dict["torch_profiler_with_memory"])
++            self.assertEqual(profiler_config_dict["delay_iterations"], 0)
++            self.assertEqual(profiler_config_dict["max_iterations"], 0)
++
++    def test_build_vllm_profiler_args_with_profile_window(self):
++        tool_config = TorchProfilerToolConfig(contents=["stack"], profile_token_start=12, profile_token_end=46)
++        config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
++
++        args = build_vllm_profiler_args(config, tool_config, rank=1)
++        profiler_config_dict = json.loads(args["profiler_config"])
++        self.assertEqual(profiler_config_dict["delay_iterations"], 12)
++        self.assertEqual(profiler_config_dict["max_iterations"], 34)
++
++    def test_build_vllm_profiler_args_with_npu_profile_window(self):
++        tool_config = NPUToolConfig(contents=["npu"], profile_token_start=5, profile_token_end=13)
++        config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
++        args = build_vllm_profiler_args(config, tool_config, rank=0)
++        profiler_config_dict = json.loads(args["profiler_config"])
++        self.assertEqual(profiler_config_dict["delay_iterations"], 5)
++        self.assertEqual(profiler_config_dict["max_iterations"], 8)
+ 
+     def test_build_sglang_profiler_args(self):
+         # Case 1: Basic features
+@@ -58,6 +78,15 @@ class TestServerProfilerArgs(unittest.TestCase):
+         self.assertEqual(args["output_dir"], "/tmp/test/agent_loop_rollout_replica_0")
+         self.assertTrue(args["with_stack"])
+         self.assertTrue(args["record_shapes"])
++        self.assertIsNone(args["start_step"])
++        self.assertIsNone(args["num_steps"])
++
++    def test_build_sglang_profiler_args_with_profile_window(self):
++        tool_config = TorchProfilerToolConfig(contents=["stack"], profile_token_start=7, profile_token_end=16)
++        config = ProfilerConfig(save_path="/tmp/test", tool_config=tool_config)
++        args = build_sglang_profiler_args(config, tool_config, rank=0)
++        self.assertEqual(args["start_step"], 7)
++        self.assertEqual(args["num_steps"], 9)
+ 
+ 
+ class TestServerProfilerFunctionality(unittest.IsolatedAsyncioTestCase):
+diff --git a/verl/models/mcore/util.py b/verl/models/mcore/util.py
+index d58514d7..b0bccca8 100644
+--- a/verl/models/mcore/util.py
++++ b/verl/models/mcore/util.py
+@@ -567,6 +567,10 @@ def preprocess_bshd_engine(
+     batch_size = input_ids.shape[0]
+     seqlens_in_batch = input_ids.offsets().diff()
+     max_seqlen = seqlens_in_batch.max().item()
++    align_value = 2048
++    if max_seqlen % align_value != 0:
++        old_seqlen = max_seqlen
++        max_seqlen = ((max_seqlen + align_value - 1) // align_value) * align_value
+     tp_size = mpu.get_tensor_model_parallel_world_size()
+     # For CP, sequence length must be divisible by (2 * cp_size), and for SP by tp_size.
+     align_size = math.lcm(tp_size, 2 * cp_size) if cp_size > 1 else tp_size
+diff --git a/verl/third_party/vllm/__init__.py b/verl/third_party/vllm/__init__.py
+index 2f6646f3..6cafbc1f 100644
+--- a/verl/third_party/vllm/__init__.py
++++ b/verl/third_party/vllm/__init__.py
+@@ -14,6 +14,7 @@
+ 
+ from importlib.metadata import PackageNotFoundError, version
+ 
++import os
+ from packaging import version as vs
+ 
+ from verl.utils.device import is_npu_available
+@@ -39,8 +40,10 @@ if package_version is None:
+             f"vllm versions are 0.7.0+"
+         )
+ elif is_npu_available:
+-    # sleep_mode=2 is not supported on vllm-ascend for now, will remove this restriction when this ability is ready.
+-    VLLM_SLEEP_LEVEL = 1
++    # sleep_mode=2 is supported on vllm-ascend for DeepSeek V4 RL colocate
++    # (see worker.py level-2 sleep/wake machinery). It stays opt-in via the
++    # VLLM_SLEEP_LEVEL env var until it is validated on more models.
++    VLLM_SLEEP_LEVEL = int(os.environ.get("VLLM_SLEEP_LEVEL", "1"))
+     from vllm import LLM
+     from vllm.distributed import parallel_state
+ elif vs.parse(package_version) >= vs.parse("0.7.0"):
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index a8ffeb3a..0fea5201 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -367,10 +367,14 @@ actor_rollout_ref:
+           level: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.level,level0}
+           analysis: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.analysis,false}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         torch:
+           _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+           contents: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.contents,[]}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         precision_debugger:
+           _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+           config_path: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.config_path,${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}}
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index 0a153a1b..870dcd8b 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -334,10 +334,14 @@ actor_rollout_ref:
+           level: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.level,level0}
+           analysis: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.analysis,false}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         torch:
+           _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+           contents: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.contents,[]}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         precision_debugger:
+           _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+           config_path: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.config_path,${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}}
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index b58ed65e..a1704b07 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -343,10 +343,14 @@ actor_rollout_ref:
+           level: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.level,level0}
+           analysis: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.analysis,false}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         torch:
+           _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+           contents: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.contents,[]}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         precision_debugger:
+           _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+           config_path: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.config_path,${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}}
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index a6623177..7f6d235c 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -313,10 +313,14 @@ actor_rollout_ref:
+           level: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.level,level0}
+           analysis: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.analysis,false}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         torch:
+           _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+           contents: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.contents,[]}
+           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
++          profile_token_start: null
++          profile_token_end: null
+         precision_debugger:
+           _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+           config_path: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.config_path,${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}}
+diff --git a/verl/trainer/config/engine/mindspeed.yaml b/verl/trainer/config/engine/mindspeed.yaml
+index af1e9cab..04439196 100644
+--- a/verl/trainer/config/engine/mindspeed.yaml
++++ b/verl/trainer/config/engine/mindspeed.yaml
+@@ -4,42 +4,6 @@ _target_: verl.workers.config.MindSpeedEngineConfig
+ # mindspeed_llm or mindspeed_mm
+ strategy: mindspeed_llm
+ 
+-llm_kwargs:
+-  # mindspeed_llm model config
+-  use_mcore_models: true
+-  spec: []
+-  qk_layernorm: true
+-  position_embedding_type: rope
+-  normalization: RMSNorm
+-  disable_bias_linear: true
+-  swiglu: true
+-  attention_softmax_in_fp32: true  
+-  no_gradient_accumulation_fusion: true
+-  group_query_attention: true
+-
+-  # only support transformer_engine for now
+-  transformer_impl: transformer_engine
+-
+-  no_pad_to_seq_lengths: true
+-  reset_attention_mask: true
+-  context_parallel_algo: ulysses_cp_algo
+-  attention_mask_type: general
+-
+-  # mindspeed_llm optimizer config
+-  use_flash_attn: true
+-  use_fused_rotary_pos_emb: true
+-  sequence_parallel: true
+-  use_rotary_position_embeddings: true
+-  use_fused_swiglu: true
+-  use_fused_rmsnorm: true
+-  no_masked_softmax_fusion: true
+-  use_distributed_optimizer: true
+-
+-  # mindspeed_llm train config
+-  seq_length: 10240
+-  micro_batch_size: 1
+-  initial_loss_scale: 4096
+-  init_method_std: 0.01
+-  hidden_dropout: 0.0
++llm_kwargs: {}
+ 
+ mm_kwargs: {}
+diff --git a/verl/trainer/config/profiler/profiler.yaml b/verl/trainer/config/profiler/profiler.yaml
+index fd3b4bbb..c2c64726 100644
+--- a/verl/trainer/config/profiler/profiler.yaml
++++ b/verl/trainer/config/profiler/profiler.yaml
+@@ -35,6 +35,14 @@ tool_config:
+     # True for each task has its own database, False for all tasks in one training step share one database.
+     discrete: False
+ 
++    # Start collecting profiler data from this response-token index.
++    # null means collect from the first response token (full collection start).
++    profile_token_start: null
++
++    # Stop collecting profiler data at this response-token index (exclusive).
++    # null means collect until the end (full collection).
++    profile_token_end: null
++
+     name: npu
+ 
+ 
+@@ -58,6 +66,14 @@ tool_config:
+     # True for each task has its own database, False for all tasks in one training step share one database.
+     discrete: false
+ 
++    # Start collecting profiler data from this response-token index.
++    # null means collect from the first response token (full collection start).
++    profile_token_start: null
++
++    # Stop collecting profiler data at this response-token index (exclusive).
++    # null means collect until the end (full collection).
++    profile_token_end: null
++
+     name: torch
+ 
+   torch_memory:
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index a0f3eb92..24c83407 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -384,6 +384,14 @@ profiler:
+       # True for each task has its own database, False for all tasks in one training step share one database.
+       discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
+ 
++      # Start collecting profiler data from this response-token index.
++      # null means collect from the first response token (full collection start).
++      profile_token_start: null
++
++      # Stop collecting profiler data at this response-token index (exclusive).
++      # null means collect until the end (full collection).
++      profile_token_end: null
++
+     # torch profiler config
+     torch:
+ 
+@@ -397,6 +405,15 @@ profiler:
+       # True for each task has its own database, False for all tasks in one training step share one database.
+       discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
+ 
++      # Start collecting profiler data from this response-token index.
++      # null means collect from the first response token (full collection start).
++      profile_token_start: null
++
++      # Stop collecting profiler data at this response-token index (exclusive).
++      # null means collect until the end (full collection).
++      profile_token_end: null
++
++
+     # msprobe precision debugger config
+     precision_debugger:
+ 
+diff --git a/verl/utils/debug/metrics.py b/verl/utils/debug/metrics.py
+index 706a7f97..208f041f 100644
+--- a/verl/utils/debug/metrics.py
++++ b/verl/utils/debug/metrics.py
+@@ -12,6 +12,8 @@
+ # limitations under the License.
+ 
+ import logging
++import os
++from pathlib import Path
+ 
+ import torch
+ 
+@@ -20,6 +22,38 @@ from verl.protocol import DataProto
+ logger = logging.getLogger(__file__)
+ 
+ 
++def _dump_rollout_actor_alignment(data: DataProto) -> None:
++    """Dump the first rollout/actor comparison batch when explicitly enabled."""
++    dump_dir = os.getenv("VERL_ROLLOUT_ACTOR_DUMP_DIR")
++    if not dump_dir:
++        return
++
++    dump_path = Path(dump_dir) / "rollout_actor_step1.pt"
++    if dump_path.exists():
++        return
++
++    keys = (
++        "input_ids",
++        "attention_mask",
++        "position_ids",
++        "prompts",
++        "responses",
++        "response_mask",
++        "rollout_log_probs",
++        "old_log_probs",
++    )
++    payload = {
++        key: data.batch[key].detach().cpu()
++        for key in keys
++        if key in data.batch
++    }
++    Path(dump_dir).mkdir(parents=True, exist_ok=True)
++    tmp_path = dump_path.with_suffix(".tmp")
++    torch.save(payload, tmp_path)
++    os.replace(tmp_path, dump_path)
++    logger.warning("Saved rollout/actor alignment dump to %s", dump_path)
++
++
+ def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+     # verify inputs
+     if tensor1.numel() == 0 or tensor2.numel() == 0:
+@@ -80,6 +114,7 @@ def calculate_debug_metrics(data: DataProto) -> dict:
+             "training/rollout_actor_probs_pearson_corr": logprob's pearson corrcoef of rollout vs. actor, reference to https://arxiv.org/pdf/2506.13585
+     """
+ 
++    _dump_rollout_actor_alignment(data)
+     rollout_old_log_probs = data.batch["rollout_log_probs"]
+     actor_old_log_probs = data.batch["old_log_probs"]
+     if "response_mask" in data.batch:
+diff --git a/verl/utils/device.py b/verl/utils/device.py
+index e0e917a7..687feb74 100644
+--- a/verl/utils/device.py
++++ b/verl/utils/device.py
+@@ -239,6 +239,11 @@ def get_npu_versions() -> tuple[str, str]:
+ 
+ 
+ def check_ipc_version_support(software_version: str, cann_version: str) -> bool:
++    # return true for a5
++    import torch_npu
++    device_name = torch_npu.npu.get_device_name()
++    if "Ascend910_95" in device_name or "Ascend950" in device_name:
++        return True
+     """Check if the given software and CANN versions support IPC.
+ 
+     Compares the software version and CANN toolkit version against minimum
+diff --git a/verl/utils/megatron/router_replay_patch.py b/verl/utils/megatron/router_replay_patch.py
+index 012ab3ff..8929ffe5 100644
+--- a/verl/utils/megatron/router_replay_patch.py
++++ b/verl/utils/megatron/router_replay_patch.py
+@@ -18,13 +18,27 @@ from enum import Enum
+ from functools import wraps
+ 
+ import torch
+-
++import torch.nn.functional as F
++from megatron.core import parallel_state
++
++# Import granularly: some names (apply_router_token_dropping,
++# compute_routing_scores_for_aux_loss) do not exist in older/newer Megatron
++# versions; they are only used on the token-dropping / aux-loss paths, which
++# DSV4 does not enable. group_limited_topk is required by group-limited
++# routing and must not be lost to an unrelated missing name.
++try:
++    from megatron.core.transformer.moe.moe_utils import group_limited_topk
++except ImportError:
++    group_limited_topk = None
++try:
++    from megatron.core.transformer.moe.moe_utils import apply_router_token_dropping
++except ImportError:
++    apply_router_token_dropping = None
++try:
++    from megatron.core.transformer.moe.moe_utils import compute_routing_scores_for_aux_loss
++except ImportError:
++    compute_routing_scores_for_aux_loss = None
+ try:
+-    from megatron.core.transformer.moe.moe_utils import (
+-        apply_router_token_dropping,
+-        compute_routing_scores_for_aux_loss,
+-        group_limited_topk,
+-    )
+     from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+ except ImportError:
+     warnings.warn("NPU not support router replay for now.", stacklevel=2)
+@@ -162,6 +176,31 @@ def _patched_topk_routing_with_score_function(
+     def compute_topk(scores, topk, num_groups=None, group_topk=None):
+         # Default behavior if no replay is active
+ 
++        def apply_missing_target_fallback(top_indices):
++            if top_indices.shape[0] != scores.shape[0]:
++                raise RuntimeError(
++                    "router replay target/token mismatch: "
++                    f"target_rows={top_indices.shape[0]} score_rows={scores.shape[0]}"
++                )
++            missing = torch.all(top_indices == 0, dim=1)
++            if torch.any(missing):
++                _, fallback_indices = _compute_topk(
++                    scores,
++                    topk,
++                    num_groups=num_groups,
++                    group_topk=group_topk,
++                )
++                top_indices = top_indices.clone()
++                top_indices[missing] = fallback_indices[missing]
++                if router_replay is not None and not getattr(router_replay, "_missing_target_logged", False):
++                    print(
++                        "R3 replay: falling back to native TopK for "
++                        f"{int(missing.sum().item())} uncaptured route rows",
++                        flush=True,
++                    )
++                    router_replay._missing_target_logged = True
++            return top_indices
++
+         routing_action = router_replay.router_replay_action if router_replay is not None else None
+ 
+         if routing_action is None:
+@@ -182,6 +221,15 @@ def _patched_topk_routing_with_score_function(
+             top_indices = router_replay.target_topk_idx
+             # Ensure indices are on the correct device
+             top_indices = top_indices.to(scores.device)
++            # vLLM uses an all-zero row as the placeholder for tokens whose
++            # routing was not captured (currently the DSV4 prompt prefill
++            # region, plus the final sampled token which has not run a model
++            # forward).  Treating [0, 0, ..., 0] as a real TopK assignment
++            # routes the token to expert 0 only and introduces duplicate
++            # indices into the all-to-all dispatcher.  Preserve R3 for every
++            # captured response row, but recompute native TopK for the exact
++            # missing-row sentinel.
++            top_indices = apply_missing_target_fallback(top_indices)
+             # Gather the scores for the replayed indices to get the probabilities
+             probs = scores.gather(1, top_indices)
+             return probs, top_indices
+@@ -194,6 +242,10 @@ def _patched_topk_routing_with_score_function(
+             top_indices = router_replay.replay_backward_list.pop(0)
+             # Ensure indices are on the correct device
+             top_indices = top_indices.to(scores.device)
++            # The backward recomputation must make the same per-row decision
++            # as the original replay forward, including native fallback for
++            # uncaptured prompt/padding rows.
++            top_indices = apply_missing_target_fallback(top_indices)
+             # Gather the scores for the replayed indices to get the probabilities
+             probs = scores.gather(1, top_indices)
+             return probs, top_indices
+@@ -216,6 +268,20 @@ def _patched_topk_routing_with_score_function(
+         else:
+             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
++    elif score_function == "sqrtsoftplus":
++        # DSV4: scores = sqrt(softplus(logits)) computed in fp32 then cast back.
++        # Mirrors mindspeed_llm moe_utils.topk_softmax_with_capacity_and_hash:
++        # expert_bias only affects expert SELECTION; routed weights are always
++        # gathered from the raw (bias-free) scores, then normalized by the
++        # selected-sum and scaled by scaling_factor (done below).
++        scores = F.softplus(logits.float()).sqrt().type_as(logits)
++        if expert_bias is not None:
++            scores_for_routing = scores + expert_bias
++            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
++            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
++        else:
++            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
++        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+     else:
+         raise ValueError(f"Invalid score_function: {score_function}")
+ 
+@@ -288,6 +354,34 @@ def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
+     # Calculate probs and routing_map for token dispatching
+     if self.routing_type == "sinkhorn":
+         probs, routing_map = self.sinkhorn_load_balancing(logits)
++    elif (
++        getattr(self, "hash", False)
++        and getattr(self, "tid2eid", None) is not None
++        and getattr(self, "expert_bias", None) is None
++    ):
++        # DSV4 hash layers (layer_number <= n_hash_layers): routing is a fixed
++        # tid2eid[token_id] table lookup — deterministic and identical between
++        # actor and rollout by construction. Bypass replay and the TopK path
++        # entirely; replaying them would be a no-op anyway. Mirrors the hash
++        # branch of mindspeed_llm moe_utils.topk_softmax_with_capacity_and_hash.
++        input_ids = kwargs.get("input_ids", args[0] if args else None)
++        if input_ids is None:
++            raise ValueError("hash routing requires input_ids, but none was provided")
++        scores = F.softplus(logits.float()).sqrt().type_as(logits)
++        input_ids = input_ids.flatten()
++        tp_size = parallel_state.get_tensor_model_parallel_world_size()
++        tp_rank = parallel_state.get_tensor_model_parallel_rank()
++        input_ids = input_ids.chunk(tp_size)[tp_rank]
++        top_indices = self.tid2eid[input_ids].to(scores.device)
++        scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
++        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.topk > 1 else scores
++        if self.config.moe_router_topk_scaling_factor:
++            probs = probs * self.config.moe_router_topk_scaling_factor
++        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
++        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
++        # megatron convention: router returns FULL-WIDTH [num_tokens, num_experts]
++        # probs for the dispatcher; the gathered [T, topk] form breaks permute().
++        probs = routing_probs
+     else:
+         probs, routing_map = _patched_topk_routing_with_score_function(
+             logits=logits,
+@@ -394,18 +488,31 @@ def apply_router_replay_patch():
+         TransformerConfig.__init__ = patched_tf_config_init
+         TransformerConfig._verl_router_patched = True
+ 
+-    # Step 2: Patch TopKRouter only once to ensure idempotency.
+-    if hasattr(TopKRouter, "_router_replay_patched"):
++    # Step 2: Patch TopKRouter idempotently.  MindSpeed's repatch can replace
++    # ``__init__`` and/or ``routing`` after the first verl patch pass, while
++    # leaving class attributes intact.  Check the live methods rather than a
++    # stale class marker so a post-repatch call can restore RouterReplay.
++    init_is_patched = getattr(TopKRouter.__init__, "_verl_router_replay_patched", False)
++    routing_is_patched = getattr(TopKRouter.routing, "_verl_router_replay_patched", False)
++    if init_is_patched and routing_is_patched:
+         return
+ 
+-    original_init = TopKRouter.__init__
++    # Step 3: Define the new __init__ method only if MindSpeed replaced it.
++    # Treat __init__ and routing independently to avoid wrapping an intact
++    # patched __init__ twice and registering every router twice.
++    if not init_is_patched:
++        original_init = TopKRouter.__init__
++
++        def patched_init(self, *args, **kwargs):
++            original_init(self, *args, **kwargs)
++            self.router_replay = None
++            if getattr(self.config, "enable_routing_replay", False):
++                self.router_replay = RouterReplay()
++
++        patched_init._verl_router_replay_patched = True
++        TopKRouter.__init__ = patched_init
+ 
+-    # Step 3: Define the new __init__ method
+-    def patched_init(self, *args, **kwargs):
+-        original_init(self, *args, **kwargs)
+-        self.router_replay = None
+-        if getattr(self.config, "enable_routing_replay", False):
+-            self.router_replay = RouterReplay()
++    patched_routing._verl_router_replay_patched = True
+ 
+     # Step 4: Patch MoEAlltoAllTokenDispatcher.preprocess to handle router replay
+     # When router replay is enabled, duplicate indices in top_indices can cause
+@@ -438,6 +545,6 @@ def apply_router_replay_patch():
+         MoEAlltoAllTokenDispatcher._preprocess_patched = True
+ 
+     # Step 5: Apply the patches
+-    TopKRouter.__init__ = patched_init
+-    TopKRouter.routing = patched_routing
++    if not routing_is_patched:
++        TopKRouter.routing = patched_routing
+     TopKRouter._router_replay_patched = True
+diff --git a/verl/utils/megatron/router_replay_utils.py b/verl/utils/megatron/router_replay_utils.py
+index 9984af10..39356cc6 100644
+--- a/verl/utils/megatron/router_replay_utils.py
++++ b/verl/utils/megatron/router_replay_utils.py
+@@ -18,6 +18,7 @@ Utilities for handling router replay functionality in Megatron models.
+ """
+ 
+ import inspect
++import math
+ import warnings
+ from typing import Optional
+ 
+@@ -47,6 +48,26 @@ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAc
+ device_name = get_device_name()
+ 
+ 
++def _get_custom_num_layer_list(config: TransformerConfig) -> Optional[list[int]]:
++    """Return MindSpeed's uneven PP layer split in a normalized form."""
++    raw = getattr(config, "num_layer_list", None)
++    if not raw:
++        return None
++    if isinstance(raw, str):
++        layers = [int(item.strip()) for item in raw.replace(";", ",").split(",") if item.strip()]
++    else:
++        layers = [int(item) for item in raw]
++    pp_size = config.pipeline_model_parallel_size
++    if len(layers) != pp_size or sum(layers) != config.num_layers:
++        raise RuntimeError(
++            "invalid num_layer_list for router replay: "
++            f"layers={layers} pp_size={pp_size} num_layers={config.num_layers}"
++        )
++    if config.virtual_pipeline_model_parallel_size is not None:
++        raise RuntimeError("router replay does not support num_layer_list together with virtual pipeline parallelism")
++    return layers
++
++
+ # from megatron.core.transformer.transformer_block import get_num_layers_to_build
+ def get_num_layers_to_build(
+     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+@@ -70,6 +91,15 @@ def get_num_layers_to_build(
+             layer_type=LayerType.decoder, vp_stage=vp_stage
+         )
+ 
++    # MindSpeed-LLM supports an uneven pipeline split such as 43 layers over
++    # PP2 via num_layer_list=[21, 22].  Mirror the model builder instead of
++    # applying Megatron's equal-split divisibility assertion.
++    custom_layers = _get_custom_num_layer_list(config)
++    if custom_layers is not None:
++        if pp_rank is None:
++            pp_rank = mpu.get_pipeline_model_parallel_rank()
++        return custom_layers[pp_rank]
++
+     # Fallback for legacy tests.
+     if pp_rank is None:
+         pp_rank = mpu.get_pipeline_model_parallel_rank()
+@@ -200,14 +230,19 @@ def get_moe_num_layers_to_build(
+     """
+     total_layers = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+ 
+-    sig = inspect.signature(get_transformer_layer_offset)
+-    # core 0.12.1 is not support vp_stage and pp_rank as parameters
+-    if "vp_stage" in sig.parameters and "pp_rank" in sig.parameters:
+-        layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+-    elif "pp_rank" in sig.parameters:
+-        layer_offset = get_transformer_layer_offset(config, pp_rank=pp_rank)
++    custom_layers = _get_custom_num_layer_list(config)
++    if custom_layers is not None:
++        effective_pp_rank = mpu.get_pipeline_model_parallel_rank() if pp_rank is None else pp_rank
++        layer_offset = sum(custom_layers[:effective_pp_rank])
+     else:
+-        layer_offset = get_transformer_layer_offset(config)
++        sig = inspect.signature(get_transformer_layer_offset)
++        # core 0.12.1 is not support vp_stage and pp_rank as parameters
++        if "vp_stage" in sig.parameters and "pp_rank" in sig.parameters:
++            layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
++        elif "pp_rank" in sig.parameters:
++            layer_offset = get_transformer_layer_offset(config, pp_rank=pp_rank)
++        else:
++            layer_offset = get_transformer_layer_offset(config)
+ 
+     local_global_indices = range(layer_offset, layer_offset + total_layers)
+ 
+@@ -266,7 +301,13 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
+         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
+ 
+ 
+-def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
++def set_router_replay_data(
++    layers_topk_idx,
++    attention_mask,
++    tf_config,
++    vp_rank=None,
++    use_remove_padding=True,
++):
+     """
+     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
+     RouterReplay instance with target indices for replay mode.
+@@ -286,7 +327,83 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
+         None: The function updates internal RouterReplay instances in-place.
+     """
+     with torch.no_grad():
+-        if layers_topk_idx.is_nested:
++        if not use_remove_padding:
++            if attention_mask is None:
++                raise RuntimeError("padded router replay requires attention_mask")
++            if layers_topk_idx.is_nested:
++                # Model-engine batches store only valid tokens as a jagged
++                # tensor even when the MindSpeed model itself runs the padded
++                # BSHD path.  preprocess_bshd_engine() does not preserve the
++                # left padding in the original batch attention_mask: it copies
++                # every nested sequence into dense[:, :seqlen] and right-pads
++                # it to the aligned max length.  Reproduce that layout exactly,
++                # then flatten sequence-major to match the router's
++                # [S_local*B,E] token order.
++                values = layers_topk_idx.values()
++                batch_size = attention_mask.shape[0]
++                layer_num, topk = values.shape[-2:]
++                sequences = layers_topk_idx.unbind()
++                if len(sequences) != batch_size:
++                    raise RuntimeError(
++                        "routed_experts/attention_mask batch mismatch: "
++                        f"routes={len(sequences)} mask={batch_size}"
++                    )
++
++                # Keep this in lockstep with preprocess_bshd_engine(): its
++                # dense width is derived from this micro-batch's longest
++                # nested sequence, rounded to 2048 and then to the TP/CP
++                # divisibility requirement.  The original attention_mask can
++                # be wider (e.g. global max_model_len=4096) and is not the
++                # tensor passed to the model.
++                max_seqlen = max(sequence.shape[0] for sequence in sequences)
++                seq_len = math.ceil(max_seqlen / 2048) * 2048
++                tp_size = mpu.get_tensor_model_parallel_world_size()
++                cp_size = mpu.get_context_parallel_world_size()
++                align_size = math.lcm(tp_size, 2 * cp_size) if cp_size > 1 else tp_size
++                seq_len += (align_size - seq_len % align_size) % align_size
++                dense = torch.zeros(
++                    (batch_size, seq_len, layer_num, topk),
++                    dtype=values.dtype,
++                    device=values.device,
++                )
++                for batch_idx, sequence in enumerate(sequences):
++                    route_len = sequence.shape[0]
++                    if route_len > seq_len:
++                        raise RuntimeError(
++                            "routed_experts sequence exceeds padded BSHD length: "
++                            f"batch={batch_idx} routes={route_len} padded={seq_len}"
++                        )
++                    dense[batch_idx, :route_len].copy_(sequence)
++            else:
++                dense = layers_topk_idx
++                batch_size, seq_len = dense.shape[:2]
++            # Shard the replay target across CP ranks with the same zigzag
++            # pattern the model input uses: keep this in lockstep with
++            # _get_batch_on_this_cp_rank_in_megatron_cp(), which assigns
++            # chunk[cp_rank] and chunk[2*cp_size-cp_rank-1] to this rank.
++            # Without this, target rows exceed the rank-local token rows by
++            # exactly cp_size (e.g. target_rows=4096 vs score_rows=2048).
++            cp_size = mpu.get_context_parallel_world_size()
++            if cp_size > 1:
++                cp_rank = mpu.get_context_parallel_rank()
++                # Capture (layer_num, topk) before view(): after index_select the
++                # tensor is 5-D [batch, 2, chunk, layer, topk] and shape[2:] would
++                # wrongly pull the chunk dim into the reshape target.
++                tail_shape = dense.shape[2:]
++                dense = dense.view(
++                    batch_size, 2 * cp_size, seq_len // (2 * cp_size), *tail_shape
++                )
++                cp_index = torch.tensor(
++                    [cp_rank, 2 * cp_size - cp_rank - 1], device=dense.device
++                )
++                dense = dense.index_select(1, cp_index).reshape(
++                    batch_size, seq_len // cp_size, *tail_shape
++                )
++                seq_len //= cp_size
++            layers_topk_idx_rmpad = (
++                dense.permute(1, 0, 2, 3).reshape(seq_len * batch_size, *dense.shape[-2:]).unsqueeze(0).contiguous()
++            )
++        elif layers_topk_idx.is_nested:
+             layers_topk_idx_rmpad, _, _ = preprocess_thd_engine(layers_topk_idx, pre_process=True)
+         else:
+             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+@@ -392,12 +509,17 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
+         vp_rank = 0
+     num_layers_to_build = get_num_layers_to_build(tf_config, vp_stage=vp_rank)
+ 
+-    sig = inspect.signature(get_transformer_layer_offset)
+-
+-    if "vp_stage" in sig.parameters:
+-        offset = get_transformer_layer_offset(tf_config, vp_stage=vp_rank)
++    custom_layers = _get_custom_num_layer_list(tf_config)
++    if custom_layers is not None:
++        pp_rank = mpu.get_pipeline_model_parallel_rank()
++        offset = sum(custom_layers[:pp_rank])
+     else:
+-        offset = get_transformer_layer_offset(tf_config)
++        sig = inspect.signature(get_transformer_layer_offset)
++
++        if "vp_stage" in sig.parameters:
++            offset = get_transformer_layer_offset(tf_config, vp_stage=vp_rank)
++        else:
++            offset = get_transformer_layer_offset(tf_config)
+     local = {}
+     local["start"] = offset
+     local["end"] = offset + num_layers_to_build
+diff --git a/verl/utils/profiler/config.py b/verl/utils/profiler/config.py
+index 1ac24efb..b0e923f7 100644
+--- a/verl/utils/profiler/config.py
++++ b/verl/utils/profiler/config.py
+@@ -42,6 +42,12 @@ class TorchProfilerToolConfig(BaseConfig):
+     # options: cuda, cpu, memory, shapes, stack
+     contents: list[str] = field(default_factory=list)
+     discrete: bool = False
++    # Start collecting profiler data from this response-token index.
++    # None means collect from the beginning.
++    profile_token_start: Optional[int] = None
++    # Stop collecting profiler data at this response-token index (exclusive).
++    # None means collect until the end.
++    profile_token_end: Optional[int] = None
+     name: str = "torch"
+ 
+     def __post_init__(self) -> None:
+@@ -52,6 +58,14 @@ class TorchProfilerToolConfig(BaseConfig):
+                 f"Profiler contents only supports {__support_contents}, but gets {content}"
+             )
+         assert isinstance(self.contents, list), f"Profiler contents must be of type list, got {type(self.contents)}"
++        start = self.profile_token_start
++        stop = self.profile_token_end
++        for name, value in (("profile_token_start", start), ("profile_token_end", stop)):
++            if value is not None:
++                assert isinstance(value, int), f"{name} must be int or None, got {type(value)}"
++                assert value >= 0, f"{name} must be >= 0, got {value}"
++        if start is not None and stop is not None:
++            assert stop > start, f"profile_token_end must be > profile_token_start, got start={start}, stop={stop}"
+ 
+ 
+ @dataclass
+@@ -116,6 +130,12 @@ class NPUToolConfig(NsightToolConfig):
+ 
+     # Whether to automatically parse the data.
+     analysis: bool = False
++    # Start collecting profiler data from this response-token index.
++    # None means collect from the beginning.
++    profile_token_start: Optional[int] = None
++    # Stop collecting profiler data at this response-token index (exclusive).
++    # None means collect until the end.
++    profile_token_end: Optional[int] = None
+ 
+     name: str = "npu"
+ 
+@@ -131,6 +151,14 @@ class NPUToolConfig(NsightToolConfig):
+         assert self.level in ["level_none", "level0", "level1", "level2"], (
+             f"Profiler level only supports level0, 1, 2, and level_none, but gets {self.level}"
+         )
++        start = self.profile_token_start
++        stop = self.profile_token_end
++        for name, value in (("profile_token_start", start), ("profile_token_end", stop)):
++            if value is not None:
++                assert isinstance(value, int), f"{name} must be int or None, got {type(value)}"
++                assert value >= 0, f"{name} must be >= 0, got {value}"
++        if start is not None and stop is not None:
++            assert stop > start, f"profile_token_end must be > profile_token_start, got start={start}, stop={stop}"
+ 
+ 
+ @dataclass
+@@ -221,6 +249,13 @@ def build_vllm_profiler_args(profiler_config: ProfilerConfig, tool_config: BaseC
+     # vLLM >= 0.13.0 supports controlling profiler via arguments.
+     # While it maintains backward compatibility with environment variables,
+     # we provide arguments explicitly to align with the new API style.
++    profile_token_start = getattr(tool_config, "profile_token_start", None)
++    profile_token_end = getattr(tool_config, "profile_token_end", None)
++
++    # vLLM uses 0 to indicate immediate start / no upper bound.
++    delay_iterations = profile_token_start if profile_token_start is not None else 0
++    max_iterations = (profile_token_end - delay_iterations) if profile_token_end is not None else 0
++
+     return {
+         "profiler_config": json.dumps(
+             {
+@@ -229,6 +264,9 @@ def build_vllm_profiler_args(profiler_config: ProfilerConfig, tool_config: BaseC
+                 "torch_profiler_with_memory": with_memory,
+                 "torch_profiler_with_stack": with_stack,
+                 "torch_profiler_record_shapes": record_shapes,
++                "delay_iterations": delay_iterations,
++                "max_iterations": max_iterations,
++                "ignore_frontend": "true",
+             }
+         )
+     }
+@@ -253,8 +291,20 @@ def build_sglang_profiler_args(profiler_config: ProfilerConfig, tool_config: Bas
+     if "memory" in contents:
+         warnings.warn("SGLang profiler does not support memory profiling. Ignoring memory content.", stacklevel=2)
+ 
++    profile_token_start = getattr(tool_config, "profile_token_start", None)
++    profile_token_end = getattr(tool_config, "profile_token_end", None)
++    # SGLang API uses Optional[int], keep None for "not set" and map 0 to "no upper bound".
++    start_step = profile_token_start
++    num_steps = (
++        profile_token_end - (profile_token_start if profile_token_start is not None else 0)
++        if profile_token_end is not None
++        else None
++    )
++
+     return {
+         "output_dir": os.path.join(profiler_config.save_path, f"agent_loop_rollout_replica_{rank}"),
+         "with_stack": "stack" in contents or "module" in contents,
+         "record_shapes": "shapes" in contents,
++        "start_step": start_step,
++        "num_steps": num_steps,
+     }
+diff --git a/verl/utils/profiler/profile.py b/verl/utils/profiler/profile.py
+index d9890b2c..6cc265ba 100644
+--- a/verl/utils/profiler/profile.py
++++ b/verl/utils/profiler/profile.py
+@@ -15,8 +15,7 @@
+ import functools
+ from typing import Callable, Optional
+ 
+-from ..memory_utils import MemorySnapshotSampler, enable_memory_visualize
+-from .config import ProfilerConfig, TorchMemoryToolConfig
++from .config import ProfilerConfig
+ 
+ 
+ def mark_start_range(
+@@ -84,7 +83,7 @@ class DistProfiler:
+         self, rank: int, config: Optional[ProfilerConfig] = None, tool_config: Optional[object] = None, **kwargs
+     ):
+         # Default config
+-        if not config:
++        if config is None:
+             config = ProfilerConfig(ranks=[], enable=False, tool_config=None)
+ 
+         if tool_config is None:
+@@ -130,6 +129,8 @@ class DistProfiler:
+ 
+             self._impl = _Torch(rank=rank, config=config, tool_config=tool_config)
+         elif self._tool == "torch_memory":
++            from .torch_memory_profile import TorchMemoryProfiler
++
+             self._impl = TorchMemoryProfiler(rank=rank, config=config, tool_config=tool_config)
+         elif self._tool == "precision_debugger":
+             from .precision_debugger_profile import PrecisionDebuggerProfiler as _Precision
+@@ -140,23 +141,33 @@ class DistProfiler:
+             self._impl = _NoOpProfiler()
+ 
+     def check_enable(self):
++        """Return whether profiling is enabled by configuration."""
+         return self._enable
+ 
+     def check_this_rank(self):
++        """Return whether current rank should perform profiling."""
+         return self._this_rank
+ 
+     def check_this_step(self):
++        """Return whether current global step is marked for profiling."""
+         return self._this_step
+ 
+     def is_discrete_mode(self):
++        """Return whether profiler backend runs in discrete mode."""
+         return self._discrete
+ 
+     def start(self, **kwargs):
++        """Profiler switch for the Ray main flow; sets `this_step=True`.
++
++        Args:
++            **kwargs: Runtime arguments forwarded to backend `start`.
++        """
+         if self.check_enable() and self.check_this_rank():
+             self._this_step = True
+             return getattr(self._impl, "start", lambda **_: None)(**kwargs)
+ 
+     def stop(self):
++        """Profiler switch for the Ray main flow; sets `this_step=False`."""
+         if self.check_enable() and self.check_this_rank():
+             self._this_step = False
+             return getattr(self._impl, "stop", lambda: None)()
+@@ -170,6 +181,12 @@ class DistProfiler:
+         category: Optional[str] = None,
+         **kwargs_outer,
+     ) -> Callable:
++        """Decorate instance methods with backend profiler annotations.
++
++        The wrapped function is executed directly if profiling is disabled,
++        not selected for current rank/step, or backend annotate fails.
++        """
++
+         def decorator(func):
+             @functools.wraps(func)
+             def wrapper(self_instance, *args, **kwargs_inner):
+@@ -207,81 +224,6 @@ class _NoOpProfiler:
+         return
+ 
+ 
+-class TorchMemoryProfiler:
+-    """Profiler that dumps CUDA memory snapshots at step boundaries.
+-
+-    Behavior:
+-    - On first construction (per process), enable memory history recording if CUDA is available
+-    - On start(step=X), remember sub_dir for this step
+-    - On stop(), dump a memory snapshot into config.save_path under the remembered sub_dir
+-    """
+-
+-    _memory_history_enabled: bool = False
+-
+-    def __init__(
+-        self, rank: int, config: Optional[ProfilerConfig], tool_config: Optional[TorchMemoryToolConfig] = None
+-    ):
+-        # Always respond to explicit start/stop calls for torch_memory tool,
+-        # regardless of per-role enable flag, to align with global step control.
+-        self.enable = True
+-        if not config:
+-            config = ProfilerConfig(ranks=[])
+-        self.config = config
+-        self.rank = rank
+-        self.this_step = False
+-        self.sub_dir = None
+-        self.sampler = MemorySnapshotSampler()
+-
+-        # Get parameters from tool_config, with fallback to defaults
+-        if tool_config:
+-            trace_alloc_max_entries = tool_config.trace_alloc_max_entries
+-            stack_depth = tool_config.stack_depth
+-        else:
+-            trace_alloc_max_entries = 100_000
+-            stack_depth = 32
+-
+-        # Best-effort enable memory history once
+-        if not TorchMemoryProfiler._memory_history_enabled:
+-            try:
+-                enable_memory_visualize(trace_alloc_max_entries=trace_alloc_max_entries, stack_depth=stack_depth)
+-            except Exception:
+-                # silently ignore if not supported
+-                pass
+-            TorchMemoryProfiler._memory_history_enabled = True
+-
+-    def start(self, **kwargs):
+-        if not self.enable:
+-            return
+-        if not self._should_profile_this_rank():
+-            return
+-        profile_step = kwargs.get("profile_step", None)
+-        # Keep ranks aligned under same folder name
+-        self.sub_dir = f"step{profile_step}" if profile_step is not None else None
+-        self.this_step = True
+-
+-    def stop(self):
+-        if not self.enable or not self.this_step:
+-            return
+-        self.this_step = False
+-        if not self._should_profile_this_rank():
+-            return
+-        out_dir = self.config.save_path or "outputs/profile"
+-        tag = "torch_memory"
+-        # Dump snapshot; all ranks write into same sub_dir
+-        try:
+-            self.sampler.dump_memory_snapshot(out_dir=out_dir, tag=tag, sub_dir=self.sub_dir)
+-        except Exception:
+-            pass
+-
+-    def _should_profile_this_rank(self) -> bool:
+-        if self.config.all_ranks:
+-            return True
+-        if self.config.ranks:
+-            return self.rank in self.config.ranks
+-        # default rank 0
+-        return self.rank == 0
+-
+-
+ class DistProfilerExtension:
+     """An extension class for DistProfiler that provides distributed profiling capabilities.
+ 
+diff --git a/verl/utils/vllm/npu_vllm_patch.py b/verl/utils/vllm/npu_vllm_patch.py
+index c22647ce..1764b49d 100644
+--- a/verl/utils/vllm/npu_vllm_patch.py
++++ b/verl/utils/vllm/npu_vllm_patch.py
+@@ -21,6 +21,51 @@ from functools import wraps
+ from verl.utils.device import is_torch_npu_available
+ 
+ 
++def patch_vllm_ascend_routed_experts_local_padding():
++    """Teach the Ascend route capturer about pre-all-gather DP padding.
++
++    DSV4 decode MoE may route a local tensor padded to the largest token
++    count in the DP group.  The vllm-ascend capturer already handles the
++    corresponding *post*-all-gather layout (``max_tokens * dp_size``), but
++    not this local ``max_tokens`` layout.  Only the first
++    ``token_num_per_dp`` rows are real; the remaining rows are scheduler
++    padding and must not be returned as routes for generated tokens.
++
++    This patch is installed inside each vLLM worker after vllm-ascend has
++    applied its own capturer patch.  It intentionally leaves every other
++    layout to the existing implementation.
++    """
++    if not is_torch_npu_available(check_device=False):
++        return
++
++    from vllm.forward_context import get_forward_context
++    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
++
++    original_capture = RoutedExpertsCapturer.capture
++    if getattr(original_capture, "_verl_ascend_local_dp_padding", False):
++        return
++
++    @wraps(original_capture)
++    def capture_with_local_dp_padding(self, layer_id, topk_ids):
++        ctx = get_forward_context()
++        if ctx.dp_metadata is not None:
++            num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
++            token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
++            max_tokens = int(num_tokens_dp.max().item())
++
++            # Before the DP all-gather, DSV4's bucketed decode path exposes a
++            # per-rank [max_tokens, topk] tensor.  Trim only this exact shape;
++            # global concatenated, padded-all-gather and SP layouts continue
++            # through the original vllm-ascend implementation unchanged.
++            if topk_ids.shape[0] == max_tokens and max_tokens > token_num_per_dp:
++                topk_ids = topk_ids[:token_num_per_dp]
++
++        return original_capture(self, layer_id, topk_ids)
++
++    capture_with_local_dp_padding._verl_ascend_local_dp_padding = True
++    RoutedExpertsCapturer.capture = capture_with_local_dp_padding
++
++
+ def vllm_ascend_v011_select_moe_comm_method_wrapper(fn):
+     @wraps(fn)
+     def wrapper(self, num_tokens, with_prefill):
+@@ -193,13 +238,16 @@ if is_torch_npu_available(check_device=False):
+     import vllm
+     from packaging import version
+ 
+-    _VLLM_VERSION = version.parse(vllm.__version__)
++    try:
++        _VLLM_VERSION = version.parse(vllm.__version__)
++    except:
++        _VLLM_VERSION = version.parse("0.23.0")
+     if _VLLM_VERSION >= version.parse("0.13.0") and _VLLM_VERSION <= version.parse("0.14.0"):
+         # Disable flash_attn in RotaryEmbedding (NPU) when VLLM >= 0.13
+         from vllm.model_executor.layers.fused_moe import FusedMoE
+ 
+         patch_vllm013_rotary_emb()
+-        FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
++        #FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
+ 
+     VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2 = bool(int(os.getenv("VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2", "1")))
+     if VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2:
+diff --git a/verl/utils/vllm/vllm_fp8_utils.py b/verl/utils/vllm/vllm_fp8_utils.py
+index 54e7b44d..09e501e9 100644
+--- a/verl/utils/vllm/vllm_fp8_utils.py
++++ b/verl/utils/vllm/vllm_fp8_utils.py
+@@ -25,9 +25,8 @@ from packaging import version
+ try:
+     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+     from vllm.model_executor.layers.linear import LinearBase
+-except ImportError as e:
+-    raise ImportError("FP8 quantization not available") from e
+-
++except ImportError:
++    pass
+ from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
+ 
+ logger = logging.getLogger(__name__)
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index cbb7be48..44c9faa4 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -677,30 +677,10 @@ class MegatronEngine(BaseEngine):
+                     losses_reduced[0]["metrics"] = {}
+                 losses_reduced[0]["metrics"].update(metrics)
+ 
+-        if RouterReplayHelper.is_r2_record_action(self.tf_config):
+-            if self.tf_config.virtual_pipeline_model_parallel_size is not None:
+-                # config = self.actor_module[0].module.module.config
+-                vp_size = len(self.module)
+-                microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
+-                bs = n_micro_batch
+-                topk_idx_td = reorder_and_merge_vpp_layers(
+-                    self.mini_layer_topk_idx_list, bs, vp_size, microbatch_group_size_per_vp_stage
+-                )
+-            else:
+-                tensors = [tensor for nt in self.mini_layer_topk_idx_list for tensor in nt.unbind()]
+-                topk_idx_td = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+-            self.mini_layer_topk_idx_list = []
+-
+-            layers_topk_idx = pp_gather(topk_idx_td.to(torch.uint8), self.tf_config)
+-            use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+-            if use_dynamic_bsz and indices is not None:
+-                layers_topk_idx = restore_dynamic_batch(layers_topk_idx, indices)
+ 
+         output = {}
+         if mpu.is_pipeline_last_stage(ignore_virtual=True):
+             output = postprocess_batch_func(output_lst=losses_reduced, indices=indices, data=data)
+-            if RouterReplayHelper.is_r2_record_action(self.tf_config):
+-                output["model_output"]["routed_experts"] = layers_topk_idx
+         if enable_routing_replay:
+             RouterReplay.clear_global_indices()
+             RouterReplay.clear_global_router_replay_action()
+@@ -833,14 +813,41 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         else:
+             vp_rank = 0
+ 
++        # The model-engine worker sets the global replay action before the
++        # pipeline schedule starts, but (unlike the legacy MegatronActor
++        # path) it previously never installed this micro-batch's returned
++        # vLLM routes on the local RouterReplay instances.  In that state R3
++        # was nominally enabled while every router silently fell back to its
++        # locally recomputed TopK because target_topk_idx remained None.
+         if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
+-            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
+-            for router in router_instance_list:
++            for router in RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank):
+                 router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+ 
+         if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
+-            layers_topk_idx = model_inputs["routed_experts"]
+-            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
++            layers_topk_idx = model_inputs.get("routed_experts")
++            if layers_topk_idx is None:
++                raise RuntimeError("R3 replay is active, but routed_experts is missing from the actor micro-batch")
++            attention_mask = batch.get("attention_mask", None)
++            if not layers_topk_idx.is_nested and attention_mask is None:
++                raise RuntimeError("R3 replay received padded routes without an attention_mask")
++            set_router_replay_data(
++                layers_topk_idx,
++                attention_mask,
++                self.tf_config,
++                vp_rank,
++                use_remove_padding=self.engine_config.use_remove_padding,
++            )
++            if not getattr(self, "_router_replay_target_logged", False):
++                local_routers = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
++                target_shapes = [
++                    tuple(router.target_topk_idx.shape) if router.target_topk_idx is not None else None
++                    for router in local_routers
++                ]
++                print(
++                    f"R3 replay targets installed: vp_rank={vp_rank} target_shapes={target_shapes}",
++                    flush=True,
++                )
++                self._router_replay_target_logged = True
+ 
+         if pad_mode == DatasetPadMode.NO_PADDING:
+             label = input_ids.clone()
+@@ -932,14 +939,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 local_cp_size=local_cp_size,
+             )
+ 
+-        # Router replay: record routing decisions for R2 mode
+-        if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
+-            merge_router_topk_indices(None, input_ids, self.mini_layer_topk_idx_list, self.tf_config, vp_rank)
+-
+-        # Router replay: switch to backward replay mode for next backward pass
++        # Activation checkpointing re-enters each router during backward.
++        # Keep the per-micro-batch targets queued by set_target_indices() and
++        # consume them in forward order during recomputation.  This matters
++        # for PP schedules where several variable-length micro-batches are in
++        # flight and target_topk_idx is overwritten by later forwards.
+         if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
+-            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
+-            for router in router_instance_list:
++            for router in RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank):
+                 router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+ 
+         return output, partial(postprocess_micro_batch_func, data=batch, local_cp_size=local_cp_size)
+diff --git a/verl/workers/engine/mindspeed/transformer_impl.py b/verl/workers/engine/mindspeed/transformer_impl.py
+index acbdcf63..0c5e00d3 100644
+--- a/verl/workers/engine/mindspeed/transformer_impl.py
++++ b/verl/workers/engine/mindspeed/transformer_impl.py
+@@ -14,6 +14,7 @@
+ 
+ import logging
+ import os
++from functools import wraps
+ 
+ try:
+     from mindspeed.megatron_adaptor import repatch
+@@ -21,7 +22,7 @@ except ImportError:
+     repatch = None
+ 
+ from verl.trainer.config import CheckpointConfig
+-from verl.utils.megatron.router_replay_patch import RouterReplay
++from verl.utils.megatron.router_replay_patch import RouterReplay, apply_router_replay_patch
+ from verl.utils.model import print_model_size
+ from verl.workers.config import (
+     HFModelConfig,
+@@ -80,6 +81,11 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
+ 
+     def _init_device_mesh(self):
+         apply_patch(self.model_config, self.engine_config, self.optimizer_config)
++        # MindSpeed repatch may replace TopKRouter methods after the generic
++        # Megatron engine installed RouterReplay.  Re-apply against the live
++        # post-repatch class before model construction.
++        if self.engine_config.router_replay.mode != "disabled":
++            apply_router_replay_patch()
+         super()._init_device_mesh()
+ 
+     def _build_megatron_module(self):
+@@ -93,15 +99,35 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
+         import torch.distributed
+         from megatron.core.enums import ModelType
+         from megatron.training.training import get_model
++        import mindspeed_llm.pretrain_deepseek4 as deepseek4_provider
+ 
+-        # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
+-        if self.engine_config.forward_only:
+-            module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)
+-            return module
++        gpt_model_provider = deepseek4_provider.model_provider
++        original_config_factory = deepseek4_provider.core_transformer_config_from_args
++
++        # The generic Megatron engine can set ``enable_routing_replay`` on its
++        # TransformerConfig directly.  The MindSpeed DSV4 provider constructs
++        # a fresh MLATransformerConfig from global args instead, and the custom
++        # field is not a dataclass field, so it was silently dropped.  Inject
++        # the flag at the provider boundary while building this actor model.
++        if self.enable_routing_replay:
++            @wraps(original_config_factory)
++            def config_factory_with_router_replay(*args, **kwargs):
++                config = original_config_factory(*args, **kwargs)
++                config.enable_routing_replay = True
++                return config
+ 
+-        module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=True)
++            deepseek4_provider.core_transformer_config_from_args = config_factory_with_router_replay
++
++        # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
++        try:
++            if self.engine_config.forward_only:
++                module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)
++            else:
++                module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=True)
++        finally:
++            deepseek4_provider.core_transformer_config_from_args = original_config_factory
+         if self.vanilla_bridge:
+-            self.bridge.load_weights(module, self.model_config.local_path)
++            self.bridge.load_weights(module, self.model_config.local_path,memory_efficient=True)
+         else:
+             raise ValueError(f"vanilla_bridge should be true now, but got {self.vanilla_bridge}")
+ 
+@@ -110,5 +136,9 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
+ 
+         if self.enable_routing_replay:
+             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
++            if not RouterReplay.router_instances:
++                raise RuntimeError(
++                    "MindSpeed R3 was requested, but no TopKRouter registered a RouterReplay instance"
++                )
+ 
+         return module
+diff --git a/verl/workers/engine/mindspeed/utils.py b/verl/workers/engine/mindspeed/utils.py
+index 9b600e30..ecb9de4c 100644
+--- a/verl/workers/engine/mindspeed/utils.py
++++ b/verl/workers/engine/mindspeed/utils.py
+@@ -153,10 +153,11 @@ def add_mcore_arguments(all_config: dict) -> dict:
+ 
+ 
+ def apply_patch(model_config, engine_config, optimizer_config):
+-    model_config = get_base_mcore_config_from_model_config(model_config)
+-    optimizer_config = get_base_mcore_config_from_optim_config(optimizer_config)
++    # model_config = get_base_mcore_config_from_model_config(model_config)
++    # optimizer_config = get_base_mcore_config_from_optim_config(optimizer_config)
+     engine_config = get_base_mcore_config_from_engine_config(engine_config)
+-    all_config = {**model_config, **optimizer_config, **engine_config}
++    #all_config = {**model_config, **optimizer_config, **engine_config}
++    all_config = {**engine_config}
+     mcore_config = add_mcore_arguments(all_config)
+     from mindspeed_llm.tasks.megatron_adaptor_v2 import repatch
+ 
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index ee741cba..5c390b31 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -20,6 +20,7 @@ from functools import partial
+ from itertools import chain
+ from typing import Optional
+ 
++import psutil
+ import torch
+ from codetiming import Timer
+ from omegaconf import DictConfig, open_dict
+@@ -32,7 +33,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
+ from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+ from verl.utils import tensordict_utils as tu
+ from verl.utils.config import omega_conf_to_dataclass
+-from verl.utils.device import get_device_name, is_npu_available, set_expandable_segments
++from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
+ from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
+ from verl.utils.flops_counter import FlopsCounter
+ from verl.utils.import_utils import import_external_libs
+@@ -213,6 +214,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
+         if lr is not None:
+             final_metrics["lr"] = lr
+ 
++        final_metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
++        final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
++        final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
++
+         # TODO: confirm the mtp loss IS same across dp
+         for k, v in final_metrics.items():
+             if k.startswith("mtp_losses"):
+@@ -473,8 +478,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         else:
+             tool_config = None
+ 
++        # Router replay is owned by the selected actor engine.  MindSpeed uses
++        # the same engine-side implementation as Megatron, but its config is
++        # stored under ``actor.mindspeed`` rather than ``actor.megatron``.
++        actor_strategy = self.config.actor.strategy
++        actor_engine = None
++        if actor_strategy == "megatron":
++            actor_engine = self.config.actor.megatron
++        elif actor_strategy == "mindspeed":
++            actor_engine = self.config.actor.mindspeed
+         self.enable_routing_replay = (
+-            self.config.actor.strategy == "megatron" and self.config.actor.megatron.router_replay.mode != "disabled"
++            actor_engine is not None and actor_engine.router_replay.mode != "disabled"
+         )
+ 
+         DistProfilerExtension.__init__(
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+index eb337939..81ac0ea1 100644
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -137,6 +137,11 @@ class BucketedWeightSender:
+                     f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
+                     f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
+                 )
++                if offset % 8 != 0 and "tid2eid" in name and weight.dtype == torch.int64:
++                    offset = (offset + 8 - 1) // 8 * 8
++
++                if offset % 4 != 0 and weight.dtype == torch.bfloat16:
++                    offset = (offset + 4 - 1) // 4 * 4
+                 bucket_meta[name] = {
+                     "name": name,
+                     "shape": weight.shape,
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index b2cc699f..6f263505 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -175,6 +175,13 @@ class vLLMColocateWorkerExtension:
+         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
+         # patch weight loader to support MoE model
+         patch_vllm_moe_model_weight_loader(self.model_runner.model)
++        if is_npu_available:
++            # vllm-ascend applies its RoutedExpertsCapturer override while the
++            # worker starts.  Install the DSV4 local-DP-padding compatibility
++            # afterwards, before the first generation request.
++            from verl.utils.vllm.npu_vllm_patch import patch_vllm_ascend_routed_experts_local_padding
++
++            patch_vllm_ascend_routed_experts_local_padding()
+ 
+     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+         """Update the weights of the rollout model."""
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 23c8594f..9bb8b599 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -53,7 +53,10 @@ from verl.workers.rollout.vllm_rollout.utils import (
+     get_vllm_max_lora_rank,
+ )
+ 
+-_VLLM_VERSION = version.parse(vllm.__version__)
++try:
++    _VLLM_VERSION = version.parse(vllm.__version__)
++except:
++    _VLLM_VERSION = version.parse("0.23.0")
+ 
+ if _VLLM_VERSION > version.parse("0.11.0"):
+     from vllm.utils.argparse_utils import FlexibleArgumentParser
+@@ -541,7 +544,6 @@ class vLLMHttpServer:
+ 
+         if hasattr(final_res.outputs[0], "num_preempted"):
+             num_preempted = final_res.outputs[0].num_preempted
+-
+         return TokenOutput(
+             token_ids=token_ids,
+             log_probs=log_probs,
+@@ -577,6 +579,8 @@ class vLLMHttpServer:
+             logger.info("skip sleep in standalone mode")
+ 
+     async def start_profile(self, **kwargs):
++        if self.node_rank != 0:
++            return
+         if (
+             self.profiler_controller.check_enable()
+             and self.profiler_controller.check_this_rank()
+@@ -585,6 +589,8 @@ class vLLMHttpServer:
+             await self.engine.start_profile(**kwargs)
+ 
+     async def stop_profile(self):
++        if self.node_rank != 0:
++            return
+         if (
+             self.profiler_controller.check_enable()
+             and self.profiler_controller.check_this_rank()
+@@ -853,12 +859,18 @@ class vLLMHttpServer:
+ 
+     async def _sleep_hybrid(self):
+         """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
+-        # Don't use engine.sleep(level=2) here
+-        # lora only update adapter weights, so set sleep level to 1
++        # lora only update adapter weights, so set sleep level to 1.
++        # On NPU the level is configurable via VLLM_SLEEP_LEVEL (default 1);
++        # vllm-ascend supports level 2 for DeepSeek V4 RL colocate.
+         if self.lora_as_adapter:
+             sleep_level = 1
++        elif is_torch_npu_available(check_device=False):
++            from verl.third_party.vllm import VLLM_SLEEP_LEVEL
++
++            sleep_level = VLLM_SLEEP_LEVEL
+         else:
+             sleep_level = 2
++        logger.info(f"HYBRID sleep with level={sleep_level}")
+         await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
+         if _VLLM_VERSION >= version.parse("0.17.0"):
+             await self.engine.reset_encoder_cache()
+@@ -929,6 +941,11 @@ class vLLMReplica(RolloutReplica):
+                         # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+                         # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                         "NCCL_CUMEM_ENABLE": "0",
++                        # Ray runtime_env requires every env var value to be a string.
++                        # Fall back to the process-level Ascend setting instead of None.
++                        "TASK_QUEUE_ENABLE": os.environ.get(
++                            "VLLM_ASCEND_TASK_QUEUE_ENABLE", os.environ.get("TASK_QUEUE_ENABLE", "1")
++                        ),
+                     }
+                 },
+                 name=name,

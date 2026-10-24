@@ -27,6 +27,28 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class PlacementConfig:
+    """Node-label placement isolation sub-config (opt-out).
+
+    Trainer nodes host training plus all CPU-side coordination actors;
+    rollout nodes host standalone rollout replicas only. See README's
+    "Configuration" section for the deployment contract.
+    """
+
+    enabled: bool = True
+    """Master switch. Placement is opt-out: on whenever fault tolerance is on."""
+
+    node_label_key: str = "verl.io/role"
+    """Node label key set at ray start time (`ray start --labels=...`)."""
+
+    trainer_label_value: str = "trainer"
+    """Label value marking trainer nodes. Empty disables the trainer constraint."""
+
+    rollout_label_value: str = "rollout"
+    """Label value marking standalone rollout nodes. Empty disables the constraint."""
+
+
+@dataclass
 class FaultToleranceConfig:
     """Knobs for verl asynchronous rollout fault tolerance.
 
@@ -70,9 +92,39 @@ class FaultToleranceConfig:
     replace_dead_replicas: bool = True
     """If True (standalone mode only), supervisor spawns replacement on dead."""
 
+    replacement_give_up_timeout_s: float = 180.0
+    """Give-up timeout for replacement: training stays with N-1 replicas."""
+
     # ----- Token continuation sub-config -----
     progress: ProgressConfig = field(default_factory=lambda: _default_progress_config())
     """Token 续推子配置. 当 ``progress.enabled=True`` 且 ``enabled=True`` 时启用."""
+
+    # ----- Placement isolation sub-config -----
+    placement: PlacementConfig = field(default_factory=PlacementConfig)
+    """Node-label placement isolation (opt-out: on whenever ``enabled=True``)."""
+
+    def __post_init__(self) -> None:
+        """Normalize YAML-shaped dicts into the nested sub-configs.
+
+        The patch sites build this dataclass from
+        ``OmegaConf.to_container(node, resolve=True)``, so nested sections
+        arrive as plain dicts. Unknown keys keep raising ``TypeError`` from
+        the dataclass ``__init__`` — a mis-typed fault_tolerance section must
+        fail loudly instead of silently disabling Supervisor/CKE protection.
+        """
+        if isinstance(self.placement, dict):
+            self.placement = PlacementConfig(**self.placement)
+        if isinstance(self.progress, dict):
+            from verl.workers.rollout.fault_tolerance.progress.types import (
+                ModelVersionPolicy,
+                ProgressConfig,
+            )
+
+            kwargs = dict(self.progress)
+            policy = kwargs.get("model_version_policy")
+            if isinstance(policy, dict):
+                kwargs["model_version_policy"] = ModelVersionPolicy(**policy)
+            self.progress = ProgressConfig(**kwargs)
 
 
 def _default_progress_config() -> ProgressConfig:

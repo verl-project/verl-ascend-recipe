@@ -13,6 +13,8 @@ async_training:
     weight_sync_member_timeout_s: 60.0
     weight_sync_transfer_timeout_s: 600.0
     max_weight_sync_retries: 2
+    # Give-up timeout for replacement: training stays with N-1 replicas.
+    replacement_give_up_timeout_s: 180.0
 
 # config for the rollout (only for resource isolation)
 rollout:

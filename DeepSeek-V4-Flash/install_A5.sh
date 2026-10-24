@@ -9,7 +9,7 @@ cd ..
 
 echo "2. install vllm-ascend from source"
 git clone https://github.com/vllm-project/vllm-ascend.git
-cd vllm-ascend && git checkout 343743a && install -r requirements.txt --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ --trusted-host triton-ascend.osinfra.cn
+cd vllm-ascend && git checkout 343743a && pip install -r requirements.txt --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ --trusted-host triton-ascend.osinfra.cn
 export COMPILE_CUSTOM_KERNELS=1
 pip install -v -e . --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ --trusted-host triton-ascend.osinfra.cn 
 cd ..
@@ -50,15 +50,21 @@ pip install transformers==5.8.1
 
 echo "7.apply patch"
 cd Megatron-LM
-git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/megatron.patch && cd ..
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/megatron_A5.patch && cd ..
+
+cd MindSpeed-LLM
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/mindspeed_llm_A5.patch && cd ..
 
 cd mbridge
-git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/mbridge.patch && cd ..
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/mbridge_A5.patch && cd ..
+
+cd vllm
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/vllm_A5.patch && cd ..
 
 cd vllm-ascend
-git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/vllm-ascend_A5.patch && cd ..
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/vllm-ascend_A5.patch && cd ..
 
 cd verl
-git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/verl.patch && cd ..
+git apply --whitespace=nowarn ../verl-ascend-recipe/DeepSeek-V4-Flash/patch/A5/verl_A5.patch && cd ..
 
 

@@ -121,7 +121,6 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel=True
     actor_rollout_ref.actor.megatron.param_offload=True
     actor_rollout_ref.actor.megatron.optimizer_offload=True
-    actor_rollout_ref.actor.megatron.grad_offload=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
@@ -200,7 +199,7 @@ TRAINER_CONFIG=(
     trainer.save_freq=-1
     trainer.test_freq=-1
     trainer.default_local_dir="${CKPTS_DIR}"
-    trainer.rollout_data_dir="logs-32/rollout_data_dir/$(date +%Y%m%d_%H%M%S)"
+    trainer.rollout_data_dir="logs/rollout_data_dir/$(date +%Y%m%d_%H%M%S)"
     trainer.resume_mode="auto"
     trainer.balance_batch=${balance_batch}
     trainer.device=npu
@@ -224,5 +223,5 @@ python3 -m verl.trainer.main_ppo \
     "${ALGORITHM_CONFIG[@]}" \
     "${TRAINER_CONFIG[@]}" \
     "${EXTRA[@]}" \
-    2>&1 | tee logs-32/run_glm5_$(date -d '+8 hours' +%Y%m%d_%H%M%S).log.log \
+    2>&1 | tee logs/run_glm5_$(date -d '+8 hours' +%Y%m%d_%H%M%S).log.log \
     "$@" 
