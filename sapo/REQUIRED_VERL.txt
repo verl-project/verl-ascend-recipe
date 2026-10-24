@@ -1,0 +1,10 @@
+# SAPO Qwen3-30B-A3B Megatron NPU — pinned to the commit the acceptance run was executed on.
+# Runtime patches and exact environments are documented in
+# verl_ascend_practice/reports/sapo/README.md. The pin alone is not the patched runtime.
+# The historical 100-step acceptance numbers were produced on this commit; the
+# recipe was re-validated with a 4-step smoke run after rebasing onto a later
+# main that restructured verl/utils/vllm/npu_vllm_patch.py (verl#7190, verl#7147).
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=bf48903d93e4618531d3bbae96551a889007dd8b
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@bf48903d93e4618531d3bbae96551a889007dd8b
