@@ -1,0 +1,1350 @@
+diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter.py b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+--- a/verl/experimental/fully_async_policy/fully_async_rollouter.py
++++ b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+@@ -789,7 +789,11 @@
+             resource_pool_spec["teacher_pool"] = teacher_pool
+             mapping[Role.TeacherModel] = "teacher_pool"
+ 
+-            resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
++            from verl.single_controller.ray.ascend_topology import topology_from_config
++
++            resource_pool_manager = ResourcePoolManager(
++                resource_pool_spec=resource_pool_spec, mapping=mapping, topology=topology_from_config(self.config)
++            )
+             resource_pool_manager.create_resource_pool()
+             teacher_resource_pool = resource_pool_manager.get_resource_pool(Role.TeacherModel)
+ 
+diff --git a/verl/experimental/reward_loop/reward_loop.py b/verl/experimental/reward_loop/reward_loop.py
+--- a/verl/experimental/reward_loop/reward_loop.py
++++ b/verl/experimental/reward_loop/reward_loop.py
+@@ -299,7 +299,11 @@
+                 )
+                 with open_dict(self.config):
+                     rm_rollout.max_num_seqs = 1
+-            self.reward_model_manager = RewardModelManager(config.reward.reward_model, rm_resource_pool)
++            from verl.single_controller.ray.ascend_topology import topology_from_config
++
++            self.reward_model_manager = RewardModelManager(
++                config.reward.reward_model, rm_resource_pool, topology=topology_from_config(config)
++            )
+             self.reward_router_address = self.reward_model_manager.get_router_address()
+         else:
+             self.reward_model_manager = None
+diff --git a/verl/experimental/reward_loop/reward_model.py b/verl/experimental/reward_loop/reward_model.py
+--- a/verl/experimental/reward_loop/reward_model.py
++++ b/verl/experimental/reward_loop/reward_model.py
+@@ -31,6 +31,7 @@
+         self,
+         config: RewardModelConfig,
+         resource_pool: RayResourcePool = None,
++        topology=None,
+     ):
+         """
+         Initialize the reward model manager.
+@@ -41,6 +42,7 @@
+         """
+         self.config = config
+         self.resource_pool = resource_pool
++        self.topology = topology
+ 
+         self._initialize_llm_servers()
+         self._initialize_router()
+@@ -90,6 +92,9 @@
+                 ]
+             )
+         else:
++            if self.topology is not None:
++                for server in self.rollout_replicas:
++                    server.prepare_standalone(self.topology)
+             self._run_all([server.init_standalone() for server in self.rollout_replicas])
+         self.server_handles = [server._server_handle for server in self.rollout_replicas]
+         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+diff --git a/verl/experimental/separation/utils.py b/verl/experimental/separation/utils.py
+--- a/verl/experimental/separation/utils.py
++++ b/verl/experimental/separation/utils.py
+@@ -56,7 +56,13 @@
+         assert rm_cfg.n_gpus_per_node > 0, "config.reward.reward_model.n_gpus_per_node must be greater than 0"
+         assert rm_cfg.nnodes > 0, "config.reward.reward_model.nnodes must be greater than 0"
+ 
+-    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
++    from verl.single_controller.ray.ascend_topology import prepare_topology
++
++    return ResourcePoolManager(
++        resource_pool_spec=resource_pool_spec,
++        mapping=mapping,
++        topology=prepare_topology(config, resource_pool_spec, mode="fully_async"),
++    )
+ 
+ 
+ def create_role_worker_mapping(config):
+diff --git a/verl/single_controller/ray/ascend_topology.py b/verl/single_controller/ray/ascend_topology.py
+new file mode 100644
+--- /dev/null
++++ b/verl/single_controller/ray/ascend_topology.py
+@@ -0,0 +1,306 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
++"""Job-scoped Ascend node selection and PG ownership, independent of training roles.
++
++One PG occupies one Ray node. Pools in the same job never share nodes unless they
++explicitly share/split a RayResourcePool. No custom SP resources or env vars are used.
++"""
++
++import logging
++import math
++import time
++import uuid
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass
++
++import ray
++from ray.util import placement_group_table, remove_placement_group
++from ray.util.placement_group import placement_group
++from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
++
++from .ascend_topology_plan import plan_nodes, requests_from_config
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass(frozen=True)
++class TopologyPolicy:
++    sp_plan: tuple[tuple[int, int], ...] = ()
++    planning_timeout_s: float = 30
++    allocation_retries: int = 1
++    dcmi_library: str | None = None
++    probe_timeout_s: float = 60
++    placement_timeout_s: float = 1800
++
++    @classmethod
++    def from_config(cls, cfg):
++        if "sp_layout" in cfg:
++            raise ValueError(
++                "trainer.ascend_topology.sp_layout has been removed; remove it for automatic placement, "
++                "or use sp_plan with explicit per-SP node counts"
++            )
++        raw_plan = cfg.get("sp_plan", [])
++        if raw_plan is None:
++            raw_plan = []
++        hint = (
++            'Pass one complete shell argument: "trainer.ascend_topology.sp_plan='
++            '[{sp:2, nodes:8}, {sp:6, nodes:8}]"; do not put quoted strings inside the list.'
++        )
++        if isinstance(raw_plan, (str, bytes)) or not isinstance(raw_plan, Sequence):
++            raise ValueError(f"sp_plan must be a list of mappings; got {type(raw_plan).__name__}: {raw_plan!r}. {hint}")
++        plan = []
++        for index, item in enumerate(raw_plan):
++            if not isinstance(item, Mapping) or set(item.keys()) != {"sp", "nodes"}:
++                raise ValueError(
++                    f"sp_plan[{index}] must be {{sp: integer, nodes: positive integer}}; "
++                    f"got {type(item).__name__}: {item!r}; received sp_plan={raw_plan!r}. {hint}"
++                )
++            sp, count = item["sp"], item["nodes"]
++            if type(sp) is not int or sp < 0 or type(count) is not int or count <= 0:
++                raise ValueError(
++                    f"sp_plan[{index}] requires a non-negative integer SP ID and a positive integer node count; "
++                    f"got sp={sp!r} ({type(sp).__name__}), nodes={count!r} ({type(count).__name__})"
++                )
++            plan.append((sp, count))
++        if len({sp for sp, _ in plan}) != len(plan):
++            raise ValueError("sp_plan must not contain duplicate SP IDs")
++        retries = cfg.get("allocation_retries", 1)
++        if type(retries) is not int or not 0 <= retries <= 10:
++            raise ValueError("allocation_retries must be an integer in [0, 10]")
++        policy = cls(
++            sp_plan=tuple(plan),
++            planning_timeout_s=float(cfg.get("planning_timeout_s", 30)),
++            allocation_retries=retries,
++            dcmi_library=cfg.get("dcmi_library"),
++            probe_timeout_s=float(cfg.get("probe_timeout_s", 60)),
++            placement_timeout_s=float(cfg.get("placement_timeout_s", 1800)),
++        )
++        if any(
++            not math.isfinite(t) or t <= 0
++            for t in (policy.probe_timeout_s, policy.placement_timeout_s, policy.planning_timeout_s)
++        ):
++            raise ValueError("Ascend topology timeouts must be finite and positive")
++        return policy
++
++
++def _query_sp(library_path, timeout_s=60):
++    from verl.utils.ascend_dcmi_probe import query_superpod_id_isolated
++
++    return query_superpod_id_isolated(library_path, timeout_s)
++
++
++def _make_probe_node():
++    @ray.remote(num_cpus=0, max_retries=0)
++    def probe(library_path, timeout_s=60):
++        import warnings
++
++        warnings.filterwarnings(
++            "ignore",
++            message=r"invalid escape sequence",
++            category=SyntaxWarning,
++            module=r"^(?:torch_npu\.op_plugin_docs|.*/torch_npu/op_plugin_docs)(?:\.py)?$",
++        )
++
++        from verl.single_controller.ray.ascend_topology import _query_sp
++
++        try:
++            return _query_sp(library_path, timeout_s)
++        except Exception as exc:
++            node_id = ray.get_runtime_context().get_node_id()
++            raise RuntimeError(f"SP probe failed on Ray node {node_id}: {exc}") from exc
++
++    return probe
++
++
++_probe_node = _make_probe_node()
++
++
++class _TopologyAllocator:
++    """A synchronous Ray actor serializes reservations across trainers/replicas.
++
++    It owns PGs for this Ray job. A reservation is kept until Ray confirms the PG
++    has been removed, even if the available-resource snapshot is temporarily stale.
++    """
++
++    def __init__(self, policy):
++        self.policy = policy
++        self.nodes = {}
++        self.owned = {}  # PG ID -> (PG handle, selected node)
++        self.manifest = None
++        self.pools = {}
++        self.order = {}
++
++    def _check_policy(self, policy):
++        if policy != self.policy:
++            raise ValueError("All Ascend topology pools in one Ray job must use the same policy")
++
++    def _discover(self):
++        alive = [node for node in ray.nodes() if node.get("Alive") and node["Resources"].get("NPU", 0) > 0]
++        missing = [node for node in alive if node["NodeID"] not in self.nodes]
++        refs = [
++            _probe_node.options(
++                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node["NodeID"], soft=False)
++            ).remote(self.policy.dcmi_library, self.policy.probe_timeout_s)
++            for node in missing
++        ]
++        if refs:
++            try:
++                # Allow dispatch/result collection and subprocess cleanup beyond
++                # the independently enforced query budget. No new user option.
++                ids = ray.get(refs, timeout=self.policy.probe_timeout_s + 10)
++            except Exception as exc:
++                for ref in refs:
++                    ray.cancel(ref, force=True)
++                raise RuntimeError("DCMI discovery failed/timed out; refusing IP-only fallback") from exc
++            for node, sp in zip(missing, ids, strict=True):
++                node_id, ip = node["NodeID"], node["NodeManagerAddress"]
++                resource = f"node:{ip}"
++                if node["Resources"].get(resource, 0) <= 0:
++                    raise RuntimeError(f"Ray node {node_id} lacks its automatic {resource} resource")
++                self.nodes[node_id] = {"id": node_id, "ip": ip, "sp": sp, "resource": resource}
++            logger.warning("[ascend-topology] discovered %s", [self.nodes[n["NodeID"]] for n in missing])
++        nodes = [self.nodes[node["NodeID"]] for node in alive]
++        if len({node["ip"] for node in nodes}) != len(nodes):
++            raise RuntimeError("Ascend topology requires distinct IPs for distinct Ray nodes")
++        return nodes
++
++    def _verify(self, pgs):
++        for pg in pgs:
++            _, node = self.owned[pg.id.hex()]
++            info = placement_group_table(pg)
++            actual = info.get("bundles_to_node_id", {})
++            if info.get("state") != "CREATED" or len(actual) != pg.bundle_count or set(actual.values()) != {node["id"]}:
++                raise RuntimeError(f"Planned PG {pg.id.hex()} lost its selected node; restart the Ray job")
++
++    def _rollback(self):
++        for pg, _ in self.owned.values():
++            remove_placement_group(pg)
++        deadline = time.monotonic() + min(30, self.policy.placement_timeout_s)
++        while self.owned:
++            for key, (pg, _) in list(self.owned.items()):
++                info = placement_group_table(pg)
++                if not info or info.get("state") == "REMOVED":
++                    del self.owned[key]
++            if self.owned:
++                if time.monotonic() >= deadline:
++                    raise RuntimeError("PG rollback not confirmed; refusing to replan over existing reservations")
++                time.sleep(0.1)
++        self.pools.clear()
++        self.order.clear()
++
++    def prepare(self, policy, requests):
++        self._check_policy(policy)
++        requests = tuple(requests)
++        if self.manifest is not None:
++            if requests != self.manifest:
++                raise ValueError("A Ray job cannot change its topology manifest after reservation")
++            self._verify([pg for pgs in self.pools.values() for pg in pgs])
++            return
++        if self.owned:
++            raise RuntimeError("Previous PG cleanup incomplete; restart the Ray job")
++        for attempt in range(self.policy.allocation_retries + 1):
++            nodes = self._discover()
++            selected = plan_nodes(
++                nodes,
++                ray._private.state.available_resources_per_node(),
++                requests,
++                sp_plan=self.policy.sp_plan,
++                timeout_s=self.policy.planning_timeout_s,
++            )
++            token = uuid.uuid4().hex[:8]
++            try:
++                for request in requests:
++                    pgs = self.pools[request.name] = []
++                    for idx, (bundles, node) in enumerate(zip(request.schemes(), selected[request.name], strict=True)):
++                        bundles[0][node["resource"]] = 0.001
++                        pg = placement_group(bundles, strategy="STRICT_PACK", name=f"{request.name}_{idx}_{token}")
++                        self.order[pg.id.hex()] = len(self.order)
++                        self.owned[pg.id.hex()] = (pg, node)
++                        pgs.append(pg)
++                all_pgs = [pg for pgs in self.pools.values() for pg in pgs]
++                ray.get([pg.ready() for pg in all_pgs], timeout=self.policy.placement_timeout_s)
++                self._verify(all_pgs)
++            except Exception:
++                self._rollback()
++                if attempt == self.policy.allocation_retries:
++                    raise
++                logger.warning("[ascend-topology] reservation raced/failed; replanning before Worker startup")
++                continue
++            self.manifest = requests
++            for request in requests:
++                logger.warning(
++                    "[ascend-topology] pool=%s groups=%s selected=%s",
++                    request.name,
++                    request.groups,
++                    [(idx, node["sp"], node["ip"]) for idx, node in enumerate(selected[request.name])],
++                )
++            return
++
++    def claim(self, policy, name, schemes):
++        self._check_policy(policy)
++        request = next((r for r in self.manifest or () if r.name == name), None)
++        if request is None:
++            raise ValueError(f"Unplanned topology pool {name!r}; prepare the complete task manifest before workers")
++        if schemes != request.schemes():
++            raise ValueError(f"Pool {name!r} resource demand differs from its reserved task plan")
++        pgs = self.pools[name]
++        self._verify(pgs)
++        return pgs
++
++    def sort(self, policy, pgs):
++        self._check_policy(policy)
++        self._verify(pgs)
++        # Preserve the plan's replica/teacher boundaries, including heterogeneous groups.
++        return sorted(pgs, key=lambda pg: self.order[pg.id.hex()])
++
++
++_AllocatorActor = ray.remote(num_cpus=0, max_restarts=0, max_task_retries=0)(_TopologyAllocator)
++
++
++@dataclass
++class AscendTopology:
++    """Small, serializable interface retained by every participating resource pool."""
++
++    allocator: object
++    policy: TopologyPolicy
++    name: str
++
++    def create_placement_groups(self, schemes, pool_name, detached=False):
++        if detached:
++            raise ValueError("Ascend topology PGs are job-scoped; detached pools are not supported")
++        return ray.get(self.allocator.claim.remote(self.policy, pool_name, schemes))
++
++    def sort_placement_groups(self, pgs):
++        return ray.get(self.allocator.sort.remote(self.policy, pgs))
++
++
++def topology_from_config(config):
++    """Return None when disabled, without probing hardware or creating an actor."""
++    cfg = config.get("trainer", {}).get("ascend_topology", {})
++    if not cfg.get("enabled", False):
++        return None
++    policy = TopologyPolicy.from_config(cfg)
++    name = f"verl_ascend_topology_{ray.get_runtime_context().get_job_id()}"
++    allocator = _AllocatorActor.options(name=name, get_if_exists=True, scheduling_strategy="DEFAULT").remote(policy)
++    return AscendTopology(allocator, policy, name)
++
++
++def prepare_topology(config, resource_pool_spec, *, mode="sync"):
++    """Reserve the task's complete plan before constructing its first WorkerGroup."""
++    if not config.get("trainer", {}).get("ascend_topology", {}).get("enabled", False):
++        return None
++    if config["trainer"].get("device", "npu").lower() != "npu":
++        raise ValueError("trainer.ascend_topology requires trainer.device=npu")
++    # Reject invalid mode, replica dimensions, or quota syntax before hardware discovery.
++    requests = requests_from_config(config, resource_pool_spec, mode=mode)
++    topology = topology_from_config(config)
++    logger.warning(
++        "[ascend-topology] mode=%s manifest=%s physical_nodes=%d",
++        mode,
++        [(r.name, r.processes, r.groups) for r in requests],
++        sum(len(r.processes) for r in requests),
++    )
++    ray.get(topology.allocator.prepare.remote(topology.policy, requests))
++    return topology
+diff --git a/verl/single_controller/ray/ascend_topology_plan.py b/verl/single_controller/ray/ascend_topology_plan.py
+new file mode 100644
+--- /dev/null
++++ b/verl/single_controller/ray/ascend_topology_plan.py
+@@ -0,0 +1,413 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
++"""Pure task-wide node planning. No Ray, torch, or hardware side effects."""
++
++import ipaddress
++import logging
++import time
++from collections import Counter, deque
++from dataclasses import dataclass
++from itertools import combinations
++
++logger = logging.getLogger(__name__)
++
++
++def positive_int(value, label):
++    if type(value) is not int or value <= 0:
++        raise ValueError(f"{label} must be a positive integer, got {value!r}")
++    return value
++
++
++@dataclass(frozen=True)
++class PoolRequest:
++    name: str
++    processes: tuple[int, ...]
++    cpus_per_process: int = 3
++    # Consecutive node spans that must each remain in one SP. One means unconstrained.
++    groups: tuple[int, ...] = ()
++
++    def __post_init__(self):
++        if not self.name or not self.processes or len(set(self.processes)) != 1:
++            raise ValueError("Topology pools require a name and homogeneous per-node process counts")
++        for count in self.processes:
++            positive_int(count, self.name)
++        positive_int(self.cpus_per_process, "cpus_per_process")
++        groups = self.groups or (1,) * len(self.processes)
++        for count in groups:
++            positive_int(count, "group size")
++        if sum(groups) != len(self.processes):
++            raise ValueError(f"{self.name}: groups must cover every node exactly once")
++        object.__setattr__(self, "groups", groups)
++
++    def schemes(self):
++        return [[{"NPU": 1, "CPU": self.cpus_per_process} for _ in range(count)] for count in self.processes]
++
++
++def node_key(node):
++    ip = ipaddress.ip_address(node["ip"])
++    return ip.version, int(ip), node["id"]
++
++
++def plan_nodes(nodes, available, requests, sp_plan=(), timeout_s=30):
++    """Return pool -> ordered nodes, satisfying exact quotas and all single-SP spans.
++
++    Whole-node assignments use max flow, so a CPU-rich node is not greedily stolen
++    from a pool that needs it. Backtracking pins multi-node groups to one SP; each
++    branch is pruned by a full resource/quota matching of ALL pools. Automatic
++    placement first finds a feasible plan, then minimizes the number of used SPs
++    and their combined eligible-node capacity, in that order. The latter prefers
++    tighter-fitting blocks and leaves larger untouched blocks available. If the
++    shared planning budget expires during optimization, keep the best feasible
++    plan found; no resource or single-SP constraint is relaxed.
++    """
++    requests = tuple(requests)
++    if not requests or len({r.name for r in requests}) != len(requests):
++        raise ValueError("A task plan must contain uniquely named resource pools")
++    total = sum(len(r.processes) for r in requests)
++    quotas = dict(sp_plan)
++    if sp_plan and sum(quotas.values()) != total:
++        raise ValueError(f"sp_plan total={sum(quotas.values())}, task requires {total} physical Ray nodes")
++    allowed = set(quotas) if sp_plan else {n["sp"] for n in nodes}
++    order = {sp: i for i, sp in enumerate(quotas or sorted(allowed))}
++    nodes = sorted((n for n in nodes if n["sp"] in allowed), key=lambda n: (order[n["sp"]], node_key(n)))
++    if len({n["id"] for n in nodes}) != len(nodes):
++        raise ValueError("Duplicate NodeID in topology snapshot")
++    counts = Counter(n["sp"] for n in nodes)
++    caps = quotas if sp_plan else counts
++    units = []
++    for request in requests:
++        demand = {"NPU": request.processes[0], "CPU": request.processes[0] * request.cpus_per_process}
++        for size in request.groups:
++            eligible = [
++                i
++                for i, node in enumerate(nodes)
++                if available.get(node["id"], {}).get(node["resource"], 0) >= 0.001
++                and all(available.get(node["id"], {}).get(k, 0) >= v for k, v in demand.items())
++            ]
++            units.append((request.name, size, eligible))
++    deadline = time.monotonic() + timeout_s
++
++    def check_time():
++        if time.monotonic() > deadline:
++            raise TimeoutError("Topology planning timed out; no PGs were created. Check SP quotas/replica sizes")
++
++    def match(pinned, active_sps):
++        check_time()
++        # source -> demand groups -> eligible physical nodes -> SP quota -> sink
++        source = 0
++        first_node = 1 + len(units)
++        first_sp = first_node + len(nodes)
++        sp_vertices = {sp: first_sp + i for i, sp in enumerate(order)}
++        sink = first_sp + len(order)
++        graph = [[] for _ in range(sink + 1)]
++
++        def edge(a, b, cap):
++            forward = [b, cap, len(graph[b])]
++            backward = [a, 0, len(graph[a])]
++            graph[a].append(forward)
++            graph[b].append(backward)
++            return forward
++
++        links = []
++        for i, (_, size, eligible) in enumerate(units):
++            edge(source, 1 + i, size)
++            links.append(
++                [
++                    (j, edge(1 + i, first_node + j, 1))
++                    for j in eligible
++                    if nodes[j]["sp"] in active_sps and (i not in pinned or nodes[j]["sp"] == pinned[i])
++                ]
++            )
++        for j, node in enumerate(nodes):
++            edge(first_node + j, sp_vertices[node["sp"]], 1)
++        for sp, vertex in sp_vertices.items():
++            edge(vertex, sink, caps.get(sp, 0))
++        flow = 0
++        while flow < total:
++            check_time()
++            parent = {source: None}
++            queue = deque([source])
++            while queue and sink not in parent:
++                a = queue.popleft()
++                for index, (b, cap, _) in enumerate(graph[a]):
++                    if cap > 0 and b not in parent:
++                        parent[b] = (a, index)
++                        queue.append(b)
++            if sink not in parent:
++                return None
++            b = sink
++            while b != source:
++                a, index = parent[b]
++                e = graph[a][index]
++                e[1] -= 1
++                graph[b][e[2]][1] += 1
++                b = a
++            flow += 1
++        return [[nodes[j] for j, e in group if e[1] == 0] for group in links]
++
++    eligible_counts = [Counter(nodes[j]["sp"] for j in eligible) for _, _, eligible in units]
++
++    def solve(active_sps):
++        check_time()
++        candidates = {
++            i: [sp for sp in order if sp in active_sps and eligible_counts[i][sp] >= size and caps.get(sp, 0) >= size]
++            for i, (_, size, _) in enumerate(units)
++            if size > 1
++        }
++        if any(not options for options in candidates.values()):
++            return None
++        # Harder/larger replica groups first; restore rank ordering at the end.
++        sequence = sorted(candidates, key=lambda i: (len(candidates[i]), -units[i][1], i))
++
++        def search(depth, pinned):
++            assignment = match(pinned, active_sps)
++            if assignment is None:
++                return None
++            if depth == len(sequence):
++                return assignment
++            i = sequence[depth]
++            used = Counter(pinned.values())
++            options = candidates[i]
++            if not sp_plan:
++                options = sorted(options, key=lambda sp: (-used[sp], -eligible_counts[i][sp], sp))
++            for sp in options:
++                pinned[i] = sp
++                result = search(depth + 1, pinned)
++                if result is not None:
++                    return result
++            pinned.pop(i, None)
++            return None
++
++        return search(0, {})
++
++    def compact(best):
++        # Count each currently eligible physical node once, across all pools.
++        # Busy or unusable nodes must not make a block appear larger than it is.
++        free_counts = Counter(nodes[j]["sp"] for j in {j for _, _, eligible in units for j in eligible})
++
++        def score(assignment):
++            used = {node["sp"] for group in assignment for node in group}
++            return len(used), sum(free_counts[sp] for sp in used)
++
++        best_score = score(best)
++        accumulated = 0
++        for minimum_sps, count in enumerate(sorted(free_counts.values(), reverse=True), 1):
++            accumulated += count
++            if accumulated >= total:
++                break
++        if best_score == (minimum_sps, total):
++            return best
++        # SP count dominates fit. Keep iteration lazy and within the SAME budget
++        # as feasibility search; never build an exponential list of subsets.
++        sps = sorted(free_counts, key=lambda sp: (free_counts[sp], sp))
++        try:
++            for size in range(minimum_sps, best_score[0] + 1):
++                # Even the smallest blocks cannot improve this score. This also
++                # avoids enumerating equivalent subsets in homogeneous clusters.
++                if (size, sum(free_counts[sp] for sp in sps[:size])) >= best_score:
++                    break
++                for subset in combinations(sps, size):
++                    check_time()
++                    capacity = sum(free_counts[sp] for sp in subset)
++                    if capacity < total or (size, capacity) >= best_score:
++                        continue
++                    candidate = solve(set(subset))
++                    if candidate is not None:
++                        candidate_score = score(candidate)
++                        if candidate_score < best_score:
++                            best, best_score = candidate, candidate_score
++                        if best_score == (size, total):
++                            return best
++                # All smaller subsets have been checked; only this size's
++                # best fit matters once a feasible assignment has been found.
++                if best_score[0] <= size:
++                    break
++        except TimeoutError:
++            logger.warning(
++                "[ascend-topology] automatic placement optimization reached its time budget; "
++                "using the best feasible plan found (SPs=%s, eligible nodes in selected SPs=%s); "
++                "optimality is not guaranteed",
++                *best_score,
++            )
++        return best
++
++    assignment = solve(set(order))
++    if assignment is None:
++        eligible_counts = {
++            request.name: dict(Counter(nodes[j]["sp"] for j in next(u[2] for u in units if u[0] == request.name)))
++            for request in requests
++        }
++        raise RuntimeError(
++            f"No feasible single-SP replica plan: free eligible nodes by pool/SP={eligible_counts}; "
++            f"required groups={[(r.name, r.groups) for r in requests]}; sp_plan={list(sp_plan)}. "
++            "Total free nodes alone is insufficient; check CPU/NPU capacity and complete replica slots."
++        )
++    if not sp_plan:
++        assignment = compact(assignment)
++    result = {r.name: [] for r in requests}
++    for (name, _, _), selected in zip(units, assignment, strict=True):
++        result[name].extend(sorted(selected, key=node_key))
++    # Equal-size groups contribute a multiple of that size to every SP, so a
++    # full SP/IP sort preserves replica boundaries. Heterogeneous teacher spans
++    # must retain their original group positions.
++    for request in requests:
++        if len(set(request.groups)) == 1:
++            result[request.name].sort(key=lambda n: (order[n["sp"]], node_key(n)))
++    return result
++
++
++def replica_world_size(rollout):
++    if rollout.get("name", "vllm") not in ("vllm", "sglang"):
++        raise ValueError("Ascend topology planning currently supports vllm/sglang replicas")
++    if (rollout.get("disaggregation") or {}).get("enabled", False):
++        raise ValueError("This VERL version's PD backends reject NPU execution; disable PD for Ascend topology")
++    world = 1
++    for field in ("tensor_model_parallel_size", "data_parallel_size", "pipeline_model_parallel_size"):
++        world *= positive_int(rollout.get(field, 1), field)
++    return world
++
++
++def replica_spans(world, replica_world):
++    if world <= 0 or world % replica_world:
++        raise ValueError(f"Pool world_size={world} must be a positive multiple of replica world_size={replica_world}")
++    return [(start, start + replica_world) for start in range(0, world, replica_world)]
++
++
++def replica_world_on_nodes(rollout, per_node):
++    """Match RolloutReplica's node layout before reserving any resources."""
++    world = replica_world_size(rollout)
++    per_node = positive_int(per_node, "n_gpus_per_node")
++    if world % min(per_node, world):
++        raise ValueError(f"Replica world_size={world} must be divisible by per-node processes={min(per_node, world)}")
++    return world
++
++
++def pool_request(name, processes, spans=(), cpus=3):
++    processes = tuple(processes)
++    if not processes or len(set(processes)) != 1:
++        raise ValueError(f"{name}: expected homogeneous nonempty pool")
++    per_node = positive_int(processes[0], "processes per node")
++    joins = set()
++    for start, end in spans:
++        if start < 0 or end <= start or end > sum(processes):
++            raise ValueError(f"{name}: invalid replica rank span {(start, end)}")
++        first, last = start // per_node, (end - 1) // per_node
++        # Match the existing replica implementation's node alignment requirements.
++        if last - first + 1 != (end - start + per_node - 1) // per_node:
++            raise ValueError(f"{name}: replica rank span {(start, end)} is not node aligned")
++        joins.update(range(first, last))
++    groups, size = [], 1
++    for index in range(len(processes) - 1):
++        if index in joins:
++            size += 1
++        else:
++            groups.append(size)
++            size = 1
++    groups.append(size)
++    return PoolRequest(name, processes, cpus, tuple(groups))
++
++
++def standalone_requests(rollout, nnodes, per_node, prefix="rollout_pool_", start_rank=0):
++    world = replica_world_on_nodes(rollout, per_node)
++    per_node = positive_int(per_node, "n_gpus_per_node")
++    total = positive_int(nnodes, "nnodes") * per_node
++    spans = replica_spans(total, world)
++    per_replica_node = min(per_node, world)
++    count = world // per_replica_node
++    return [
++        PoolRequest(f"{prefix}{start_rank + i}", (per_replica_node,) * count, 2, (count,)) for i in range(len(spans))
++    ]
++
++
++def teacher_spans(config):
++    teachers = dict(config.get("teacher_models", {}))
++    per_node = positive_int(config.get("n_gpus_per_node"), "distillation.n_gpus_per_node")
++    total = positive_int(config.get("nnodes"), "distillation.nnodes") * per_node
++    if len(teachers) == 1 and "teacher_model" in teachers:
++        return replica_spans(total, replica_world_on_nodes(teachers["teacher_model"]["inference"], per_node))
++    teachers.pop("teacher_model", None)
++    spans, offset = [], 0
++    for teacher in teachers.values():
++        world = replica_world_on_nodes(teacher["inference"], per_node)
++        for _ in range(positive_int(teacher.get("num_replicas"), "teacher.num_replicas")):
++            spans.append((offset, offset + world))
++            offset += world
++    if offset != total:
++        raise ValueError("Teacher replica sizes do not cover the configured teacher pool")
++    return spans
++
++
++def requests_from_config(config, resource_pool_spec, *, mode="sync"):
++    """Build the complete manifest before ANY training PG is allocated.
++
++    V0/sync/colocate_async reuse the training pool for rollout. V1 separate_async
++    also starts standalone replicas. Fully async has separate training and rollout
++    pools, and optionally hybrid replicas on training nodes. The entrypoint passes
++    its actual mode explicitly; the presence of async config keys is not a selector.
++    Later callers only claim reservations; they cannot add an unplanned pool.
++    """
++    if mode not in ("v0", "sync", "colocate_async", "separate_async", "fully_async"):
++        raise ValueError(f"Unsupported Ascend topology trainer mode: {mode!r}")
++    specs = {name: tuple(counts) for name, counts in resource_pool_spec.items()}
++    rollout = config["actor_rollout_ref"]["rollout"]
++    trainer = config["trainer"]
++    per_node = positive_int(trainer["n_gpus_per_node"], "trainer.n_gpus_per_node")
++    fully_async = mode == "fully_async"
++    shared_name = "trainer_pool" if fully_async else "global_pool"
++    if shared_name not in specs or specs[shared_name] != (per_node,) * positive_int(
++        trainer["nnodes"], "trainer.nnodes"
++    ):
++        raise ValueError(f"{mode} requires a {shared_name} matching trainer.nnodes/n_gpus_per_node")
++    async_cfg = config.get("async_training", {})
++    dynamic = async_cfg.get("use_dynamic_resource_scheduling", False)
++    hybrid = not fully_async or dynamic or async_cfg.get("use_trainer_do_validate", False)
++    constraints = {name: [] for name in specs}
++    start_rank = 0
++    if hybrid:
++        world = sum(specs[shared_name])
++        if rollout.get("n_gpus_per_node", per_node) != per_node:
++            raise ValueError("Hybrid rollout and trainer must use the same n_gpus_per_node")
++        constraints[shared_name] += replica_spans(world, replica_world_on_nodes(rollout, per_node))
++        start_rank = len(constraints[shared_name])
++    extra = []
++    if fully_async or mode == "separate_async":
++        standalone = config["rollout"] if fully_async else rollout
++        nnodes = standalone["nnodes"]
++        if type(nnodes) is not int or nnodes < 0:
++            raise ValueError(f"Standalone rollout.nnodes must be a non-negative integer, got {nnodes!r}")
++        if fully_async and any(rollout.get(key) != standalone[key] for key in ("nnodes", "n_gpus_per_node")):
++            raise ValueError("Fully async must copy top-level rollout dimensions before preparing topology")
++        if nnodes == 0:
++            if not (fully_async and dynamic):
++                raise ValueError(
++                    "Zero standalone rollout nodes require fully_async with use_dynamic_resource_scheduling=true"
++                )
++        else:
++            extra += standalone_requests(rollout, nnodes, standalone["n_gpus_per_node"], start_rank=start_rank)
++    reward = config.get("reward", {}).get("reward_model", {})
++    if not reward.get("enable", False):
++        specs.pop("reward_pool", None)
++    if reward.get("enable", False):
++        if (fully_async or mode == "separate_async") and not reward.get("enable_resource_pool", False):
++            raise ValueError(f"{mode} requires reward.reward_model.enable_resource_pool=true when RM is enabled")
++        if fully_async:
++            extra += standalone_requests(
++                reward["rollout"], reward["nnodes"], reward["n_gpus_per_node"], prefix="rollout_pool_reward_"
++            )
++        else:
++            name = "reward_pool" if reward.get("enable_resource_pool", False) else "global_pool"
++            if name not in specs:
++                raise ValueError(f"Enabled reward model requires resource pool {name!r}")
++            if reward["n_gpus_per_node"] != specs[name][0]:
++                raise ValueError("Reward model n_gpus_per_node must match its resource pool")
++            constraints[name] += replica_spans(
++                sum(specs[name]), replica_world_on_nodes(reward["rollout"], reward["n_gpus_per_node"])
++            )
++    distillation = config.get("distillation", {})
++    if distillation.get("enabled", False):
++        if "teacher_pool" not in specs:
++            specs["teacher_pool"] = (distillation["n_gpus_per_node"],) * distillation["nnodes"]
++        constraints["teacher_pool"] = teacher_spans(distillation)
++    return tuple(pool_request(name, counts, constraints.get(name, ())) for name, counts in specs.items()) + tuple(extra)
+diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
+--- a/verl/single_controller/ray/base.py
++++ b/verl/single_controller/ray/base.py
+@@ -119,6 +119,7 @@
+         max_colocate_count: int = 10,
+         detached=False,
+         accelerator_type: Optional[str] = None,
++        topology=None,
+     ) -> None:
+         super().__init__(process_on_nodes, max_colocate_count)
+         self.use_gpu = use_gpu
+@@ -127,6 +128,12 @@
+         self.pgs = None
+         self.detached = detached
+         self.accelerator_type = accelerator_type
++        self.topology = topology
++
++    def sort_placement_groups(self, pgs):
++        if self.topology is not None and self.use_gpu:
++            return self.topology.sort_placement_groups(pgs)
++        return sort_placement_group_by_node_ip(pgs)
+ 
+     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
+         if self.pgs is not None:
+@@ -149,6 +156,13 @@
+             if self.accelerator_type is not None:
+                 bundle[self.accelerator_type] = 1e-4
+         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
++
++        if self.topology is not None and self.use_gpu:
++            if device_name != "NPU":
++                raise ValueError("trainer.ascend_topology is only supported for NPU resource pools")
++            self.pgs = self.topology.create_placement_groups(pg_scheme, self.name_prefix, self.detached)
++            self.pgs = self.sort_placement_groups(self.pgs)
++            return self.pgs
+ 
+         lifetime = "detached" if self.detached else None
+ 
+@@ -191,6 +205,7 @@
+     mapping: dict[int, str]
+     max_colocate_count: int = 3
+     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
++    topology: Any = None
+ 
+     def create_resource_pool(self):
+         """Create Ray resource pools for distributed training.
+@@ -210,10 +225,14 @@
+                 use_gpu=True,
+                 max_colocate_count=self.max_colocate_count,
+                 name_prefix=resource_pool_name,
++                topology=self.topology,
+             )
+             self.resource_pool_dict[resource_pool_name] = resource_pool
+ 
+-        self._check_resource_available()
++        # Planned PGs already hold these resources, so the free-resource snapshot
++        # cannot be used to re-check their capacity. Each pool claim validates its demand.
++        if self.topology is None:
++            self._check_resource_available()
+ 
+     def get_resource_pool(self, role) -> RayResourcePool:
+         """Get the resource pool of the worker_cls"""
+@@ -312,6 +331,7 @@
+             placement_groups=placement_groups,
+             start_bundle_index=start_bundle_idx_list[split_idx],
+             subgroup_world_size=split_size_list[split_idx],
++            topology=resource_pool.topology,
+         )
+         for split_idx in range(len(split_size_list))
+     ]
+@@ -323,15 +343,27 @@
+     assert rp1.max_colocate_count == rp2.max_colocate_count, "Both RayResourcePool must has the same max_colocate_count"
+     assert rp1.n_gpus_per_node == rp2.n_gpus_per_node, "Both RayResourcePool must has the same n_gpus_per_node"
+     assert rp1.detached == rp2.detached, "Detached ResourcePool cannot be merged with non-detached ResourcePool"
++    if (rp1.topology is None) != (rp2.topology is None) or (
++        rp1.topology is not None
++        and (rp1.topology.name != rp2.topology.name or rp1.topology.policy != rp2.topology.policy)
++    ):
++        raise ValueError("Cannot merge pools with different Ascend topology policies/allocators")
+ 
+     new_store = rp1.store + rp2.store
+ 
+     merged = type(rp1)(
+-        new_store, rp1.use_gpu, f"{rp1.name_prefix}_{rp2.name_prefix}", rp1.max_colocate_count, rp1.detached
++        new_store,
++        rp1.use_gpu,
++        f"{rp1.name_prefix}_{rp2.name_prefix}",
++        rp1.max_colocate_count,
++        rp1.detached,
++        topology=rp1.topology,
+     )
+     merged.pgs = rp1.get_placement_groups(device_name=get_device_name()) + rp2.get_placement_groups(
+         device_name=get_device_name()
+     )
++    if merged.topology is not None:
++        merged.pgs = merged.sort_placement_groups(merged.pgs)
+ 
+     return merged
+ 
+@@ -562,7 +594,7 @@
+ 
+         rank = -1
+         local_world_size = resource_pool.store[0]
+-        for pg_idx, pg in enumerate(sort_placement_group_by_node_ip(pgs)):
++        for pg_idx, pg in enumerate(resource_pool.sort_placement_groups(pgs)):
+             assert local_world_size <= pg.bundle_count, f"when generating for {self.name_prefix}, for the "
+             if pg_idx == 0:
+                 self._get_master_addr_port(pg, bundle_index=0, master_port_range=self._ray_master_port_range)
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -132,6 +132,33 @@
+ 
+ # config for the trainer
+ trainer:
++
++  # Discover physical SuperPod IDs, plan the whole job, then reserve node-pinned PGs.
++  # Supported by V0, all V1 trainer modes, and fully_async_policy.
++  ascend_topology:
++
++    # Opt in; disabled preserves the original resource scheduling path.
++    enabled: false
++
++    # Exact job-wide physical-node quotas, e.g. [{sp: 2, nodes: 8}, {sp: 6, nodes: 8}].
++    # Empty: satisfy constraints first, prefer fewer SPs, then tighter-fitting free blocks.
++    # Training size and model parallelism are never changed automatically.
++    sp_plan: []
++
++    # Shared feasibility/optimization budget; keep a feasible plan on optimization timeout.
++    planning_timeout_s: 30
++
++    # Retry reservation only after every previous PG is confirmed removed.
++    allocation_retries: 1
++
++    # Optional explicit DCMI shared library; null uses standard library locations.
++    dcmi_library: null
++
++    # Enforced in an isolated subprocess with cancellation cleanup.
++    probe_timeout_s: 60
++
++    # Maximum wait for all planned placement groups to become ready.
++    placement_timeout_s: 1800
+ 
+   # Whether to balance batch sizes across distributed workers
+   balance_batch: True
+diff --git a/verl/trainer/main_ppo_v0.py b/verl/trainer/main_ppo_v0.py
+--- a/verl/trainer/main_ppo_v0.py
++++ b/verl/trainer/main_ppo_v0.py
+@@ -94,9 +94,14 @@
+             teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+             resource_pool_spec["teacher_pool"] = teacher_pool
+ 
++        from verl.single_controller.ray.ascend_topology import prepare_topology
+         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+ 
+-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
++        resource_pool_manager = ResourcePoolManager(
++            resource_pool_spec=resource_pool_spec,
++            mapping=self.mapping,
++            topology=prepare_topology(config, resource_pool_spec, mode="v0"),
++        )
+         return resource_pool_manager
+ 
+     def add_reward_model_resource_pool(self, config):
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -784,7 +784,13 @@
+             resource_pool_spec["teacher_pool"] = teacher_pool
+             self.mapping[Role.TeacherModel] = "teacher_pool"
+ 
+-        self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
++        from verl.single_controller.ray.ascend_topology import prepare_topology
++
++        self.resource_pool_manager = ResourcePoolManager(
++            resource_pool_spec=resource_pool_spec,
++            mapping=self.mapping,
++            topology=prepare_topology(config, resource_pool_spec, mode=self.trainer_mode),
++        )
+ 
+     def _load_checkpoint(self):
+         self.global_steps = 0
+diff --git a/verl/utils/ascend_dcmi.py b/verl/utils/ascend_dcmi.py
+new file mode 100644
+--- /dev/null
++++ b/verl/utils/ascend_dcmi.py
+@@ -0,0 +1,94 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
++"""Read physical SuperPod identity without importing torch or initializing an NPU context."""
++
++import ctypes
++
++
++class _SpodInfo(ctypes.Structure):
++    # dcmi_interface_api.h: struct dcmi_spod_info (48 bytes).
++    _fields_ = [
++        ("sdid", ctypes.c_uint),
++        ("super_pod_size", ctypes.c_uint),
++        ("super_pod_id", ctypes.c_uint),
++        ("server_index", ctypes.c_uint),
++        ("reserve", ctypes.c_uint * 8),
++    ]
++
++
++def _load_library(path):
++    candidates = (
++        [path]
++        if path
++        else [
++            "libdcmi.so",
++            "/usr/local/dcmi/libdcmi.so",
++            "/usr/local/Ascend/driver/lib64/common/libdcmi.so",
++        ]
++    )
++    errors = []
++    for candidate in candidates:
++        try:
++            return ctypes.CDLL(candidate)
++        except OSError as exc:
++            errors.append(f"{candidate}: {exc}")
++    raise RuntimeError("Cannot load DCMI: " + "; ".join(errors))
++
++
++def _check(ret, operation):
++    if ret != 0:
++        raise RuntimeError(f"DCMI {operation} failed: ret={ret}; check driver, device mounts and permissions")
++
++
++def query_superpod_id(library_path=None, *, _on_stage=None):
++    """Return the single physical SP ID of all locally visible NPU chips.
++
++    Uses DCMI_MAIN_CMD_CHIP_INF=12 / DCMI_CHIP_INF_SUB_CMD_SPOD_INFO=1.
++    Query failure is fatal; it must never silently become an IP-only allocation.
++    """
++    stage = _on_stage or (lambda operation: None)
++    stage("load libdcmi")
++    lib = _load_library(library_path)
++    int_ptr = ctypes.POINTER(ctypes.c_int)
++    uint_ptr = ctypes.POINTER(ctypes.c_uint)
++    signatures = {
++        "dcmi_init": [],
++        "dcmi_get_card_list": [int_ptr, int_ptr, ctypes.c_int],
++        "dcmi_get_device_num_in_card": [ctypes.c_int, int_ptr],
++        "dcmi_get_device_info": [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, uint_ptr],
++    }
++    for name, argtypes in signatures.items():
++        function = getattr(lib, name)
++        function.argtypes = argtypes
++        function.restype = ctypes.c_int
++    stage("dcmi_init")
++    _check(lib.dcmi_init(), "init")
++    cards = (ctypes.c_int * 64)()
++    count = ctypes.c_int()
++    stage("dcmi_get_card_list")
++    _check(lib.dcmi_get_card_list(ctypes.byref(count), cards, len(cards)), "get_card_list")
++    if not 0 < count.value <= len(cards):
++        raise RuntimeError(f"Invalid visible DCMI card count: {count.value}")
++    ids = set()
++    for card in cards[: count.value]:
++        devices = ctypes.c_int()
++        stage(f"dcmi_get_device_num_in_card(card={card})")
++        _check(lib.dcmi_get_device_num_in_card(card, ctypes.byref(devices)), f"device_count(card={card})")
++        if not 0 < devices.value <= 64:
++            raise RuntimeError(f"Invalid DCMI device count on card {card}: {devices.value}")
++        for device in range(devices.value):
++            info = _SpodInfo()
++            size = ctypes.c_uint(ctypes.sizeof(info))
++            stage(f"dcmi_get_device_info(card={card}, device={device})")
++            _check(
++                lib.dcmi_get_device_info(card, device, 12, 1, ctypes.byref(info), ctypes.byref(size)),
++                f"spod_info(card={card}, device={device})",
++            )
++            if size.value != ctypes.sizeof(info) or info.super_pod_id == 0xFFFFFFFF:
++                raise RuntimeError(f"Invalid DCMI spod_info on card={card}, device={device}")
++            ids.add(info.super_pod_id)
++    if len(ids) != 1:
++        raise RuntimeError(f"One Ray node must belong to one physical SuperPod; DCMI returned {sorted(ids)}")
++    return ids.pop()
+diff --git a/verl/utils/ascend_dcmi_probe.py b/verl/utils/ascend_dcmi_probe.py
+new file mode 100644
+--- /dev/null
++++ b/verl/utils/ascend_dcmi_probe.py
+@@ -0,0 +1,204 @@
++# Copyright 2026 verl contributors
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
++"""Isolate DCMI from Ray/Torch and supervise its lifetime without query threads.
++
++Ray worker -> relay -> supervisor -> single-threaded DCMI interpreter.
++The relay absorbs Ray's forced direct-child cleanup; its surviving supervisor
++observes the relay's exit and kills the query group. All helper interpreters
++run this file by absolute path with -I -S, bypassing package
++imports, PYTHONPATH, sitecustomize and .pth hooks. The supervisor remains outside
++the process that calls DCMI; it also cleans up if the Ray caller is killed.
++"""
++
++import json
++import math
++import os
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++
++def _command(*arguments):
++    return [sys.executable, "-I", "-S", str(Path(__file__).resolve()), *arguments]
++
++
++def _stop_supervisor(process):
++    # SIGTERM lets the supervisor clean its separate query process group first.
++    if process.poll() is None:
++        process.terminate()
++    try:
++        process.communicate(timeout=3)
++    except subprocess.TimeoutExpired:
++        process.kill()
++        process.communicate()
++
++
++def query_superpod_id_isolated(library_path=None, timeout_s=60):
++    """Run one local query; never load libdcmi in this calling process."""
++    timeout_s = float(timeout_s)
++    if not math.isfinite(timeout_s) or timeout_s <= 0:
++        raise ValueError("DCMI query timeout must be finite and positive")
++    process = subprocess.Popen(
++        _command("--relay", str(os.getpid()), str(timeout_s), library_path or ""),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++        start_new_session=True,
++    )
++    try:
++        stdout, stderr = process.communicate(timeout=timeout_s + 5)
++    except subprocess.TimeoutExpired as exc:
++        _stop_supervisor(process)
++        raise RuntimeError("DCMI supervisor did not finish within its query/cleanup deadline") from exc
++    except BaseException:
++        _stop_supervisor(process)
++        raise
++    try:
++        result = json.loads(stdout)
++    except (ValueError, TypeError) as exc:
++        raise RuntimeError(f"DCMI supervisor exited {process.returncode} without a result: {stderr[-2000:]}") from exc
++    if process.returncode != 0 or not isinstance(result, dict) or not result.get("ok"):
++        detail = result.get("error", result) if isinstance(result, dict) else result
++        raise RuntimeError(f"Isolated SP query failed: {detail}")
++    sp = result.get("sp")
++    if type(sp) is not int or not 0 <= sp < 0xFFFFFFFF:
++        raise RuntimeError(f"DCMI supervisor returned an invalid SP ID: {sp!r}")
++    return sp
++
++
++def _kill_query(process):
++    # start_new_session gives this invocation its own group. DCMI's forked
++    # children inherit it; kill the group even if its leader already exited.
++    try:
++        os.killpg(process.pid, signal.SIGKILL)
++    except ProcessLookupError:
++        pass
++    process.wait(timeout=2)
++
++
++def _relay(owner_pid, timeout_s, library_path):
++    """Shield the cleanup supervisor from Ray's direct-child SIGKILL policy."""
++    cancelled = []
++
++    def cancel(signum, frame):
++        cancelled.append(signum)
++
++    signal.signal(signal.SIGTERM, cancel)
++    signal.signal(signal.SIGINT, cancel)
++    if os.getppid() != owner_pid:
++        return 1
++    process = subprocess.Popen(_command("--supervise", str(os.getpid()), str(timeout_s), library_path))
++    deadline = time.monotonic() + timeout_s + 3
++    try:
++        while process.poll() is None:
++            if cancelled or os.getppid() != owner_pid or time.monotonic() >= deadline:
++                break
++            time.sleep(0.05)
++    finally:
++        _stop_supervisor(process)
++    return process.returncode
++
++
++def _tail(file, limit=4096):
++    file.seek(0, os.SEEK_END)
++    file.seek(max(0, file.tell() - limit))
++    return file.read().decode("utf-8", errors="replace")
++
++
++def _supervise(owner_pid, timeout_s, library_path):
++    cancelled = []
++
++    def cancel(signum, frame):
++        cancelled.append(signum)
++
++    signal.signal(signal.SIGTERM, cancel)
++    signal.signal(signal.SIGINT, cancel)
++    if os.getppid() != owner_pid:
++        return {"ok": False, "error": "Ray caller exited before DCMI query startup"}
++    with tempfile.TemporaryFile() as events, tempfile.TemporaryFile() as output:
++        deadline = time.monotonic() + timeout_s
++        process = subprocess.Popen(
++            _command("--query", str(events.fileno()), library_path),
++            pass_fds=(events.fileno(),),
++            stdout=output,
++            stderr=output,
++            start_new_session=True,
++        )
++        reason = None
++        try:
++            while process.poll() is None:
++                if cancelled or os.getppid() != owner_pid:
++                    reason = "Ray caller exited or cancelled the query"
++                    break
++                if time.monotonic() >= deadline:
++                    reason = f"query timed out after {timeout_s:g}s"
++                    break
++                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
++        finally:
++            _kill_query(process)
++        stage = "query interpreter startup"
++        result = None
++        # A separate inherited descriptor keeps native stdout/stderr away from
++        # the result protocol. Read only after the entire query group is stopped.
++        for line in _tail(events, 65536).splitlines():
++            try:
++                event = json.loads(line)
++            except ValueError:
++                continue
++            if "stage" in event:
++                stage = event["stage"]
++            if "ok" in event:
++                result = event
++        if reason is None and process.returncode == 0 and result and result.get("ok"):
++            return result
++        if reason is None:
++            reason = result.get("error") if result else None
++            reason = reason or f"query interpreter exit code {process.returncode}"
++        return {
++            "ok": False,
++            "error": f"{reason}; last stage={stage}; output tail={_tail(output)!r}",
++        }
++
++
++def _query(event_fd, library_path):
++    # Do not import verl, Ray or Torch here, or start a watchdog thread.
++    import runpy
++
++    with os.fdopen(event_fd, "w", buffering=1) as events:
++
++        def emit(record):
++            events.write(json.dumps(record, ensure_ascii=True) + "\n")
++            events.flush()
++
++        try:
++            emit({"stage": "load standalone DCMI code"})
++            namespace = runpy.run_path(str(Path(__file__).with_name("ascend_dcmi.py")))
++            sp = namespace["query_superpod_id"](library_path or None, _on_stage=lambda stage: emit({"stage": stage}))
++            emit({"ok": True, "sp": sp})
++            return 0
++        except Exception as exc:  # noqa: BLE001 - serialize failures across the process boundary
++            emit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
++            return 1
++
++
++if __name__ == "__main__":
++    if len(sys.argv) == 4 and sys.argv[1] == "--query":
++        sys.exit(_query(int(sys.argv[2]), sys.argv[3]))
++    if len(sys.argv) == 5 and sys.argv[1] == "--relay":
++        sys.exit(_relay(int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]))
++    if len(sys.argv) == 5 and sys.argv[1] == "--supervise":
++        try:
++            result = _supervise(int(sys.argv[2]), float(sys.argv[3]), sys.argv[4])
++        except Exception as exc:  # noqa: BLE001 - final process-boundary error response
++            result = {
++                "ok": False,
++                "error": f"DCMI supervisor error: {type(exc).__name__}: {exc}",
++            }
++        print(json.dumps(result, ensure_ascii=True), flush=True)
++        sys.exit(0 if result.get("ok") else 1)
++    raise SystemExit("Internal DCMI helper: expected --relay, --supervise or --query")
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -574,6 +574,13 @@
+                 ]
+             )
+         else:
++            from verl.single_controller.ray.ascend_topology import topology_from_config
++
++            topology = topology_from_config(self.config)
++            if topology is not None:
++                # Reserve in replica order, before asyncio.gather starts servers concurrently.
++                for server in self.rollout_replicas:
++                    server.prepare_standalone(topology)
+             await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
+ 
+         self.server_handles = [server._server_handle for server in self.rollout_replicas]
+diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
+--- a/verl/workers/rollout/replica.py
++++ b/verl/workers/rollout/replica.py
+@@ -186,10 +186,8 @@
+         self.workers = worker_group.workers
+         await self.launch_servers()
+ 
+-    async def init_standalone(self):
+-        """Init standalone rollout server, create new resource pool for this rollout."""
+-        # create resource pool for this rollout
+-        self.rollout_mode = RolloutMode.STANDALONE
++    def prepare_standalone(self, topology=None):
++        """Prepare a per-replica pool; optionally reserve PGs before parallel server startup."""
+         if self.is_reward_model:
+             resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
+         elif self.is_teacher_model:
+@@ -203,9 +201,18 @@
+             resource_pool_spec=resource_pool_spec,
+             mapping=None,
+             max_colocate_count=2,
++            topology=topology,
+         )
+         resource_pool_manager.create_resource_pool()
+         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
++        if topology is not None:
++            self.resource_pool.get_placement_groups(device_name=get_device_name())
++
++    async def init_standalone(self):
++        """Init standalone rollout server, using a pre-reserved pool when provided."""
++        self.rollout_mode = RolloutMode.STANDALONE
++        if self.resource_pool is None:
++            self.prepare_standalone()
+ 
+         # create worker group for this rollout
+         if self.is_reward_model:
