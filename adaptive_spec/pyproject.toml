@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verl-adaptive-spec"
+version = "0.1.0"
+description = "Historical AdaptiveSpec MTP control and optional Elastic rollout routing for verl on Ascend"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.entry-points."vllm.general_plugins"]
+adaptive_spec_plugin = "adaptive_spec.vllm_plugin:adaptive_spec_plugin"
+adaptive_spec_calibration_plugin = "adaptive_spec.vllm_plugin.calibration_v0_23:calibration_plugin"
+
+[project.scripts]
+adaptive-spec-collect = "adaptive_spec.calibration:main"
+adaptive-spec-build-contexts = "adaptive_spec.context_bank:main"
+adaptive-spec-check-backend = "adaptive_spec.backend:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["adaptive_spec*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "I", "G"]
+ignore = ["F405", "F403", "E731", "B007", "UP032", "G004", "UP045", "UP035"]
+isort = {known-first-party = ["adaptive_spec", "verl"]}

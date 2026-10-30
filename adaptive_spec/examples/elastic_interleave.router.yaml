@@ -1,0 +1,6 @@
+# Optional; omit router_config_path to retain the upstream router.
+router_class: adaptive_spec.scheduler.ElasticInterleaveRouter
+max_inflight_per_server: 16
+prompt_credit: 2
+elastic_delay_ms: 20
+group_namespace: adaptive-spec-rollout
