@@ -25,6 +25,7 @@ from .config import ST_KIND, UT_KIND, WorkflowConfig, WorkflowInfo, is_ignored_w
 from .extractors import (
     expand_pytest_targets,
     extract_bash_target,
+    extract_pytest_main_argv,
     extract_pytest_specs,
     extract_torchrun_targets,
     normalize_path_text,
@@ -274,11 +275,60 @@ def _expand_case_record(
     return expanded_cases
 
 
+def _pytest_command_cases(
+    tokens: list[str],
+    pytest_idx: int,
+    command: str,
+    repo_root: Path,
+) -> list[dict]:
+    """Build pytest cases for one command, expanding targets to case level."""
+    cases: list[dict] = []
+    targets, ignore_paths, ignore_globs = extract_pytest_specs(tokens, pytest_idx)
+    for target in targets:
+        if not should_keep_target(target, "pytest"):
+            continue
+        normalized_target = normalize_path_text(target)
+        if normalized_target in {"tests", "tests/"} or Path(normalized_target).suffix == "":
+            target_shape = "pytest-dir"
+        elif normalized_target.endswith(".py"):
+            target_shape = "pytest-file"
+        else:
+            target_shape = "pytest-target"
+
+        signature = normalize_signature(command, target)
+        case = _make_command_case(
+            "pytest",
+            UT_KIND,
+            target,
+            command,
+            expand_pytest_targets(target, repo_root, ignore_paths, ignore_globs),
+        )
+        case["signature"] = f"{signature} {target_shape}" if signature else target_shape
+        cases.append(case)
+    return cases
+
+
 def _extract_cases_from_command(
     command: str,
     repo_root: Path,
 ) -> list[dict]:
     command = command.strip()
+
+    # Workflows that invoke pytest from an inline ``python -c`` script keep the
+    # options out of sys.argv; recover that argv list from the source text and
+    # treat it as the equivalent command line. Checked before tokenizing because
+    # such a script starts with comments and Python statements, not a shell
+    # command, and would otherwise be treated as one.
+    main_argv = extract_pytest_main_argv(command)
+    if main_argv is not None:
+        cases = _pytest_command_cases(
+            ["pytest", *main_argv],
+            0,
+            "pytest " + " ".join(shlex.quote(arg) for arg in main_argv),
+            repo_root,
+        )
+        return _dedupe_cases(cases)
+
     if not command or command.startswith("#"):
         return []
 
@@ -298,30 +348,13 @@ def _extract_cases_from_command(
                 continue
             cases.append(_make_command_case("torchrun", ST_KIND, target, command, [target]))
     elif command_uses_pytest(tokens):
-        pytest_idx = tokens.index("pytest")
-        targets, ignore_paths, ignore_globs = extract_pytest_specs(tokens, pytest_idx)
-        for target in targets:
-            if not should_keep_target(target, "pytest"):
-                continue
-            normalized_target = normalize_path_text(target)
-            if normalized_target in {"tests", "tests/"} or Path(normalized_target).suffix == "":
-                target_shape = "pytest-dir"
-            elif normalized_target.endswith(".py"):
-                target_shape = "pytest-file"
-            else:
-                target_shape = "pytest-target"
+        cases.extend(_pytest_command_cases(tokens, tokens.index("pytest"), command, repo_root))
 
-            signature = normalize_signature(command, target)
-            case = _make_command_case(
-                "pytest",
-                UT_KIND,
-                target,
-                command,
-                expand_pytest_targets(target, repo_root, ignore_paths, ignore_globs),
-            )
-            case["signature"] = f"{signature} {target_shape}" if signature else target_shape
-            cases.append(case)
+    return _dedupe_cases(cases)
 
+
+def _dedupe_cases(cases: list[dict]) -> list[dict]:
+    """Drop repeated cases that describe the same command and target set."""
     deduped: list[dict] = []
     seen = set()
     for case in cases:
@@ -375,10 +408,11 @@ def parse_workflow_content(
         if run_match:
             indent = len(run_match.group(1))
             run_entries, next_idx = _extract_run_entries(lines, idx, indent, run_match.group(2).strip())
+            block_cases: list[dict] = []
             for raw, line_number in run_entries:
                 for command in split_shell_commands(raw):
                     for case in _extract_cases_from_command(command, repo_root):
-                        cases.extend(
+                        block_cases.extend(
                             _expand_case_record(
                                 case,
                                 workflow_info,
@@ -389,10 +423,47 @@ def parse_workflow_content(
                                 workflow_kind,
                             )
                         )
+            if not block_cases:
+                block_cases.extend(
+                    _cases_from_stack_script(
+                        run_entries, workflow_info, file_name, job_name, step_name, workflow_kind, repo_root
+                    )
+                )
+            cases.extend(block_cases)
             idx = next_idx
             continue
         idx += 1
     return workflow_info, cases
+
+
+def _cases_from_stack_script(
+    run_entries: list[tuple[str, int]],
+    workflow_info: WorkflowInfo,
+    file_name: str,
+    job_name: str,
+    step_name: str,
+    workflow_kind: str,
+    repo_root: Path,
+) -> list[dict]:
+    """Recover cases from a ``run:`` block whose pytest call spans several lines.
+
+    An inline ``python -c '...'`` script is emitted one line at a time, so no
+    single entry holds a complete argv list. Join the block and retry only when
+    the per-line pass found nothing, keeping normal parsing untouched.
+    """
+    joined = "\n".join(raw for raw, _ in run_entries)
+    if "pytest.main(" not in joined:
+        return []
+    line_number = next(
+        (line_number for raw, line_number in run_entries if "pytest.main(" in raw),
+        run_entries[0][1] if run_entries else 0,
+    )
+    collected: list[dict] = []
+    for case in _extract_cases_from_command(joined, repo_root):
+        collected.extend(
+            _expand_case_record(case, workflow_info, file_name, job_name, step_name, line_number, workflow_kind)
+        )
+    return collected
 
 
 def parse_workflow(path: Path, repo_root: Path, config: WorkflowConfig) -> tuple[WorkflowInfo | None, list[dict]]:

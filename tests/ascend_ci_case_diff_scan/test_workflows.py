@@ -517,6 +517,83 @@ class TestParseWorkflowContent:
         assert len(cases) > 0
         assert any(c["command_type"] == "pytest" for c in cases)
 
+    def test_extracts_pytest_main_script_cases(self, empty_config, tmp_path):
+        """A `python -c` block that calls pytest.main([...]) is a real pytest run."""
+        from modules.workflows import parse_workflow_content
+
+        content = """name: NPU unit tests
+on: [push]
+jobs:
+  unit-tests:
+    runs-on: aarch64
+    steps:
+      - name: Run all NPU unit tests
+        run: |
+          # Keep pytest options out of sys.argv: MegatronAdaptor parses it.
+          python -c '
+          import pytest
+
+          raise SystemExit(pytest.main([
+              "-s",
+              "-x",
+              "--ignore-glob=*on_cpu.py",
+              "tests/",
+          ]))
+          '
+"""
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_alpha.py").write_text("def test_alpha():\n    pass\n", encoding="utf-8")
+        (tests_dir / "test_beta.py").write_text("def test_beta():\n    pass\n", encoding="utf-8")
+
+        info, cases = parse_workflow_content(
+            "npu_unit_tests.yml",
+            ".github/workflows/npu_unit_tests.yml",
+            content,
+            tmp_path,
+            empty_config,
+        )
+
+        assert info is not None and info.workflow_kind == "npu"
+        targets = {case["target"] for case in cases}
+        assert "tests/test_alpha.py::test_alpha" in targets
+        assert "tests/test_beta.py::test_beta" in targets
+        assert all(case["command_type"] == "pytest" for case in cases)
+
+    def test_pytest_main_script_honours_ignore_globs(self, empty_config, tmp_path):
+        from modules.workflows import parse_workflow_content
+
+        content = """name: NPU unit tests
+on: [push]
+jobs:
+  unit-tests:
+    runs-on: aarch64
+    steps:
+      - name: Run all NPU unit tests
+        run: |
+          python -c '
+          import pytest
+
+          raise SystemExit(pytest.main(["--ignore-glob=*_on_cpu.py", "tests/"]))
+          '
+"""
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_alpha.py").write_text("def test_alpha():\n    pass\n", encoding="utf-8")
+        (tests_dir / "test_gamma_on_cpu.py").write_text("def test_gamma():\n    pass\n", encoding="utf-8")
+
+        _, cases = parse_workflow_content(
+            "npu_unit_tests.yml",
+            ".github/workflows/npu_unit_tests.yml",
+            content,
+            tmp_path,
+            empty_config,
+        )
+
+        targets = {case["target"] for case in cases}
+        assert "tests/test_alpha.py::test_alpha" in targets
+        assert not any("gamma" in target for target in targets)
+
     def test_extracts_torchrun_case(self, sample_torchrun_workflow_yaml, empty_config, tmp_path):
         from modules.workflows import parse_workflow_content
 
