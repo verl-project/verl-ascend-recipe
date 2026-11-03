@@ -1,239 +1,184 @@
 # DAPO length predictor and EWS
 
-This recipe adds two orthogonal components to DAPO rollout generation:
+EWS (Event-driven Waiting-pool Scheduler) admits rollout requests from a shared waiting pool. Before a selected predictor is ready, requests follow FCFS. Once active, longer predicted work starts first, so long responses can overlap with shorter requests instead of being left until the end of a batch.
 
-1. a prompt-side response-length predictor; and
-2. an Event-driven Waiting-pool Scheduler (EWS).
+## What changes
 
-EWS has a deterministic fail-closed mode. Before the selected predictor passes its activation gates, EWS admits requests in stable FCFS order. After activation it admits the longest predicted work first and refills the bounded rollout window whenever one request completes. Actual inference-server placement remains owned by verl's existing `GlobalRequestLoadBalancer`.
+| Path | Admission order | Refill | Prediction |
+| --- | --- | --- | --- |
+| Standard DAPO rollout | Existing manager order | Existing manager | None |
+| Community predictor / static Snake | Scores packed across DP ranks before generation | Existing manager | Linear/ListMLE ranking scores |
+| EWS + D1 (default backend) | Predicted long first, FCFS during warm-up | One global bounded window, refilled on completion | Linear/ListMLE + historical PAVA calibration |
+| EWS + D2 (optional backend) | Risk-adjusted predicted long first, FCFS until admission | Same EWS window | Frozen LogNormal distribution + quality admission/monitoring |
 
-The implementation uses verl's public `agent_loop_manager_class` extension point. It does not patch vLLM or vLLM-Ascend and does not require either project as a Python dependency of the scheduler package.
+Server placement stays with verl's `GlobalRequestLoadBalancer`. Priorities are fixed for each batch: EWS does not poll decode progress, migrate running requests or revise predictions on completion. There are no forced anchor rollouts or sibling corrections.
 
-## Required `verl` version
+D1 learns online from completed training batches. PAVA maps its unitless ranking score to token-scale work. D2 returns median, p90, p95, expected length, mu/sigma and exceedance probabilities; its scheduling score is `median + risk_weight * (p90 - median)`. The backend is selected at launch and remains fixed.
 
-See [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt). The tested pin is `bcb638649a50e58494a8ddd92085ad1174f674b8`.
+## Requirements
 
-## Tested environment and dependency boundary
+| Component | Configuration |
+| --- | --- |
+| Platform | Linux, Ascend NPU for the documented device run |
+| Actor | FSDP or FSDP2; text-only D2 quality monitoring |
+| verl | `0.8.0.dev`, commit `bcb638649a50e58494a8ddd92085ad1174f674b8` |
+| Rollout stack used in evaluation | vLLM `0.19.1`, vLLM-Ascend `0.19.1rc1` |
+| Runtime image used in evaluation | `quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler` |
+| Python | Device environment 3.11.14; CI 3.10 |
+| Libraries | PyTorch/torch-npu and Ray from the runtime; the pinned verl dependencies |
 
-| Component | Tested value | Dependency role |
+This is a source-tree recipe, not a standalone wheel. [REQUIRED_VERL.txt](REQUIRED_VERL.txt) is read by the repository installer to select the core verl revision. The scheduler package has no vLLM/vLLM-Ascend imports or source patches. SciPy is optional for the D1 Kendall-tau metric.
+
+For backend upgrades, see [UPGRADING.md](UPGRADING.md): device-free tests and the integration files to review are listed separately from device validation.
+
+## Installation
+
+Start inside a working Ascend runtime whose driver/CANN/PyTorch/torch-npu stack matches the host. Keep this checkout and its dependencies in your own workspace.
+
+The commands below fetch this PR, install its pinned verl and copy both recipe directories. The overlay copies directory contents rather than creating a nested `dapo_predictor/dapo_predictor` layout.
+
+```bash
+export WORK_ROOT="$PWD/ews-work"
+mkdir -p "$WORK_ROOT"
+git clone https://github.com/verl-project/verl-ascend-recipe.git "$WORK_ROOT/recipes"
+cd "$WORK_ROOT/recipes"
+git fetch origin pull/142/head
+git switch --detach FETCH_HEAD
+export RECIPE_SRC="$PWD"
+
+./install_verl.sh --recipe dapo_predictor --method git \
+  --dest "$WORK_ROOT/verl" --yes
+
+export VERL_SRC="$WORK_ROOT/verl"
+mkdir -p "$VERL_SRC/recipe/dapo" "$VERL_SRC/recipe/dapo_predictor"
+cp -a "$RECIPE_SRC/dapo/." "$VERL_SRC/recipe/dapo/"
+cp -a "$RECIPE_SRC/dapo_predictor/." "$VERL_SRC/recipe/dapo_predictor/"
+cd "$VERL_SRC"
+export PYTHONPATH="$VERL_SRC:${PYTHONPATH:-}"
+```
+
+Use fresh destination directories for a first install; compare existing files before applying this overlay to a working checkout. Copying this directory alone does not supply the upstream `recipe.dapo` trainer.
+
+## Data and model
+
+Prepare the public DAPO-Math and AIME parquet files with the included data script:
+
+```bash
+cd "$VERL_SRC"
+VERL_HOME="$VERL_SRC" bash recipe/dapo/prepare_dapo_data.sh
+export TRAIN_FILE="$VERL_SRC/data/dapo-math-17k.parquet"
+export TEST_FILE="$VERL_SRC/data/aime-2024.parquet"
+```
+
+The parquet rows contain chat messages in `prompt`, `data_source`, and a rule-based `reward_model.ground_truth`. Use separate training and validation outputs. A model download requires access to its provider and acceptance of any applicable license. For a small integration run, for example:
+
+```bash
+python -c 'from huggingface_hub import snapshot_download; snapshot_download("Qwen/Qwen3-0.6B", local_dir="models/Qwen3-0.6B")'
+export MODEL_PATH="$VERL_SRC/models/Qwen3-0.6B"
+```
+
+Choose a model supported by the selected rollout backend. The small-model integration workload is separate from the Qwen3.5-9B performance results.
+
+## Run D1 + EWS
+
+From the pinned verl checkout, on devices allocated to this job:
+
+```bash
+export NPU_COUNT=2
+export TP_SIZE=1
+export OUTPUT_DIR="$WORK_ROOT/runs/d1-ews"
+bash recipe/dapo_predictor/run_ews.sh
+```
+
+The script sets up a single-node, text-only DAPO run with console logging and no W&B. Defaults are 8 prompts/batch, 2 responses/prompt, 512 prompt tokens, 1024 response tokens and 12 RL epochs. Set `PROMPT_LENGTH`, `RESPONSE_LENGTH`, `BATCH_SIZE`, `ROLLOUT_N`, `TOTAL_EPOCHS`, `MIN_EPOCH`, `MIN_SAMPLES` and `SLOTS_PER_SERVER` for your workload. The caller controls device allocation; the script does not choose or stop devices.
+
+`NPU_COUNT` counts logical devices visible to PyTorch, not necessarily physical boards. On A3 hardware a physical board can expose two dies.
+
+Check the composed command without starting training:
+
+```bash
+bash recipe/dapo_predictor/run_ews.sh --dry-run
+```
+
+For a short integration check of cold-start, update and active prediction:
+
+```bash
+MIN_EPOCH=0 MIN_SAMPLES=0 TOTAL_EPOCHS=2 \
+  OUTPUT_DIR="$WORK_ROOT/runs/d1-smoke" \
+  bash recipe/dapo_predictor/run_ews.sh \
+  data.train_max_samples=16 data.val_max_samples=8
+```
+
+D1 still needs calibration observations before activation. These reduced gates are for integration checks, not evidence that an untrained head is useful. In a normal run the defaults are ten completed RL dataset passes and 2560 observed rollout requests. `predictor_reorder.epochs=10` is the number of predictor fitting iterations per update, not the RL warm-up.
+
+For a matched standard-DAPO baseline, use `PREDICTOR_ENABLE=false` with the same model, seed, dataset, capacity and lengths. Give each run its own `OUTPUT_DIR`; do not compare an untrained smoke with an activated performance run. Pass extra Hydra overrides after the script arguments. To resume, retain the same output directory and pass `trainer.resume_mode=auto`.
+
+## Predictor configuration
+
+The legacy `epws` configuration keys, Python class names and metric prefixes remain compatible with the EWS display name.
+
+| Option under `trainer.predictor_reorder` | Default | Meaning |
 | --- | --- | --- |
-| Python | 3.10 / 3.11 | Provided by the selected verl runtime image. |
-| verl | commit `bcb638649a50e58494a8ddd92085ad1174f674b8` (`0.8.0.dev`) | Required and machine-pinned in `REQUIRED_VERL.txt`. |
-| PyTorch / torch-npu | The versions bundled by the tested Ascend runtime | Inherited from verl; this recipe does not repin them. |
-| vLLM | `0.19.1` | Tested rollout runtime, not imported by this package. |
-| vLLM-Ascend | `0.19.1rc1` | Tested Ascend rollout runtime, not imported by this package. |
-| Ascend image | `quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler` | End-to-end evaluation environment. |
-| Hardware | Ascend 910 | End-to-end evaluation hardware. |
+| `enable` | false in the library; true in run_ews.sh | Opt in to predictor worker and scheduling |
+| `scheduler` | static_snake in the library; epws in run_ews.sh | Community static packing or EWS |
+| `backend` | linear_listmle | D1, or censored_lognormal for D2 |
+| `activation.min_epoch` | 10 | Completed RL dataset passes before activation |
+| `activation.min_samples` | 2560 | Observed rollout-request count |
+| `epochs / batch_size / lr / weight_decay` | 10 / 32 / 3e-5 / 1e-4 | D1 optimizer settings |
+| `calibration_max_samples` | 4096 | D1 historical prompt/length replay capacity |
+| `epws.slots_per_server` | 8 | Admission capacity per server |
+| `epws.max_concurrent_requests` | null | Explicit global window; null derives servers × slots |
+| `risk_weight` | 0.5 | D2 tail-risk weight |
+| `d2_lifecycle.enable / interval_epochs` | true / 5 | D2 quality admission and monitoring cadence |
 
-The scheduler package intentionally has no direct Python dependency on vLLM or vLLM-Ascend. Runtime compatibility with newer rollout stacks is therefore expected to follow verl's public agent-loop contract, but only the versions above are claimed as tested. Core Python dependencies (`torch`, `numpy`, `ray`, Hydra/OmegaConf, and verl utilities) come from the pinned verl environment. SciPy is optional and is used only to emit the Kendall-tau training metric; training and scheduling continue without it.
+D1 uses the maximum completed sibling length as each prompt's fitting/calibration target. Prediction extracts one actor representation per contiguous `rollout.n` sibling group, reuses the trainer's tokenized inputs, then expands the prediction to all siblings.
 
-## Source-tree placement
-
-This is a recipe overlay, not a standalone wheel. Install or clone the pinned verl revision (including its `recipe` submodule), then place this directory at `recipe/dapo_predictor` in that source checkout:
+D2 requires an externally fitted checkpoint and a held-out candidate report; it is not an online D2 trainer:
 
 ```bash
-git clone --recurse-submodules https://github.com/verl-project/verl.git
-cd verl
-git checkout bcb638649a50e58494a8ddd92085ad1174f674b8
-git submodule update --init --recursive recipe
-cp -a /path/to/verl-ascend-recipe/dapo_predictor recipe/dapo_predictor
-pip install -e .
+BACKEND=censored_lognormal \
+D2_CANDIDATE_REPORT=/shared/ews/d2-candidate.json \
+TOTAL_EPOCHS=20 OUTPUT_DIR="$WORK_ROOT/runs/d2-ews" \
+  bash recipe/dapo_predictor/run_ews.sh
 ```
 
-Run the commands below from the verl checkout with that checkout on `PYTHONPATH`. The upstream DAPO recipe remains the owner of the base trainer configuration; this overlay adds predictor and EWS behavior through the documented extension point.
+Missing or rejected candidates leave FCFS active. The default D2 checks occur after completed passes 10, 15, 20, ...; admitted heads remain frozen. Read [D2_LIFECYCLE.md](D2_LIFECYCLE.md) for the checkpoint schema, external collection/fitting obligations, validation JSONL, thresholds, monitoring and resume. For explicit epoch/sample-only compatibility, use `++trainer.predictor_reorder.d2_lifecycle.enable=false` and supply `+trainer.predictor_reorder.d2_checkpoint=/path/to/head.pt`.
 
-## Product boundary
+## Design and integration
 
-Included in the first contribution:
-
-- no-anchor EWS with deterministic FCFS fallback;
-- D1 `Linear/ListMLE` as the default online backend;
-- train-history-only PAVA calibration from ranking score to token-scale work;
-- D1 epoch/sample gates, and coarse rank-first quality admission/monitoring for D2;
-- predictor-only checkpoint save/resume;
-- D2 right-censored LogNormal inference as an optional frozen backend;
-- strict finite/range/schema checks and prediction provenance.
-
-Not enabled or submitted as product behavior:
-
-- forced K=1/K=2 anchor rollouts;
-- sibling/history correction;
-- live decode-progress polling;
-- automatic D1-to-D2 switching;
-- TailGate/OOD heuristics;
-- vLLM/vLLM-Ascend source patches;
-- exact-trace replay helpers used by experiments.
-
-## Runtime flow (`scheduler=epws`)
-
-1. The trainer repeats each prompt by `rollout.n` as usual.
-2. Until the selected predictor passes its activation gates, no scheduling predictor forward is run and EWS behaves as stable FCFS. D2 also requires an independently validated candidate report.
-3. Once active, the actor extracts one prompt representation per contiguous `rollout.n` sibling group. Siblings share that prediction; identical prompts in separate groups are not deduplicated.
-4. D1 maps the scalar ListMLE score to token work using a train-history-only monotone PAVA map. D2 uses `median + risk_weight * (p90 - median)`.
-5. `EPWSAgentLoopManager` keeps a bounded set of rollout requests in flight. Each completion immediately admits the next request; active mode is longest-predicted-work-first.
-6. verl's existing global load balancer chooses the inference server.
-7. After the actor update, D1 learns from the completed rollout batch and refits calibration for future batches. The batch being scheduled never uses its own completion lengths.
-8. D2 never trains in the worker. At completed RL epochs 10, 15, 20, ... the trainer either evaluates an external candidate (while inactive) or checks a five-epoch monitoring window (while active). An admitted head stays frozen; no scheduled refitting occurs.
-
-Admission priorities are computed before each rollout batch. Completion events refill capacity; they do not refresh predictions, migrate running requests, or re-rank the batch using live decode progress.
-
-## Modules
-
-| Module | Responsibility |
+| File | Responsibility |
 | --- | --- |
-| `main_dapo_predictor_reorder.py` | DAPO entry point; selects the custom actor worker and installs EWS through verl's manager extension. |
-| `predictor_dapo_trainer.py` | Lifecycle gates, prompt-side scoring, predictor update, and predictor checkpoint state. |
-| `predictor_worker.py` | Hidden-state extraction, D1 online training/calibration, and optional D2 inference. |
-| `epws_manager.py` | Event-driven bounded admission and output-order restoration. |
-| `length_scheduler/calibration.py` | Weighted PAVA and monotone score-to-token interpolation. |
-| `length_scheduler/scheduler.py` | Stable FCFS / longest-predicted-work-first waiting pool. |
-| `length_scheduler/predictor.py` | Backend-neutral prediction API, D1/D2 adapters, provenance, and validation. |
-| `length_scheduler/checkpoint.py` | Backend-aware lifecycle metadata and frozen-D2 checkpoint binding. |
-| `length_scheduler/distribution.py` | Right-censored LogNormal inference primitives. |
-| `length_scheduler/d2_quality.py` | Rank-first D2 candidate admission, coarse monitoring, censor-aware safeguards, and resumable state. |
-| `validate_d2.py` | External CPU utility to publish a checkpoint-bound held-out validation report. |
-| `predictor_utils.py` | Legacy static-snake helper retained for backward compatibility. |
+| `config.py`, `main_dapo_predictor_reorder.py` | Validate opt-in settings, choose the worker and register the manager |
+| `epws_manager.py` | Bound requests in flight, refill after completion and restore original output order |
+| `predictor_dapo_trainer.py` | Activation, scoring, DAPO training-loop integration and checkpoint lifecycle |
+| `predictor_worker.py` | Actor hidden-state extraction, online D1 fitting/calibration, frozen D2 inference and RPCs |
+| `length_scheduler/` | Waiting pool, async execution, calibration, distribution API and D2 quality state |
+| `validate_d2.py` | Publish an immutable-checkpoint-bound external validation report |
+| `run_ews.sh` | Single-node launch example |
+| `tests/` | Numeric, configuration, worker, manager and lifecycle regressions |
 
-## Backends
+The trainer generates responses, computes rewards/advantages and updates the actor through the pinned DAPO flow. D1 fitting follows the actor update and uses completed responses for future batches. D2 monitoring pairs pre-rollout forecasts with outputs before DAPO filtering. Returned rows are restored to their original sample order before reward/training alignment.
 
-### D1: Linear/ListMLE (default)
+Missing or invalid work values select stable FCFS for the whole batch. Backend and checkpoint identity are checked on resume; failed cross-rank D2 loading aborts before mixed predictors can schedule. EWS has no live decode-progress interface.
 
-D1 is a bias-free linear ranking head over the final prompt-token hidden state. It is trained online with ListMLE. Since a ranking score has no token unit, the worker retains a bounded training-history replay and refits a monotone PAVA map after each update. PAVA sees only already-completed training rows. Until at least two valid calibration observations exist, the predictor reports not ready and EWS remains FCFS.
+## Results and verification
 
-### D2: censored LogNormal (optional)
+Representative Qwen3.5-9B / DAPO-Math rollout measurements:
 
-D2 consumes the hidden-state tap schema declared by a frozen checkpoint and exposes unstandardized `mu`, `sigma`, expected length, median, p90, p95, and exceedance probability. Checkpoints are fitted independently; this recipe does not implement the external feature-collection/training pipeline or train D2 online. The default D2 path stays FCFS until a hash-bound validation report passes rank-first admission. `d2_checkpoint` may be omitted during warm-up; all actor ranks load the admitted candidate synchronously before scheduling begins.
+| Host | FCFS, tokens/s | D1 + EWS, tokens/s | D2 + EWS, tokens/s |
+| --- | ---: | ---: | ---: |
+| 232 | 487.54 | 514.65 (+5.56%) | 547.07 (+12.21%) |
+| 222 | 480.61 | 525.11 (+9.26%) | 547.68 (+13.96%) |
 
-## Configuration
+[PERFORMANCE.md](PERFORMANCE.md) records the frozen trace, measured dispatch configuration, timing scope and transfer results. [VALIDATION.md](VALIDATION.md) separates CPU checks, integration coverage and device checks.
 
-The scheduler is named EWS. Existing `epws` configuration keys, Python identifiers (including `EPWSAgentLoopManager`), and metric names are retained. The naming change itself does not rename configuration keys; D2 quality admission is additional behavior described below.
-
-The entry point mirrors `trainer.predictor_reorder` into the actor worker config.
-
-```yaml
-trainer:
-  predictor_reorder:
-    enable: true
-    scheduler: epws
-    backend: linear_listmle
-    activation:
-      min_epoch: 10
-      min_samples: 2560
-    epochs: 10
-    batch_size: 32
-    lr: 3.0e-5
-    weight_decay: 1.0e-4
-    seed: 1
-    calibration_max_samples: 4096
-    predictor_keep_actor_loaded: false
-    epws:
-      slots_per_server: 8
-      max_concurrent_requests: null
-```
-
-`max_concurrent_requests: null` derives the admission window as `rollout server count * slots_per_server`. Set it explicitly when the inference deployment has a different safe concurrency limit.
-
-For D2, replace the backend and publish an external candidate report:
-
-```yaml
-trainer:
-  predictor_reorder:
-    backend: censored_lognormal
-    risk_weight: 0.5
-    activation:
-      min_epoch: 10
-      min_samples: 2560
-    d2_lifecycle:
-      enable: true
-      interval_epochs: 5
-      candidate_report: /absolute/shared/path/d2-candidate.json
-      quality:
-        min_prompts: 32
-        min_pairs: 100
-        max_rank_pairs: 20000
-        min_rank_accuracy: 0.60
-        rank_relative_gap: 0.10
-        max_normalized_mae: 1.0
-        min_scale_ratio: 0.25
-        max_scale_ratio: 4.0
-        min_p90_coverage: 0.70
-        max_p90_ratio: 4.0
-        bad_windows_before_fallback: 2
-```
-
-The backend is selected before training and never changes mid-run.
-
-### D2 external fitting and coarse lifecycle
-
-`activation.min_epoch=10` means **ten completed RL dataset passes**, so the earliest admission is before pass 11. It is not a cap on predictor optimizer steps, nor proof that ten passes suffice for every workload. At a boundary without a usable report the trainer continues FCFS; it does not block waiting for an external fit. Publish the candidate before a boundary or it will be considered five passes later. While inactive, collect additional data externally and refit/revalidate every five passes as needed. Once admitted, only monitor every five passes; do not refit routinely.
-
-Use a fixed prompt population with held-out *future outputs*, not necessarily unseen prompt identities. For example, fit a candidate on passes 1–9 and validate on pass 10; if it fails, fit the next candidate through pass 14 and validate on pass 15. If fitting includes pass 10, that candidate must instead be validated on later outputs: its fitting rows cannot also certify admission. Feature projection/normalization/head fitting must all respect the cutoff. Collect validation forecasts before seeing their responses, using the matching actor/model/tokenizer/tap schema; a post-hoc feature readout is not online validation. These provenance obligations remain with the external pipeline; this utility checks the declared temporal boundary and file hashes, not the truth of those declarations.
-
-Write one JSONL row per held-out response (siblings share the prompt identity):
-
-```json
-{"prompt_id":"stable-tokenized-prompt-hash","epoch":10,"observed":1200,"expected":1300,"median":1100,"p90":2400,"censored":false}
-```
-
-All epoch numbers in rows are one-based. Mark cap-truncated responses `censored: true`, including ambiguous EOS-at-cap cases conservatively. Actual lengths alone cannot distinguish those cases. Publish with:
+For local CPU checks:
 
 ```bash
-python -m recipe.dapo_predictor.validate_d2 \
-  --checkpoint /absolute/shared/path/d2-candidate-v1.pt \
-  --rows /absolute/path/heldout-pass10.jsonl \
-  --trained-through-epoch 9 --validation-epoch 10 \
-  --output /absolute/shared/path/d2-candidate.json
+python -m pip install pytest numpy hydra-core codetiming ruff==0.14.10
+python -m ruff check dapo_predictor
+python -m ruff format --check dapo_predictor
+python -m pytest tests/ dapo_predictor/tests/ -q -rs
 ```
 
-The utility streams the input rows and atomically replaces the report; it rejects an output path that resolves to the checkpoint or input rows. The candidate weight file itself must be immutable and visible at the same absolute path on every actor rank. The trainer recomputes metrics from the report's grouped sufficient statistics, checks the checkpoint SHA-256 and matching `risk_weight`, and rejects stale/future/overlapping validation. It never trusts a supplied `passed` flag. Publishing is a trusted local handoff, not a cryptographic proof of how an external trainer used its data.
-
-The defaults above are **configurable engineering starting points**, not experimentally calibrated universal thresholds or a statistical significance claim:
-
-| Role | Definition and default |
-| --- | --- |
-| Primary ranking | Pairwise order agreement of actual per-prompt mean response length with the actual EWS risk score, `median + risk_weight * (p90 - median)`, averaged per prompt. Require >=60%; predicted ties score 0.5, actual pairs differing by <=10% of the larger mean are excluded. This is **not Spearman correlation**. |
-| Evidence floor | At least 32 distinct exact prompt identities and 100 comparable pairs. Repeated epochs/siblings do not create new independent identities; pair counts are descriptive, not independent statistical samples. Above 20,000 possible pairs, use a deterministic sample of at most 20,000 before excluding near-ties, bounding CPU overhead without changing global RNG state. Small datasets may explicitly lower the evidence floor, with correspondingly weaker evidence. |
-| Gross length/scale protection | Prompt-balanced normalized MAE = `sum(abs(predicted_mean - observed_mean)) / sum(observed_mean)` <=1.0; aggregate predicted/observed mean ratio within [0.25, 4]. This is deliberately a gross-error veto, not a 35% point-accuracy target. |
-| Tail protection | Prompt-balanced p90 coverage lower bound >=70% and mean predicted p90 / observed mean <=4. Nominal p90 coverage is 90%; 70% is only a severe-undercoverage guard, not a target. High coverage alone cannot qualify an inflated forecast. |
-
-Any prompt identity with a censored response is excluded from exact mean/rank/MAE calculations. Coverage uses lower/upper bounds: a censored length below predicted p90 has unknown coverage, not a success. Insufficient exact data or bounds straddling the protection threshold cannot certify initial admission. Use held-out workload evidence to choose thresholds before deployment, not to retrofit a favorable result on a completed experiment. The exploratory post-hoc pilot is not a production D2 threshold calibration.
-
-Active monitoring reuses the pre-rollout forecasts (no extra per-epoch fit or post-hoc actor forward), pairs them with completed responses **before DAPO reward filtering**, and pools each five-pass window by prompt identity. One sufficiently supported gross scale/tail violation triggers FCFS at the boundary; ranking failure requires two consecutive supported bad windows by default. Missing/insufficient monitoring evidence also suspends scheduling at the boundary; invalid numeric rows suspend it immediately. No fallback rewrites the completed batch. A suspended checkpoint cannot automatically reactivate: externally fit and validate a new checkpoint, publish a new report, and wait for the next boundary. There is no D1/D2 backend switch.
-
-Monitoring state, incomplete-window statistics, boundary counters, the selected checkpoint path/hash, and the in-progress RL epoch are saved with the trainer. Resume validates counters, grouped statistics, readiness consistency, temporal boundaries, the same quality configuration, and the weight hash **before** loading a candidate onto workers. Missing legacy quality state returns to FCFS admission rather than trusting an old activation flag; a backend mismatch is rejected. Checkpoint snapshots do not alias a live monitor window. Do not overwrite admitted weights in place; saving a changed admitted file also fails explicitly.
-
-The current runtime monitor identifies prompts by unpadded text token IDs. Nonempty `multi_modal_data` suspends quality-mode D2 and uses FCFS before predictor forward, rather than merging different images under the same text identity. Multimodal quality admission is not claimed. A cross-rank candidate-load RPC failure aborts training with readiness cleared; it does not silently continue with mixed heads.
-
-For an already validated matching candidate, `activation.min_epoch=0` and `min_samples=0` explicitly permit admission at startup; the report's epochs then describe the completed historical fitting/validation run. This historical exception is only available at the explicit zero-warm-up startup boundary; later candidate checks must use recent completed epochs of the current run. For short training runs, **20 total RL epochs is a recommendation**, not a hard disable gate: the recipe only warns below 20. Decide whether warm-up and forward overhead can be amortized. D1 fitting and calibration are unchanged.
-
-For exact legacy epoch/sample-only D2 behavior, explicitly set `d2_lifecycle.enable=false` and provide `d2_checkpoint`; no new quality protection is then claimed. Existing D2 launch configurations must either provide a report or select this compatibility mode. D1's `predictor_reorder.epochs` remains the number of ListMLE fitting iterations per update; it is unrelated to these RL epoch boundaries.
-
-## Launch
-
-Use the same DAPO data/model/rollout overrides as `recipe.dapo`, plus:
-
-```bash
-PYTHONPATH=/workspace/verl python recipe/dapo_predictor/main_dapo_predictor_reorder.py \
-  +trainer.predictor_reorder.enable=true \
-  +trainer.predictor_reorder.scheduler=epws \
-  +trainer.predictor_reorder.backend=linear_listmle \
-  +trainer.predictor_reorder.activation.min_epoch=10 \
-  +trainer.predictor_reorder.activation.min_samples=2560 \
-  +trainer.predictor_reorder.calibration_max_samples=4096 \
-  +trainer.predictor_reorder.epws.slots_per_server=8 \
-  +trainer.predictor_reorder.epws.max_concurrent_requests=null
-```
-
-## Correctness and fallback guarantees
-
-- Missing, nonnumeric, non-finite, negative, or incomplete predicted-work values fail closed to stable FCFS for the entire EWS batch. Structurally misaligned protocol batches still raise explicit errors.
-- Dynamic micro-batch reordering is reversed before predictions are attached to prompts.
-- Generated outputs are restored to original batch order before the trainer unions them with training rows.
-- D1 calibration never reads the completion lengths of the rollout batch currently being scheduled.
-- D1 weights and calibration are stored beside the normal trainer checkpoint. D2 remains external and frozen; its SHA-256 is stored with the shared lifecycle state and verified on resume.
-- If lifecycle state is absent on resume, the scheduler restarts in FCFS fallback mode instead of using stale predictions. A backend or D2 checkpoint mismatch fails explicitly.
-- D2 validates hidden tap names/dimensions, finite inputs, positive sigma, monotone quantiles, and checkpoint provenance.
-
-## Validation scope
-
-Unit tests cover lifecycle gates, PAVA, scheduler fallback/priority, event-driven refill, numerical invariants, D1/D2 reload, and error inputs. Integration validation should use the pinned verl commit and the target Ascend rollout stack. See the PR validation receipt for the exact commands and environment used for the contribution.
+Torch-dependent tests need a CPU PyTorch installation; the DataProto/manager integration cases also need the pinned verl and its dependencies. The CI predictor job installs CPU PyTorch and executes the worker/lifecycle tests without an NPU.
