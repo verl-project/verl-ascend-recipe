@@ -1,4 +1,4 @@
-"""DAPO entrypoint with legacy predictor-driven reorder support."""
+"""DAPO entry point for EWS and response-length prediction."""
 
 import os
 import socket
@@ -6,6 +6,7 @@ import socket
 import hydra
 import ray
 from recipe.dapo.main_dapo import DAPOTaskRunner
+from recipe.dapo_predictor.config import configure_predictor
 from recipe.dapo_predictor.predictor_dapo_trainer import PredictorRayDAPOTrainer
 from recipe.dapo_predictor.predictor_worker import PredictorAsyncActorRolloutRefWorker
 
@@ -18,6 +19,8 @@ from verl.utils.device import auto_set_device
 
 class PredictorDAPOTaskRunner(DAPOTaskRunner):
     def add_actor_rollout_worker(self, config):
+        if not config.trainer.get("predictor_reorder", {}).get("enable", False):
+            return super().add_actor_rollout_worker(config)
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             from verl.single_controller.ray import RayWorkerGroup
             from verl.trainer.ppo.ray_trainer import Role
@@ -32,7 +35,7 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
     def run(self, config):
         from pprint import pprint
 
-        from omegaconf import OmegaConf, open_dict
+        from omegaconf import OmegaConf
 
         from verl.utils import hf_processor, hf_tokenizer
         from verl.utils.dataset.rl_dataset import collate_fn
@@ -42,19 +45,7 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        trainer_predictor_cfg = OmegaConf.select(config, "trainer.predictor_reorder", default=None)
-        if trainer_predictor_cfg is not None:
-            with open_dict(config.actor_rollout_ref):
-                config.actor_rollout_ref.predictor_reorder = OmegaConf.create(
-                    OmegaConf.to_container(trainer_predictor_cfg, resolve=True)
-                )
-            if str(trainer_predictor_cfg.get("scheduler", "static_snake")) == "epws":
-                with open_dict(config.actor_rollout_ref.rollout):
-                    if config.actor_rollout_ref.rollout.get("agent") is None:
-                        config.actor_rollout_ref.rollout.agent = OmegaConf.create({})
-                    config.actor_rollout_ref.rollout.agent.agent_loop_manager_class = (
-                        "recipe.dapo_predictor.epws_manager.EPWSAgentLoopManager"
-                    )
+        configure_predictor(config)
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
         self.add_reward_model_resource_pool(config)

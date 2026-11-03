@@ -329,3 +329,80 @@ def test_real_worker_loads_and_runs_frozen_d2_on_cpu(tmp_path):
     with pytest.raises(ValueError, match="SHA-256"):
         namespace["load_d2_candidate"](worker, str(checkpoint), "0" * 64)
     assert worker.actor.distribution_predictor is model
+
+
+@pytest.mark.parametrize("include_messages", [False, True])
+def test_hydration_uses_raw_ids_and_explicit_lengths(trainer_type, include_messages):
+    value = trainer(trainer_type)
+    value.tokenizer = SimpleNamespace(pad_token_id=0)
+    non_tensor = {"raw_prompt_ids": np.asarray([[5, 0], [7]], dtype=object)}
+    if include_messages:
+        non_tensor["messages"] = np.asarray([None, None], dtype=object)
+    batch = SimpleNamespace(batch=None, non_tensor_batch=non_tensor)
+    output = value._hydrate_gen_batch_model_inputs(batch)
+    assert output.batch["input_ids"].tolist() == [[5, 0], [7, 0]]
+    assert output.batch["attention_mask"].tolist() == [[1, 1], [1, 0]]
+    assert output.batch["position_ids"].tolist() == [[0, 1], [0, 0]]
+    assert output.batch.batch_size == torch.Size([2])
+
+
+def test_hydration_keeps_existing_tensor_inputs(trainer_type):
+    value = trainer(trainer_type)
+    tokens = {
+        "input_ids": torch.tensor([[0, 7]]),
+        "attention_mask": torch.tensor([[0, 1]]),
+        "position_ids": torch.tensor([[0, 0]]),
+    }
+    batch = SimpleNamespace(batch=tokens, non_tensor_batch={})
+    assert value._hydrate_gen_batch_model_inputs(batch) is batch
+    assert batch.batch is tokens
+
+
+def test_one_batch_run_starts_at_epoch_zero(trainer_type, monkeypatch, tmp_path):
+    import contextlib
+    import sys
+    from collections import defaultdict
+
+    from omegaconf import OmegaConf
+
+    class EnteredEpoch(Exception):
+        pass
+
+    class Loader:
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            raise EnteredEpoch
+
+    value = trainer_type()
+    value.config = OmegaConf.create(
+        {
+            "trainer": {
+                "predictor_reorder": {"enable": True, "backend": "linear_listmle"},
+                "project_name": "test",
+                "experiment_name": "test",
+                "logger": ["console"],
+                "val_before_train": False,
+                "total_epochs": 1,
+                "default_local_dir": str(tmp_path),
+            },
+            "actor_rollout_ref": {"rollout": {"skip_rollout": False}},
+            "global_profiler": {"steps": None},
+        }
+    )
+    value.total_training_steps = 1
+    value.train_dataloader = Loader()
+    value.checkpoint_manager = SimpleNamespace(update_weights=lambda: None)
+    value._save_checkpoint = Mock(side_effect=AssertionError("Epoch zero was skipped"))
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.utils.tracking",
+        SimpleNamespace(Tracking=lambda **kwargs: SimpleNamespace()),
+    )
+    monkeypatch.setitem(trainer_type.fit.__globals__, "tqdm", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setitem(trainer_type.fit.__globals__, "defaultdict", defaultdict)
+    monkeypatch.setitem(trainer_type.fit.__globals__, "marked_timer", lambda *args: contextlib.nullcontext())
+    with pytest.raises(EnteredEpoch):
+        value.fit()
+    assert value._d2_rl_epoch == 0

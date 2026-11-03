@@ -317,12 +317,6 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
 
         from tensordict import TensorDict
 
-        from verl.workers.rollout.schemas import (
-            AsyncRolloutRequest,
-            AsyncRolloutRequestStateEnum,
-            TokenizationSanityCheckModeEnum,
-        )
-
         if gen_batch.batch is None:
             gen_batch.batch = {}
 
@@ -346,7 +340,13 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                 messages = gen_batch.non_tensor_batch["raw_prompt"]
             if messages is not None and len(messages) == 0:
                 messages = None
-            if messages is not None:
+            if messages is not None and seqs is None:
+                from verl.workers.rollout.schemas import (
+                    AsyncRolloutRequest,
+                    AsyncRolloutRequestStateEnum,
+                    TokenizationSanityCheckModeEnum,
+                )
+
                 multi_modal_batch = gen_batch.non_tensor_batch.get("multi_modal_data", None)
                 tool_schema_batch = gen_batch.non_tensor_batch.get("tool_schemas", None)
                 input_id_list = []
@@ -431,11 +431,14 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                 pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
                 max_len = max((len(s) for s in seqs), default=0)
                 input_ids = torch.full((len(seqs), max_len), fill_value=pad_token_id, dtype=torch.long)
+                attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long)
                 for i, seq in enumerate(seqs):
                     if len(seq) > 0:
                         input_ids[i, : len(seq)] = torch.as_tensor(seq, dtype=torch.long)
+                        attention_mask[i, : len(seq)] = 1
                 gen_batch.batch["input_ids"] = input_ids
-                batch_keys.add("input_ids")
+                gen_batch.batch["attention_mask"] = attention_mask
+                batch_keys.update({"input_ids", "attention_mask"})
 
         if "attention_mask" not in batch_keys and "input_ids" in batch_keys:
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
@@ -447,6 +450,10 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                 (torch.cumsum(gen_batch.batch["attention_mask"], dim=-1) - 1).clamp_min(0).long()
             )
 
+        if isinstance(gen_batch.batch, dict):
+            if "input_ids" not in gen_batch.batch:
+                raise ValueError("predictor requires model input tensors, raw_prompt_ids, or chat messages")
+            gen_batch.batch = TensorDict(gen_batch.batch, batch_size=(gen_batch.batch["input_ids"].shape[0],))
         return gen_batch
 
     @staticmethod
@@ -600,7 +607,7 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
-        current_epoch = self.global_steps // len(self.train_dataloader)
+        current_epoch = (self.global_steps - 1) // len(self.train_dataloader)
         if self._d2_quality is not None:
             current_epoch = getattr(self, "_d2_rl_epoch", 0)
 
@@ -640,6 +647,12 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                             if self._predictor_active(epoch):
                                 with marked_timer("predictor_hydrate", timing_raw, "purple"):
                                     predictor_input_batch = gen_batch_output.select(deepcopy=True)
+                                    predictor_input_batch = self._ensure_gen_batch_has_tensors(
+                                        predictor_input_batch,
+                                        new_batch.repeat(
+                                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                                        ),
+                                    )
                                     predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
                                 gen_batch_output = self._attach_epws_predictions(predictor_input_batch, epoch)
                             else:
@@ -649,6 +662,12 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                         elif self._scheduler_name() == "static_snake":
                             with marked_timer("predictor_hydrate", timing_raw, "purple"):
                                 predictor_input_batch = gen_batch_output.select(deepcopy=True)
+                                predictor_input_batch = self._ensure_gen_batch_has_tensors(
+                                    predictor_input_batch,
+                                    new_batch.repeat(
+                                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                                    ),
+                                )
                                 predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
                             predictor_order = self._build_predictor_order(predictor_input_batch)
                             self._apply_predictor_order(gen_batch_output, predictor_order)

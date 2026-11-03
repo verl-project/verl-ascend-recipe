@@ -77,7 +77,6 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 hidden_states = self._forward_predictor_micro_batch(model_inputs, temperature)
-                # hidden_states = self. _forward_micro_batch(model_inputs, temperature)
                 hidden_states_list.append(hidden_states)
 
         # Concatenate hidden states from all micro batches. Dynamic batching
@@ -251,10 +250,10 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
         eps: float = 1e-10,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        """Compute ListMLE loss with random feature shuffling for regularization.
+        """Compute ListMLE loss with randomized tie ordering.
 
-        Shuffles hidden dimensions, sorts by true labels, then computes the
-        ListMLE loss to train the predictor scorer to predict response length.
+        Shuffle the list of prompt scores before sorting by target length so
+        tied labels do not impose a fixed order.
         """
         random_indices = torch.randperm(y_pred.shape[-1], generator=generator).to(y_pred.device)
         y_pred_shuffled = y_pred[:, random_indices].float()
@@ -269,13 +268,7 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
 
 
 class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
-    """Async worker that adds predictor score computation and update RPCs.
-
-    Extends the standard worker with three new entry points:
-    - compute_predictor_score: forward pass to score prompts
-    - update_predictor: train the predictor with ListMLE loss
-    - update_actor: overridden to keep actor loaded for predictor when needed
-    """
+    """Actor worker with predictor scoring, fitting and checkpoint RPCs."""
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -467,7 +460,10 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 predictor_ready = True
             else:
                 sampled_hidden_states = self.actor.extract_hidden_states(data=sampled_data)
-                scores = self.actor.predictor_scorer(sampled_hidden_states).squeeze(-1)
+                with torch.no_grad():
+                    scorer = self.actor.predictor_scorer
+                    features = sampled_hidden_states.to(dtype=scorer.weight.dtype)
+                    scores = scorer(features).squeeze(-1)
                 if self.actor.predictor_calibration is None:
                     predicted_work_per_prompt = torch.full_like(scores, float("nan"))
                 else:
@@ -571,7 +567,10 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         pad_token_id = (
             self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
         )
-        response_lengths = (response_batch.batch["responses"] != pad_token_id).sum(dim=1)
+        if "response_mask" in response_batch.batch:
+            response_lengths = response_batch.batch["response_mask"].sum(dim=1)
+        else:
+            response_lengths = (response_batch.batch["responses"] != pad_token_id).sum(dim=1)
         response_lengths = response_lengths.view(-1, n).max(dim=1).values.float()
 
         if torch.distributed.is_initialized():
@@ -644,8 +643,8 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                     num_batches += 1
 
                     if epoch == 0 or epoch == epochs - 1:
-                        pred_numpy = preds.squeeze().detach().cpu().float().numpy()
-                        true_numpy = labels.squeeze().detach().cpu().float().numpy()
+                        pred_numpy = preds.reshape(-1).detach().cpu().float().numpy()
+                        true_numpy = labels.reshape(-1).detach().cpu().float().numpy()
 
                         if len(pred_numpy) > 1 and kendalltau is not None:
                             kendall_tau, _ = kendalltau(pred_numpy, true_numpy)
