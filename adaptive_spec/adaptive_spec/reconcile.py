@@ -54,14 +54,25 @@ def lower_median(values: Sequence[int]) -> int:
 
 
 class HistoricalEngineReconciler:
-    """Historical direction confirmation and dwell on the global candidate ladder."""
+    """Confirm direction changes and enforce dwell on the candidate ladder."""
 
-    def __init__(self, candidate_ks, *, confirmations=2, minimum_dwell_rounds=64, one_rung_per_switch=True):
+    def __init__(
+        self,
+        candidate_ks,
+        *,
+        confirmations=2,
+        minimum_dwell_rounds=64,
+        one_rung_per_switch=True,
+        engine_aggregation="lower_median",
+    ):
         self.candidate_ks = tuple(sorted(set(int(k) for k in candidate_ks)))
         if not self.candidate_ks or self.candidate_ks[0] < 1:
             raise ValueError("positive backend candidate depths required")
         if confirmations < 1 or minimum_dwell_rounds < 0:
             raise ValueError("invalid stabilization settings")
+        if engine_aggregation not in {"lower_median", "max"}:
+            raise ValueError("engine_aggregation must be lower_median or max")
+        self.engine_aggregation = engine_aggregation
         self.confirmations = int(confirmations)
         self.minimum_dwell_rounds = int(minimum_dwell_rounds)
         self.one_rung_per_switch = bool(one_rung_per_switch)
@@ -75,11 +86,20 @@ class HistoricalEngineReconciler:
         self.pending_direction = 0
         self.pending_count = 0
 
+    def aggregate(self, recommendations, *, fallback_k):
+        values = tuple(recommendations)
+        if any(type(k) is not int or k not in self.candidate_ks for k in values):
+            raise ValueError("recommendation is outside the declared candidate set")
+        target = (
+            (max(values) if self.engine_aggregation == "max" else lower_median(values)) if values else int(fallback_k)
+        )
+        if target not in self.candidate_ks:
+            raise ValueError("target is outside the declared candidate set")
+        return target
+
     def select(self, recommendations, *, fallback_k):
         allowed = self.candidate_ks
-        target = lower_median(recommendations) if recommendations else int(fallback_k)
-        if not allowed or target not in allowed:
-            raise ValueError("target is outside the declared candidate set")
+        target = self.aggregate(recommendations, fallback_k=fallback_k)
         if self.current_k is None:
             self.current_k = target
             self.clear_pending()

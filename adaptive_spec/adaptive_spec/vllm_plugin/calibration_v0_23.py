@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Offline-only observer for the source-guarded synchronous 0.23 runner.
-
-No depth control is installed. Sampling returns raw valid token lists, so Mamba
-state-advance counters and delayed next-step attribution are not involved.
-"""
+"""Measure synchronous fixed-K draft and verification iterations."""
 
 from __future__ import annotations
 
@@ -121,7 +117,7 @@ def patch_class(cls: Any, plan: dict, output: Path) -> None:
             raise RuntimeError("offline calibration requires serial MTP and CP1")
         if getattr(scheduler_output, "preempted_req_ids", ()):
             raise RuntimeError("KV preemption invalidates this calibration probe; preserve it and reduce the grid")
-        # Keep this intentionally synchronized timing strictly outside production jobs.
+        # Synchronize the device to measure the complete iteration.
         torch = inspect.unwrap(original_execute).__globals__["torch"]
         self._verl_calibration_snapshot = None
         self._verl_calibration_execute_ns = None

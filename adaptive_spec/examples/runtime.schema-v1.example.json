@@ -15,5 +15,10 @@
   "one_rung_per_switch": true,
   "minimum_score_gain": 0.01,
   "evidence_exchange_directory": null,
-  "evidence_exchange_poll_decisions": 64
+  "evidence_exchange_poll_decisions": 64,
+  "engine_aggregation": "max",
+  "tp_control_transport": "packed",
+  "phase_stage_control": "drain_triggered",
+  "phase_stage_max_batch_size": 16,
+  "phase_stage_below_max_confirm_steps": 4
 }

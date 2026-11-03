@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pinned 0.23 positive-depth MTP CPU draft transport; no NPU imports at install."""
+"""Copy variable-width MTP drafts between the runner and scheduler."""
 
 import hashlib
 import inspect
@@ -50,7 +50,7 @@ def patch_copy_and_read(runner_class):
 
     @wraps(copy)
     def copy_drafts(self, scheduler_output, zeros_only=False):
-        # A skipped/failed new copy must not publish the preceding batch's IDs.
+        # Clear the previous batch snapshot before starting a new copy.
         setattr(self, _SNAPSHOT, None)
         self._draft_token_req_ids = None
         if not self.num_spec_tokens:

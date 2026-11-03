@@ -258,8 +258,6 @@ def test_nonpadded_order_reconciles_invalid_rows_before_propose(monkeypatch):
     assert [row["discarded"] for row in pending["rows"]] == [False, True]
 
 
-# These regressions verify attribution across the actual adapter callbacks,
-# including the two Ascend bookkeeping orders, not just the clipping helper.
 def test_previous_k_binding_across_transitions(monkeypatch):
     for previous, upcoming, raw, emitted, expected in [
         (9, 5, 9, 9, (9, 8)),

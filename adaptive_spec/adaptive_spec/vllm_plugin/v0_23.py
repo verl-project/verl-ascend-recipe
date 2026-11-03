@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Adapter for vLLM 0.23.0 and vLLM-Ascend 0.23.0.
-
-This module patches three narrow model-runner methods. It never writes telemetry
-and it refuses to change K when eager execution or required accepted-token
-buffers are unavailable. Bookkeeping is observed so preempted or otherwise
-invalid rows cannot be misclassified as draft-token rejections.
-"""
+"""Connect K selection and acceptance bookkeeping to the Ascend runner."""
 
 from __future__ import annotations
 
@@ -134,6 +128,7 @@ def _runtime_state(runner: Any, config: AdaptiveSpecConfig) -> dict[str, Any] | 
             "rollout_step": None,
             "tp_group": group,
             "decision_round": 0,
+            "tp_control_transport": config.tp_control_transport,
         }
     setattr(runner, _STATE_ATTR, state)
     setattr(runner, _REQUESTS_ATTR, {})
@@ -154,7 +149,7 @@ def _tensor_parallel_group(runner: Any) -> Any:
 
 
 def _select_engine_k(state: dict[str, Any], contexts: list[RequestContext]) -> int:
-    """Use one authority per Engine, including filesystem evidence visibility."""
+    """Select K on TP rank zero and broadcast the decision."""
     group = state.get("tp_group")
     if group is None:
         return state["controller"].decide_engine(contexts).physical_k
@@ -166,8 +161,15 @@ def _select_engine_k(state: dict[str, Any], contexts: list[RequestContext]) -> i
             packet = (decision_round, int(k), None)
         except Exception as error:
             # All ranks must leave this collective before reporting a policy failure.
-            packet = (decision_round, None, f"{type(error).__name__}: {error}")
-    packet = group.broadcast_object(packet, src=0)
+            packet = (decision_round, None, f"{type(error).__name__}: {error}"[:512])
+    if state.get("tp_control_transport", "object") == "packed":
+        from .tp_control import PackedTPControl
+
+        if "packed_tp_control" not in state:
+            state["packed_tp_control"] = PackedTPControl(group)
+        packet = state["packed_tp_control"].broadcast(packet)
+    else:
+        packet = group.broadcast_object(packet, src=0)
     if not isinstance(packet, tuple) or len(packet) != 3 or packet[0] != decision_round:
         raise RuntimeError("AdaptiveSpec received an out-of-order TP decision")
     if packet[2] is not None:

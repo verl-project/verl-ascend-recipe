@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A probe leader exiting is not evidence that its worker group exited."""
+"""Probe process-group cleanup after leader exit."""
 
 import json
 import subprocess

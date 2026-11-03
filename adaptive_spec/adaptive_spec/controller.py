@@ -52,10 +52,11 @@ class EngineDecision:
     physical_k: int
     request_decisions: tuple[RequestDecision, ...]
     fallback_reason: str | None = None
+    phase_stage: str | None = None
 
 
 class AdaptiveSpecController:
-    """Reference implementation of the adaptive-spec decision loop."""
+    """Select K from phase costs and sibling acceptance evidence."""
 
     def __init__(
         self,
@@ -67,6 +68,9 @@ class AdaptiveSpecController:
         exchange: CrossEngineEvidenceExchange | None = None,
         reconciler: HistoricalEngineReconciler | None = None,
         minimum_score_gain: float = 0.01,
+        phase_stage_control: str = "off",
+        phase_stage_max_batch_size: int = 16,
+        phase_stage_below_max_confirm_steps: int = 4,
     ) -> None:
         if model_fingerprint != phase_map.model_fingerprint:
             raise ValueError("runtime model does not match the phase map")
@@ -78,6 +82,15 @@ class AdaptiveSpecController:
         if any(len(cell.prior_survival) < max(candidates) for cell in phase_map.cells):
             raise ValueError("every phase prior must cover global evidence depth")
         self.minimum_score_gain = float(minimum_score_gain)
+        if phase_stage_control not in {"off", "drain_triggered"}:
+            raise ValueError("phase_stage_control must be off or drain_triggered")
+        if phase_stage_max_batch_size < 1 or phase_stage_below_max_confirm_steps < 1:
+            raise ValueError("phase-stage capacity and confirmation count must be positive")
+        self.phase_stage_control = phase_stage_control
+        self.phase_stage_max_batch_size = int(phase_stage_max_batch_size)
+        self.phase_stage_below_max_confirm_steps = int(phase_stage_below_max_confirm_steps)
+        self._phase_stage = "warmup"
+        self._below_max_count = 0
         self.phase_map = phase_map
         self.model_fingerprint = str(model_fingerprint)
         self.evidence = evidence or AcceptanceEvidence(max_depth=max(candidates))
@@ -183,8 +196,29 @@ class AdaptiveSpecController:
         cell = self.phase_map.cell_for(len(requests), length)
         pairs = [self._request_decision(r, active_batch_size=len(requests), phase_override=cell) for r in requests]
         decisions = tuple(item[0] for item in pairs)
-        physical_k = self.reconciler.select([d.selected_k for d in decisions], fallback_k=cell.fallback_k)
-        return EngineDecision(physical_k, decisions)
+        target = self.reconciler.aggregate([d.selected_k for d in decisions], fallback_k=cell.fallback_k)
+        target = self._stage_target(target, cell.fallback_k, len(requests))
+        physical_k = self.reconciler.select([target], fallback_k=cell.fallback_k)
+        return EngineDecision(
+            physical_k,
+            decisions,
+            phase_stage=self._phase_stage if self.phase_stage_control != "off" else None,
+        )
+
+    def _stage_target(self, recommendation: int, fallback: int, batch_size: int) -> int:
+        """Track warmup, saturation and drain for a finite rollout."""
+        if self.phase_stage_control == "off" or self._phase_stage == "drain":
+            return recommendation
+        if self._phase_stage == "warmup":
+            if batch_size >= self.phase_stage_max_batch_size:
+                self._phase_stage = "saturated"
+            self._below_max_count = 0
+            return fallback
+        self._below_max_count = self._below_max_count + 1 if batch_size < self.phase_stage_max_batch_size else 0
+        if self._below_max_count >= self.phase_stage_below_max_confirm_steps:
+            self._phase_stage = "drain"
+            return recommendation
+        return fallback
 
     def reset_step(self) -> None:
         self.evidence.reset_step()
@@ -192,3 +226,5 @@ class AdaptiveSpecController:
         self._identity_cache.clear()
         self._key_cache.clear()
         self.reconciler.reset()
+        self._phase_stage = "warmup"
+        self._below_max_count = 0

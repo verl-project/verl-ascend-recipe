@@ -65,3 +65,20 @@ def test_known_sources_pass_and_one_byte_mutation_is_rejected(tmp_path, monkeypa
 def test_source_read_failure_is_reported(tmp_path):
     report = backend.source_check(tmp_path / "absent.py", {"expected"})
     assert not report["supported"] and report["error"]
+
+
+def test_upgrade_audit_reports_changed_methods_without_accepting_source(tmp_path, monkeypatch):
+    for package, relative in [
+        ("vllm_ascend", "worker/model_runner_v1.py"),
+        ("vllm", "v1/worker/gpu_model_runner.py"),
+    ]:
+        path = tmp_path / package / relative
+        path.parent.mkdir(parents=True)
+        path.write_text("class Runner:\n    def execute_model(self, schedule, new_argument=None):\n        return 1\n")
+    monkeypatch.setattr(backend, "_package_root", lambda name: tmp_path / name)
+    monkeypatch.setattr(backend, "installed_adapter_name", lambda: (None, "0.24", "0.24"))
+    report = backend.check_backend(audit=True)
+    assert not report["supported"]
+    method = report["upgrade_audit"][0]["methods"][0]
+    assert method["method"] == "execute_model" and "new_argument" in method["arguments"]
+    assert len(method["source_sha256"]) == 64

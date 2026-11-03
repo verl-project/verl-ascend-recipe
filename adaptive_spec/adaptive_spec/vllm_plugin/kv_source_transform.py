@@ -50,8 +50,7 @@ _TARGETED_BLOCK = """            # Schedule newly needed KV blocks for the reque
 def patch_scheduler_source(source: str) -> str:
     """Patch one known vLLM Scheduler.schedule implementation.
 
-    Fail closed if the installed source no longer matches the audited control
-    flow, preventing silent application to a different scheduler revision.
+    Match the scheduler control flow before applying the transform.
     """
 
     if source.count(_RUNNING_START) != 1 or source.count(_RUNNING_END) != 1:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pinned 0.23 MTP worker-local trim and optimistic-count restoration."""
+"""Trim worker draft schedules and restore scheduler draft counts."""
 
 from copy import copy
 from functools import wraps

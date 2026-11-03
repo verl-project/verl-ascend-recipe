@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime configuration with explicit fail-closed fallbacks."""
+"""Load AdaptiveSpec runtime configuration."""
 
 from __future__ import annotations
 
@@ -46,6 +46,21 @@ class AdaptiveSpecConfig:
     minimum_score_gain: float = 0.01
     evidence_exchange_directory: str | None = None
     evidence_exchange_poll_decisions: int = 64
+    engine_aggregation: str = "lower_median"
+    tp_control_transport: str = "object"
+    phase_stage_control: str = "off"
+    phase_stage_max_batch_size: int = 16
+    phase_stage_below_max_confirm_steps: int = 4
+
+    def __post_init__(self) -> None:
+        if self.engine_aggregation not in {"lower_median", "max"}:
+            raise ValueError("engine_aggregation must be lower_median or max")
+        if self.tp_control_transport not in {"object", "packed"}:
+            raise ValueError("tp_control_transport must be object or packed")
+        if self.phase_stage_control not in {"off", "drain_triggered"}:
+            raise ValueError("phase_stage_control must be off or drain_triggered")
+        if self.phase_stage_max_batch_size < 1 or self.phase_stage_below_max_confirm_steps < 1:
+            raise ValueError("phase-stage capacity and confirmation count must be positive")
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> AdaptiveSpecConfig:
@@ -74,6 +89,11 @@ class AdaptiveSpecConfig:
                 str(raw["evidence_exchange_directory"]) if raw.get("evidence_exchange_directory") else None
             ),
             evidence_exchange_poll_decisions=int(raw.get("evidence_exchange_poll_decisions", 64)),
+            engine_aggregation=str(raw.get("engine_aggregation", "lower_median")),
+            tp_control_transport=str(raw.get("tp_control_transport", "object")),
+            phase_stage_control=str(raw.get("phase_stage_control", "off")),
+            phase_stage_max_batch_size=int(raw.get("phase_stage_max_batch_size", 16)),
+            phase_stage_below_max_confirm_steps=int(raw.get("phase_stage_below_max_confirm_steps", 4)),
         )
 
     @classmethod
@@ -101,6 +121,9 @@ class AdaptiveSpecConfig:
             model_fingerprint=self.model_fingerprint,
             topology_fingerprint=self.topology_fingerprint,
             minimum_score_gain=self.minimum_score_gain,
+            phase_stage_control=self.phase_stage_control,
+            phase_stage_max_batch_size=self.phase_stage_max_batch_size,
+            phase_stage_below_max_confirm_steps=self.phase_stage_below_max_confirm_steps,
             evidence=AcceptanceEvidence(
                 max_depth=max(candidates),
                 window_responses=self.window_responses,
@@ -122,5 +145,6 @@ class AdaptiveSpecConfig:
                 confirmations=self.confirmations,
                 minimum_dwell_rounds=self.minimum_dwell_rounds,
                 one_rung_per_switch=self.one_rung_per_switch,
+                engine_aggregation=self.engine_aggregation,
             ),
         )

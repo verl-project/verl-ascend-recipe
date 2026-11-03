@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public verl AgentLoopManager integration.
-
-The custom worker adds the training-step identifier to vLLM SamplingParams.
-No trainer, scheduler, or request-routing implementation is forked.
-"""
+"""Pass the verl rollout-step identifier through vLLM SamplingParams."""
 
 from __future__ import annotations
 
@@ -44,7 +40,7 @@ class AdaptiveSpecAgentLoopWorker(AgentLoopWorker):
 
 
 class AdaptiveSpecAgentLoopManager(AgentLoopManager):
-    """Use upstream routing with only a step-scoping worker override."""
+    """Create agent-loop workers that attach rollout-step metadata."""
 
     def __init__(self, *args, **kwargs):
         self.agent_loop_workers_class = ray.remote(AdaptiveSpecAgentLoopWorker)

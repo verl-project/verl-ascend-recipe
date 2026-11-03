@@ -71,6 +71,10 @@ def test_collection_loads_actual_controller_and_never_overwrites(tmp_path):
     assert runtime["enabled"] is False
     controller = AdaptiveSpecConfig.from_dict({**runtime, "enabled": True}).build_controller()
     assert controller is not None
+    assert controller.reconciler.engine_aggregation == "max"
+    assert controller.phase_stage_control == "drain_triggered"
+    assert controller.phase_stage_max_batch_size == 16
+    assert runtime["tp_control_transport"] == "packed"
     phase = json.loads((out / "phase_map.json").read_text())
     assert phase["collection"]["device_measurement"] is False
     assert phase["cells"][0]["allowed_ks"] == [5, 9]
@@ -179,7 +183,7 @@ def test_observer_excludes_warmup_partial_drafts_and_discarded_rows():
 
 
 def test_separate_target_and_sampling_calls_both_enter_the_cost(tmp_path, monkeypatch):
-    # Exercise the real wrapper lifecycle, not just the record reducer.
+    # Measure both target and sampling callbacks through the probe wrapper.
     monkeypatch.setitem(globals(), "torch", SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None)))
     ticks = iter([0, 100, 200, 500])
     monkeypatch.setattr(observer.time, "perf_counter_ns", lambda: next(ticks))

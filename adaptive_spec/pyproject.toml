@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verl-adaptive-spec"
-version = "0.1.0"
-description = "Historical AdaptiveSpec MTP control and optional Elastic rollout routing for verl on Ascend"
+version = "0.2.0"
+description = "AdaptiveSpec dynamic MTP control and optional Elastic rollout routing for verl on Ascend"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

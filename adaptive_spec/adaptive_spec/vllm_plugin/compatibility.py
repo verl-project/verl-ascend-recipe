@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict adapter selection for private vLLM-Ascend interfaces."""
+"""Select the adapter for the installed vLLM and Ascend versions."""
 
 from __future__ import annotations
 

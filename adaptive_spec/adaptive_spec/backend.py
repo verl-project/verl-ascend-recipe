@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Source-only runtime preflight; importing the inference backend is unnecessary."""
+"""Check installed backend versions and source fingerprints."""
 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
@@ -48,7 +49,45 @@ def source_check(path: Path, allowed: set[str] | frozenset[str]) -> dict:
     return {"path": str(path), "sha256": actual, "supported": actual in allowed}
 
 
-def check_backend(*, targeted_kv: bool = False) -> dict:
+_AUDIT_METHODS = {
+    "execute_model",
+    "propose_draft_token_ids",
+    "_bookkeeping_sync",
+    "_update_states",
+    "_copy_draft_token_ids_to_cpu",
+    "_get_draft_token_ids_cpu",
+    "sample_tokens",
+    "schedule",
+}
+
+
+def audit_source(path: Path) -> dict:
+    """Report backend method signatures and source fingerprints."""
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError) as error:
+        return {"path": str(path), "error": str(error), "methods": []}
+    methods = []
+    for cls in tree.body:
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for node in cls.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _AUDIT_METHODS:
+                segment = ast.get_source_segment(source, node)
+                methods.append(
+                    {
+                        "class": cls.name,
+                        "method": node.name,
+                        "line": node.lineno,
+                        "arguments": ast.unparse(node.args),
+                        "source_sha256": hashlib.sha256(segment.encode("utf-8")).hexdigest(),
+                    }
+                )
+    return {"path": str(path), "methods": methods}
+
+
+def check_backend(*, targeted_kv: bool = False, audit: bool = False) -> dict:
     adapter, vllm_version, ascend_version = installed_adapter_name()
     checks = []
     try:
@@ -60,7 +99,7 @@ def check_backend(*, targeted_kv: bool = False) -> dict:
             checks.append(source_check(vllm / "v1/core/sched/scheduler.py", {VLLM_SCHEDULER_SHA256}))
     except (ImportError, ValueError) as error:
         checks.append({"supported": False, "error": str(error)})
-    return {
+    report = {
         "supported": adapter == "v0_23" and all(row["supported"] for row in checks),
         "vllm_version": vllm_version,
         "vllm_ascend_version": ascend_version,
@@ -69,13 +108,19 @@ def check_backend(*, targeted_kv: bool = False) -> dict:
         "checks": checks,
         "scope": "source/version preflight only; no model, NPU or ABI validation",
     }
+    if audit:
+        report["upgrade_audit"] = [audit_source(Path(row["path"])) for row in checks if "path" in row]
+    return report
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targeted-kv", action="store_true", help="also verify the optional KV scheduler source")
+    parser.add_argument(
+        "--audit-source", action="store_true", help="include private-method signatures/hashes for upgrade review"
+    )
     args = parser.parse_args()
-    report = check_backend(targeted_kv=args.targeted_kv)
+    report = check_backend(targeted_kv=args.targeted_kv, audit=args.audit_source)
     print(json.dumps(report, indent=2))
     raise SystemExit(0 if report["supported"] else 1)
 

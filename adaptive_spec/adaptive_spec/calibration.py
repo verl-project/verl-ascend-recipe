@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Offline B/L/K collection, reduction and controller-ready artifacts.
-
-The device backend is imported only by an explicitly launched probe subprocess.
-Replay validates the artifact pipeline; it is never labelled a device measurement.
-"""
+"""Collect B/L/K costs and build controller configuration."""
 
 from __future__ import annotations
 
@@ -154,7 +150,7 @@ def validate_plan(raw: dict[str, Any], plan_path: Path) -> dict[str, Any]:
     bank = read_bank(bank_path)
     plan["context_bank"] = str(bank_path.resolve())
     plan["context_bank_sha256"] = digest(bank_path)
-    # Selection never depends on K: all depths see the same prefixes in a repeat.
+    # Reuse the same prefixes for every K in this repeat.
     selections = []
     for repeat in range(plan["repeats"]):
         for state_index, state in enumerate(states):
@@ -315,7 +311,7 @@ def collect(plan: dict[str, Any], output: Path, *, backend: str, replay: Path | 
                 raise RuntimeError(
                     "device collection runs in the Linux Ascend environment; use --plan-only or replay locally"
                 )
-            # One fresh fixed-K Engine per subprocess. No adaptive controller runs during calibration.
+            # Run each fixed-K Engine in a separate subprocess.
             order = list(plan["k_values"])
             random.Random(plan["seed"]).shuffle(order)
             for k in order:
@@ -365,7 +361,14 @@ def collect(plan: dict[str, Any], output: Path, *, backend: str, replay: Path | 
             "model_fingerprint": plan["model_fingerprint"],
             "topology_fingerprint": plan["topology_fingerprint"],
         }
-        # Actual consumer loads the generated map, including identity/candidate guards.
+        runtime.update(
+            engine_aggregation="max",
+            tp_control_transport="packed",
+            phase_stage_control="drain_triggered",
+            phase_stage_max_batch_size=16,
+            phase_stage_below_max_confirm_steps=4,
+        )
+        # Validate the generated map with the controller loader.
         validation = {**runtime, "enabled": True}
         AdaptiveSpecConfig.from_dict(validation).build_controller()
         write_json(output / "runtime.json", runtime)

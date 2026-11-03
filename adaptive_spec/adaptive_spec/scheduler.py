@@ -39,7 +39,7 @@ class ElasticInterleaveRouter:
             raise ValueError("elastic_delay_ms must be finite and non-negative")
         if config.get("affinity_mode", "free") != "free":
             raise ValueError("only free routing is supported")
-        # Active accounting must never be evicted by an LRU cache.
+        # Keep active request accounting outside the LRU cache.
         self._request_to_server: dict[str, str] = {}
         self._request_to_group: dict[str, str] = {}
         self._pending: list[dict[str, Any]] = []
@@ -168,7 +168,7 @@ class ElasticInterleaveRouter:
         return list(self._servers)
 
     def clear_sticky_cache(self):
-        # This router has no sticky cache; never erase active accounting.
+        # There is no sticky cache; active request accounting remains unchanged.
         return {"cleared_entries": 0, "server_loads": dict(self._inflight_requests)}
 
     def get_total_inflight(self):

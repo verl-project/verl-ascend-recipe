@@ -27,7 +27,7 @@ from .evidence import AcceptanceEvidence, ResponseSummary
 
 
 class CrossEngineEvidenceExchange:
-    """Share counts, never prompt text, through one append-only file per process."""
+    """Append acceptance counts to one exchange file per process."""
 
     def __init__(
         self,
