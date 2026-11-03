@@ -34,6 +34,9 @@ PYTEST_OPTIONS_WITH_VALUE = {
     "--capture",
     "--asyncio-mode",
     "--durations",
+    # ``--deselect nodeid`` removes a case, so the nodeid it names is not a
+    # case the workflow runs and must not be recorded as a target.
+    "--deselect",
 }
 
 
@@ -77,6 +80,60 @@ def extract_pytest_specs(tokens: list[str], pytest_idx: int) -> tuple[list[str],
             targets.append(normalized)
         idx += 1
     return targets, ignore_paths, ignore_globs
+
+
+def extract_pytest_main_argv(text: str) -> list[str] | None:
+    """Return the argv list passed to an inline ``pytest.main([...])`` call.
+
+    Some workflows cannot pass pytest options through ``sys.argv`` (a launcher
+    may parse it during import) and therefore invoke pytest from a ``python -c``
+    script. Those cases are invisible to a command-line token scan, so recover
+    the argv list from the source text instead. Returns ``None`` when the text
+    has no such call or its argument is not a literal list of strings.
+    """
+    marker = "pytest.main("
+    start_marker = text.find(marker)
+    if start_marker < 0:
+        return None
+    start = text.find("[", start_marker)
+    if start < 0:
+        return None
+    literal = _literal_list_at(text, start)
+    if literal is None:
+        return None
+    argv = _parse_string_list(literal)
+    return argv or None
+
+
+def _literal_list_at(text: str, start: int) -> str | None:
+    """Return the balanced ``[...]`` slice starting at ``start``, if it closes."""
+    depth = 0
+    for pos in range(start, len(text)):
+        char = text[pos]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : pos + 1]
+    return None
+
+
+def _parse_string_list(literal: str) -> list[str] | None:
+    """Parse a list literal, tolerating whole-line comments inside the brackets."""
+    for candidate in (literal, _strip_comment_lines(literal)):
+        try:
+            value = ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+            return list(value)
+    return None
+
+
+def _strip_comment_lines(literal: str) -> str:
+    """Drop whole-line ``#`` comments, which ``literal_eval`` cannot parse."""
+    return "\n".join(line for line in literal.splitlines() if not line.strip().startswith("#"))
 
 
 def extract_torchrun_targets(tokens: list[str], torchrun_idx: int) -> list[str]:

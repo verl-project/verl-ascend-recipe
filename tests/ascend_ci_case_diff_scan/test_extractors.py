@@ -132,6 +132,78 @@ class TestExtractPytestSpecs:
         targets, ignore_paths, _ = extract_pytest_specs(["pytest", "tests/", "--ignore", '"tests/quoted.py"'], 0)
         assert "tests/quoted.py" in ignore_paths
 
+    def test_deselect_nodeid_is_not_a_target(self):
+        from modules.extractors import extract_pytest_specs
+
+        targets, _, _ = extract_pytest_specs(["pytest", "tests/", "--deselect", "tests/test_flaky.py::test_flaky"], 0)
+        assert targets == ["tests/"]
+        assert "tests/test_flaky.py::test_flaky" not in targets
+
+    def test_inline_deselect_is_not_a_target(self):
+        from modules.extractors import extract_pytest_specs
+
+        targets, _, _ = extract_pytest_specs(["pytest", "--deselect=tests/test_flaky.py::test_flaky", "tests/"], 0)
+        assert targets == ["tests/"]
+
+
+# ============================================================================
+# extract_pytest_main_argv
+# ============================================================================
+
+
+class TestExtractPytestMainArgv:
+    SCRIPT = """\
+          # Keep pytest options out of sys.argv: MegatronAdaptor parses it.
+          python -c '
+          import pytest
+
+          raise SystemExit(pytest.main([
+              "-s",
+              "-x",
+              "--ignore-glob=*on_cpu.py",
+              "tests/",
+              "-k",
+              "not test_slow",
+          ]))
+          '
+    """
+
+    def test_recovers_argv_list(self):
+        from modules.extractors import extract_pytest_main_argv
+
+        argv = extract_pytest_main_argv(self.SCRIPT)
+        assert argv == [
+            "-s",
+            "-x",
+            "--ignore-glob=*on_cpu.py",
+            "tests/",
+            "-k",
+            "not test_slow",
+        ]
+
+    def test_returns_none_without_call(self):
+        from modules.extractors import extract_pytest_main_argv
+
+        assert extract_pytest_main_argv("python -m pytest tests/") is None
+
+    def test_returns_none_for_non_literal_argument(self):
+        from modules.extractors import extract_pytest_main_argv
+
+        script = "python -c 'pytest.main(build_argv())'"
+        assert extract_pytest_main_argv(script) is None
+
+    def test_ignores_comment_lines_inside_list(self):
+        from modules.extractors import extract_pytest_main_argv
+
+        script = """python -c '
+pytest.main([
+    "tests/",
+    # keep this comment out of the parse
+    "--ignore-glob=*on_cpu.py",
+])
+'"""
+        assert extract_pytest_main_argv(script) == ["tests/", "--ignore-glob=*on_cpu.py"]
+
 
 # ============================================================================
 # extract_torchrun_targets
