@@ -1,7 +1,7 @@
-# ATRL segment-advantage patch base.
+# verl pin used by uni-agent release/v0.1.0 (5c5663c).
 # The July 24 ATRL snapshot records verl version 0.9.0.dev (commit 2b47a68b66d6).
-# The patch in patches/verl-main-grpo-segment.patch applies to the commit below.
+# patches/verl-v0.9.1-grpo-segment.patch applies to the commit below.
 UPSTREAM=https://github.com/verl-project/verl.git
 MODE=pinned_commit
-COMMIT=2bcc98a9b64bdb3af5b88ac870ba0709ed709aef
-PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@2bcc98a9b64bdb3af5b88ac870ba0709ed709aef
+COMMIT=1876b06d0a3e4e71e06230be10af14492ca8a75b
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@1876b06d0a3e4e71e06230be10af14492ca8a75b

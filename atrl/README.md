@@ -26,11 +26,11 @@ The increment below is therefore taken against the uni-agent release that has th
 | Component | Checkout | Notes |
 | --- | --- | --- |
 | uni-agent | `release/v0.1.0` at `5c5663c30a5e5d847707f49e7595471cd1e6315a` | patch applies cleanly here |
-| verl | `2bcc98a9b64bdb3af5b88ac870ba0709ed709aef` (`main` when the segment-advantage patch was cut) | patch applies cleanly here |
+| verl | `v0.9.1` at `1876b06d0a3e4e71e06230be10af14492ca8a75b` | the submodule pinned by that uni-agent commit; patch applies cleanly here |
 
-`2b47a68` and `2bcc98a9` are not the same tree. Use the patch bases in the table. The July 24 pin is only the version recorded inside the ATRL snapshot.
+`2b47a68` is only the `0.9.0.dev` string recorded in the July 24 ATRL snapshot. The segment-advantage patch used with uni-agent `release/v0.1.0` is the one for verl `v0.9.1` (`1876b06`).
 
-Tag `v0.1.0` (`f353c58f744b`, 2026-09-22) vendors verl `v0.9.1` (`1876b06d0a3e`). The uni-agent patch was checked against `release/v0.1.0` (`5c5663c`), not against that tag.
+Tag `v0.1.0` (`f353c58f744b`) is not the branch tip. The uni-agent patch was checked against `release/v0.1.0` (`5c5663c`).
 
 ## Apply
 
@@ -42,8 +42,8 @@ git apply /path/to/verl-ascend-recipe/atrl/patches/uni-agent-v0.1.0-atrl.patch
 
 git clone https://github.com/verl-project/verl.git
 cd verl
-git checkout 2bcc98a9b64bdb3af5b88ac870ba0709ed709aef
-git apply /path/to/verl-ascend-recipe/atrl/patches/verl-main-grpo-segment.patch
+git checkout 1876b06d0a3e4e71e06230be10af14492ca8a75b
+git apply /path/to/verl-ascend-recipe/atrl/patches/verl-v0.9.1-grpo-segment.patch
 ```
 
 Training then uses `agent.name: triton_react`, `algorithm.adv_estimator=grpo_segment`, and `actor.loss_agg_mode=seg-mean-token-mean`. See `examples/triton_react/task_config.yaml` inside the patched uni-agent tree.
