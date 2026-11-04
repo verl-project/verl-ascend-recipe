@@ -1,0 +1,7 @@
+# ATRL segment-advantage patch base.
+# The July 24 ATRL snapshot records verl version 0.9.0.dev (commit 2b47a68b66d6).
+# The patch in patches/verl-main-grpo-segment.patch applies to the commit below.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=2bcc98a9b64bdb3af5b88ac870ba0709ed709aef
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@2bcc98a9b64bdb3af5b88ac870ba0709ed709aef
