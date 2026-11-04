@@ -1,0 +1,5 @@
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned
+VERL_COMMIT=fa856c3d97fbf93c059322298cc24bec3a944bfe
+PATCH=patches/verl.patch
+NOTES=Apply the bundled patch with apply_verl_patch.sh. No recipe submodule update or separate verl PR is required.
