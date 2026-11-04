@@ -1,3 +1,0 @@
-# ATRL agent loop. Hydra instantiates ``_target_`` inside the rollout worker.
-- name: atrl
-  _target_: recipe.atrl.agent.loop.AtrlAgentLoop
