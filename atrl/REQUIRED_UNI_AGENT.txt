@@ -1,0 +1,7 @@
+# Uni-agent base for patches/uni-agent-v0.1.0-atrl.patch.
+# The ATRL snapshot does not record a uni-agent SHA.
+# Upstream on 2026-07-24 is 38c655f360f6, but that tree already uses
+# uni_agent/gateway while the snapshot still uses uni_agent/trainer/gateway.
+UPSTREAM=https://github.com/verl-project/uni-agent.git
+BRANCH=release/v0.1.0
+COMMIT=5c5663c30a5e5d847707f49e7595471cd1e6315a
