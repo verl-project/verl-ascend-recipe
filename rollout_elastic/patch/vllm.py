@@ -256,15 +256,6 @@ if vLLMHttpServer is not None:
         from vllm.inputs import TokensPrompt
         from vllm.lora.request import LoRARequest
 
-        if progress_ctx is not None:
-            from verl.workers.rollout.fault_tolerance import ServerUnavailable
-
-            expected_version = progress_ctx.checkpoint.model_weight_version
-            actual_version = str(self.global_steps) if self.global_steps is not None else None
-            if expected_version != actual_version:
-                # A sync raced with client preparation. Reject before producing tokens.
-                raise ServerUnavailable("<version-change>")
-
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -353,14 +344,14 @@ if vLLMHttpServer is not None:
         async for output in generator:
             final_res = output
             if progress_ctx is not None:
-                progress_ctx.checkpoint.ingest(output, global_steps=self.global_steps)
+                progress_ctx.checkpoint.ingest(output)
         assert final_res is not None
 
         # Final flush: ensure terminal fields (finished/finish_reason) are persisted.
         # ``ingest`` already force-flushes on finished=True, but guard against the
         # edge case where the last chunk did not set finished before the loop exited.
         if progress_ctx is not None:
-            progress_ctx.checkpoint.ingest(final_res, global_steps=self.global_steps)
+            progress_ctx.checkpoint.ingest(final_res)
             progress_ctx.checkpoint._maybe_flush(force=True)
 
         extra_fields = {"global_steps": self.global_steps}

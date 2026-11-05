@@ -337,10 +337,6 @@ async def _generate_once(
             )
             return output, server_id
         except Exception as e:
-            cause = getattr(e, "cause", None) or e
-            if isinstance(cause, ServerUnavailable):
-                # A version race requires retry, not isolation of a healthy replica.
-                raise ServerUnavailable(server_id, cause=cause) from e
             if translate_fault and is_transient_fault(e):
                 await self._mark_server_failed(server_id)
                 raise ServerUnavailable(server_id, cause=e) from e
@@ -557,11 +553,11 @@ async def _fully_generate(
     while True:
         # ----- decide prefix + progress_ctx for this attempt -----
         checkpoint = None
-        progress_ctx = None
 
-        async def prepare_request(server):
-            nonlocal checkpoint, progress_ctx, final_output, sampling_params, recovery_id
-            nonlocal min_global_steps, max_global_steps, global_steps, model_weight_version
+        async def prepare_request(server, attempt_sampling_params=sampling_params):
+            nonlocal checkpoint, final_output, model_weight_version, recovery_id, sampling_params
+            nonlocal min_global_steps, max_global_steps, global_steps
+            progress_ctx = None
             if progress_on:
                 from verl.workers.rollout.fault_tolerance import (
                     ProgressContext,
@@ -595,7 +591,8 @@ async def _fully_generate(
                         self._run_id,
                         recovery_id,
                     )
-                    # Discard the old answer branch and its recovery identity together.
+                    # A fresh answer must not inherit tokens or persistence identity
+                    # from the abandoned partial answer.
                     final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
                     min_global_steps, max_global_steps, global_steps = None, None, None
                     recovery_id = uuid4().hex
@@ -604,9 +601,6 @@ async def _fully_generate(
                     call_sampling = copy.deepcopy(original_sampling)
                 else:
                     checkpoint = result.checkpoint
-                    # The retained tokens, rather than previous failed RPCs, own the range.
-                    min_global_steps = checkpoint.min_global_steps
-                    max_global_steps = checkpoint.max_global_steps
                     progress_ctx = ProgressContext(checkpoint=checkpoint)
                     prefix_for_call = checkpoint.resume_prefix_token_ids()
                     call_sampling = copy.deepcopy(original_sampling)
@@ -653,8 +647,7 @@ async def _fully_generate(
             else:
                 progress_ctx = None
                 prefix_for_call = original_prompt + final_output.token_ids
-                call_sampling = sampling_params
-
+                call_sampling = attempt_sampling_params
             return prefix_for_call, call_sampling, progress_ctx
 
         # 1. generate tokens — catch ServerUnavailable to retry on a fresh server
@@ -746,19 +739,9 @@ async def _fully_generate(
             final_output.stop_reason = output.stop_reason
 
         global_steps = output.extra_fields.get("global_steps", None)
-        if output.token_ids:
-            lower = [
-                v
-                for v in (min_global_steps, output.extra_fields.get("min_global_steps", global_steps))
-                if v is not None
-            ]
-            upper = [
-                v
-                for v in (max_global_steps, output.extra_fields.get("max_global_steps", global_steps))
-                if v is not None
-            ]
-            min_global_steps = min(lower) if lower else None
-            max_global_steps = max(upper) if upper else None
+        if min_global_steps is None:
+            min_global_steps = global_steps
+        max_global_steps = global_steps
         model_weight_version = global_steps
 
         # 3. update the generation budget; truncate (FT only) to the original budget
