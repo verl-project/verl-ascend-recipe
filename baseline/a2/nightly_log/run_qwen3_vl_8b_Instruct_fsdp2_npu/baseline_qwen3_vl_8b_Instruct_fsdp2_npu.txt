@@ -1,5 +1,5 @@
 actor/perf/max_memory_allocated_gb:36.617788
-timing_s/step:90.266290
-perf/throughput:152.716793
-critic/rewards/mean:0.4405781
-training/rollout_probs_diff_mean:0.00544249
+timing_s/step:86.745663
+perf/throughput:161.611570
+critic/rewards/mean:0.4395375
+training/rollout_probs_diff_mean:0.00543205
