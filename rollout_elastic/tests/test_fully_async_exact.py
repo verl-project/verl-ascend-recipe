@@ -125,6 +125,25 @@ class ClientRecoveryTests(unittest.TestCase):
         )
         return SimpleNamespace(checkpoint=cp)
 
+    def test_store_failure_discards_partial_answer_and_recovery_identity(self):
+        result, client, factory = self.run_client(
+            [self.checkpoint_result([]), ConnectionError(), self.checkpoint_result([])],
+            [
+                dict(token_ids=[2], stop_reason="abort", extra_fields={"global_steps": 9}),
+                dict(token_ids=[3], stop_reason="abort", extra_fields={"global_steps": 10}),
+                dict(token_ids=[4, 5, 6], stop_reason="length", extra_fields={"global_steps": 10}),
+            ],
+        )
+        self.assertEqual(result.token_ids, [4, 5, 6])
+        calls = client._call_server.call_args_list
+        self.assertEqual(calls[1].kwargs["prompt_ids"], [1])
+        self.assertEqual(calls[1].kwargs["sampling_params"]["max_tokens"], 3)
+        self.assertEqual(result.extra_fields["min_global_steps"], 10)
+        self.assertNotEqual(
+            factory.call_args_list[1].kwargs["recovery_id"], factory.call_args_list[2].kwargs["recovery_id"]
+        )
+        client._mark_server_failed.assert_not_called()
+
     def test_resume_uses_selected_server_version(self):
         result, client, factory = self.run_client(
             [self.checkpoint_result([2])],

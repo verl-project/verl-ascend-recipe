@@ -553,9 +553,10 @@ async def _fully_generate(
     while True:
         # ----- decide prefix + progress_ctx for this attempt -----
         checkpoint = None
-        progress_ctx = None
-        async def prepare_request(server):
-            nonlocal checkpoint, final_output, model_weight_version
+
+        async def prepare_request(server, attempt_sampling_params=sampling_params):
+            nonlocal checkpoint, final_output, model_weight_version, recovery_id, sampling_params
+            nonlocal min_global_steps, max_global_steps, global_steps
             progress_ctx = None
             if progress_on:
                 from verl.workers.rollout.fault_tolerance import (
@@ -590,8 +591,14 @@ async def _fully_generate(
                         self._run_id,
                         recovery_id,
                     )
+                    # A fresh answer must not inherit tokens or persistence identity
+                    # from the abandoned partial answer.
+                    final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
+                    min_global_steps, max_global_steps, global_steps = None, None, None
+                    recovery_id = uuid4().hex
+                    sampling_params = copy.deepcopy(original_sampling)
                     prefix_for_call = original_prompt
-                    call_sampling = sampling_params
+                    call_sampling = copy.deepcopy(original_sampling)
                 else:
                     checkpoint = result.checkpoint
                     progress_ctx = ProgressContext(checkpoint=checkpoint)
@@ -640,7 +647,7 @@ async def _fully_generate(
             else:
                 progress_ctx = None
                 prefix_for_call = original_prompt + final_output.token_ids
-                call_sampling = sampling_params
+                call_sampling = attempt_sampling_params
             return prefix_for_call, call_sampling, progress_ctx
 
         # 1. generate tokens — catch ServerUnavailable to retry on a fresh server
