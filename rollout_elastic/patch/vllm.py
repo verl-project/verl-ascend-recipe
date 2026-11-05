@@ -256,15 +256,6 @@ if vLLMHttpServer is not None:
         from vllm.inputs import TokensPrompt
         from vllm.lora.request import LoRARequest
 
-        if progress_ctx is not None:
-            from verl.workers.rollout.fault_tolerance import ServerUnavailable
-
-            expected_version = progress_ctx.checkpoint.model_weight_version
-            actual_version = str(self.global_steps) if self.global_steps is not None else None
-            if expected_version != actual_version:
-                # A sync raced with client preparation. Reject before producing tokens.
-                raise ServerUnavailable("<version-change>")
-
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
