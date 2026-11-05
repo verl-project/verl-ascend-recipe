@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "model_fingerprint": "sha256:model-and-drafter-config",
+  "topology_fingerprint": "ascend-tp2-dp4-eager",
+  "batch_scale": 8.0,
+  "log2_context_scale": 1.0,
+  "cells": [
+    {
+      "phase_id": "b16-l4096",
+      "batch_size": 16,
+      "context_length": 4096,
+      "allowed_ks": [5, 7, 9, 12],
+      "iteration_latency_ns_by_k": {
+        "5": 61000000,
+        "7": 69000000,
+        "9": 78000000,
+        "12": 96000000
+      },
+      "prior_survival": [0.95, 0.91, 0.85, 0.78, 0.69, 0.58, 0.47, 0.37, 0.29, 0.22, 0.16, 0.11],
+      "fallback_k": 7
+    }
+  ]
+}

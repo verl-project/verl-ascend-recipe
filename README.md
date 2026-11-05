@@ -51,6 +51,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 
 | Recipe | `REQUIRED_VERL.txt` |
 | --- | --- |
+| [AdaptiveSpec usage and features](adaptive_spec/README.md) | [Required verl revision](adaptive_spec/REQUIRED_VERL.txt) |
 | opd | [`opd/REQUIRED_VERL.txt`](opd/REQUIRED_VERL.txt) |
 | dapo | [`recipe/dapo/REQUIRED_VERL.txt`](dapo/REQUIRED_VERL.txt) |
 | dppo | [`recipe/dppo/REQUIRED_VERL.txt`](dppo/REQUIRED_VERL.txt) |

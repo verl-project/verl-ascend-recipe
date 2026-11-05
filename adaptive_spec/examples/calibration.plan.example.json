@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "model": "/absolute/model",
+  "model_fingerprint": "YOUR_MODEL_ID",
+  "topology_fingerprint": "YOUR_ASCEND_TP2_EAGER_ID",
+  "context_bank": "/absolute/natural_contexts.jsonl",
+  "k_values": [5, 7, 9, 12],
+  "states": [
+    {"batch_size": 1, "context_length": 1024},
+    {"batch_size": 8, "context_length": 4096},
+    {"batch_size": 16, "context_length": 8192}
+  ],
+  "repeats": 3,
+  "seed": 42,
+  "probe_tokens": 256,
+  "warmup_steps": 2,
+  "minimum_steps": 8,
+  "length_window_tokens": 256,
+  "regret_fraction": 0.1,
+  "prior_pseudocount": 0.5,
+  "probe_timeout_seconds": 3600,
+  "sampling": {"temperature": 1.0, "top_p": 1.0},
+  "engine_args": {
+    "tensor_parallel_size": 2,
+    "max_num_seqs": 16,
+    "max_model_len": 69632,
+    "gpu_memory_utilization": 0.8,
+    "trust_remote_code": false
+  }
+}
