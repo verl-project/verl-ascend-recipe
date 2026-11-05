@@ -1,4 +1,4 @@
-actor/perf/max_memory_allocated_gb:36.413735
+actor/perf/max_memory_allocated_gb:36.617788
 timing_s/step:90.266290
 perf/throughput:152.716793
 critic/rewards/mean:0.4405781
