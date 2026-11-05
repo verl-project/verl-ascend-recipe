@@ -30,6 +30,7 @@ ASCEND_RUNNER_SOURCES = {
     "e4ad64b16d3707189ee54bb73be06b87a04423c1d7189e2dd8122530c605bb50": "public-5ed283a6c",
     "cd0abab15168fa7cb6b094b8f1861975e7c9ab562d29fc0fde9906435f1e96cf": "legacy-telemetry-build",
 }
+ASCEND_GDN_SHA256 = "d6ec29919268178f5bf6e70e689c1d273d04b1cb1d84dc94efa7bbbc35490816"
 VLLM_RUNNER_SHA256 = "6250ca0670c4593aa2f7c4567c9c71d6cb3d8182624a985d4d4e33d5bf054666"
 VLLM_SCHEDULER_SHA256 = "9ae1491f57a6294e32416b93ef2ea68107fa0d65c3a4d7f745f1261012f735e9"
 
@@ -95,6 +96,7 @@ def check_backend(*, targeted_kv: bool = False, audit: bool = False) -> dict:
         ascend = _package_root("vllm_ascend")
         checks.append(source_check(ascend / "worker/model_runner_v1.py", frozenset(ASCEND_RUNNER_SOURCES)))
         checks.append(source_check(vllm / "v1/worker/gpu_model_runner.py", {VLLM_RUNNER_SHA256}))
+        checks.append(source_check(ascend / "ops/gdn.py", {ASCEND_GDN_SHA256}))
         if targeted_kv:
             checks.append(source_check(vllm / "v1/core/sched/scheduler.py", {VLLM_SCHEDULER_SHA256}))
     except (ImportError, ValueError) as error:

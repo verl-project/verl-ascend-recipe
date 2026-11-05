@@ -28,6 +28,10 @@ _CONFIG_ENV = "VERL_ADAPTIVE_SPEC_CONFIG"
 
 def adaptive_spec_plugin() -> bool:
     adapter, vllm_version, ascend_version = installed_adapter_name()
+    if adapter == "v0_23" and os.environ.get("VERL_ASCEND_CLEANUP_GRACE") == "1":
+        from .shutdown_v0_23 import install
+
+        install()
     kv_installed = False
     if os.environ.get("VERL_MTP_KV_PREEMPT_MODE"):
         if adapter != "v0_23":

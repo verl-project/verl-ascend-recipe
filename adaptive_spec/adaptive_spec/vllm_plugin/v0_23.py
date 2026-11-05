@@ -302,6 +302,10 @@ def _patch_class(model_runner_cls: Any, config: AdaptiveSpecConfig) -> bool:
     from .async_reconcile_v0_23 import patch_class as patch_async_reconcile
 
     patch_async_reconcile(model_runner_cls)
+    if config.enabled:
+        from .gdn_state_v0_23 import patch_gdn
+
+        patch_gdn()
     original_execute = model_runner_cls.execute_model
     original_bookkeeping = model_runner_cls._bookkeeping_sync
     original_propose = model_runner_cls.propose_draft_token_ids

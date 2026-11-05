@@ -36,6 +36,7 @@ def test_missing_packages_fail_without_importing_them(monkeypatch):
 def test_known_sources_pass_and_one_byte_mutation_is_rejected(tmp_path, monkeypatch):
     paths = [
         "ascend/worker/model_runner_v1.py",
+        "ascend/ops/gdn.py",
         "vllm/v1/worker/gpu_model_runner.py",
         "vllm/v1/core/sched/scheduler.py",
     ]
@@ -45,6 +46,7 @@ def test_known_sources_pass_and_one_byte_mutation_is_rejected(tmp_path, monkeypa
         path.write_bytes(b"fixture\n")
     checksum = hashlib.sha256(b"fixture\n").hexdigest()
     monkeypatch.setattr(backend, "ASCEND_RUNNER_SOURCES", {checksum: "test-fixture"})
+    monkeypatch.setattr(backend, "ASCEND_GDN_SHA256", checksum)
     monkeypatch.setattr(backend, "VLLM_RUNNER_SHA256", checksum)
     monkeypatch.setattr(backend, "VLLM_SCHEDULER_SHA256", checksum)
     monkeypatch.setattr(backend, "installed_adapter_name", lambda: ("v0_23", "0.23.0", "0.23.0rc2"))

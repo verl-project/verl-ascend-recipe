@@ -42,8 +42,10 @@ def run_probe(plan: dict, output: Path, k: int) -> None:
     plugins = [p.strip() for p in os.environ.get("VLLM_PLUGINS", "ascend").split(",") if p.strip()]
     if "ascend" not in plugins:
         plugins.insert(0, "ascend")
-    if "adaptive_spec_calibration_plugin" not in plugins:
-        plugins.append("adaptive_spec_calibration_plugin")
+    for plugin in ("adaptive_spec_calibration_plugin", "adaptive_spec_plugin"):
+        if plugin not in plugins:
+            plugins.append(plugin)
+    os.environ["VERL_ASCEND_CLEANUP_GRACE"] = "1"
     os.environ["VLLM_PLUGINS"] = ",".join(plugins)
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from .vllm_plugin.compatibility import installed_adapter_name
@@ -59,42 +61,45 @@ def run_probe(plan: dict, output: Path, k: int) -> None:
     llm = LLM(
         model=plan["model"], speculative_config={"method": "mtp", "num_speculative_tokens": k}, **plan["engine_args"]
     )
-    counts = []
-    for selection in plan["selections"]:
-        state_index, repeat = selection["state_index"], selection["repeat"]
-        state = plan["states"][state_index]
-        prompts = [
-            {"prompt_token_ids": bank[identity][: state["context_length"]]} for identity in selection["context_ids"]
-        ]
-        params = SamplingParams(
-            **plan["sampling"],
-            max_tokens=plan["probe_tokens"],
-            ignore_eos=True,
-            seed=selection["sampling_seed"],
-            extra_args={"adaptive_spec_calibration_state": state_index, "adaptive_spec_calibration_repeat": repeat},
+    try:
+        counts = []
+        for selection in plan["selections"]:
+            state_index, repeat = selection["state_index"], selection["repeat"]
+            state = plan["states"][state_index]
+            prompts = [
+                {"prompt_token_ids": bank[identity][: state["context_length"]]} for identity in selection["context_ids"]
+            ]
+            params = SamplingParams(
+                **plan["sampling"],
+                max_tokens=plan["probe_tokens"],
+                ignore_eos=True,
+                seed=selection["sampling_seed"],
+                extra_args={"adaptive_spec_calibration_state": state_index, "adaptive_spec_calibration_repeat": repeat},
+            )
+            generated = llm.generate(prompts, params, use_tqdm=False)
+            if len(generated) != state["batch_size"] or any(
+                len(row.outputs) != 1
+                or len(row.outputs[0].token_ids) != plan["probe_tokens"]
+                or row.outputs[0].finish_reason != "length"
+                for row in generated
+            ):
+                raise RuntimeError(f"incomplete calibration continuation for state={state_index}, repeat={repeat}")
+            counts.append({"state_index": state_index, "repeat": repeat, "responses": len(generated)})
+        if not list(output.glob("steps.*.jsonl")):
+            raise RuntimeError("calibration observer did not publish any clean device steps")
+        write_json(
+            output / "result.json",
+            {
+                "status": "complete",
+                "k": k,
+                "responses": counts,
+                "vllm_version": vllm_version,
+                "vllm_ascend_version": ascend_version,
+                "recipe_version": importlib.metadata.version("verl-adaptive-spec"),
+            },
         )
-        generated = llm.generate(prompts, params, use_tqdm=False)
-        if len(generated) != state["batch_size"] or any(
-            len(row.outputs) != 1
-            or len(row.outputs[0].token_ids) != plan["probe_tokens"]
-            or row.outputs[0].finish_reason != "length"
-            for row in generated
-        ):
-            raise RuntimeError(f"incomplete calibration continuation for state={state_index}, repeat={repeat}")
-        counts.append({"state_index": state_index, "repeat": repeat, "responses": len(generated)})
-    if not list(output.glob("steps.*.jsonl")):
-        raise RuntimeError("calibration observer did not publish any clean device steps")
-    write_json(
-        output / "result.json",
-        {
-            "status": "complete",
-            "k": k,
-            "responses": counts,
-            "vllm_version": vllm_version,
-            "vllm_ascend_version": ascend_version,
-            "recipe_version": importlib.metadata.version("verl-adaptive-spec"),
-        },
-    )
+    finally:
+        llm.llm_engine.engine_core.shutdown(timeout=60)
 
 
 def main() -> None:

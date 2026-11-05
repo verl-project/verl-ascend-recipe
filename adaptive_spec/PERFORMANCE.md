@@ -32,6 +32,12 @@ The workload consists of 32 randomly sampled, frozen training prompts, with thin
 
 Pooling total tokens over total time gives an 11.02% throughput improvement. Total time decreases by 17.16% and total output by 8.03%. The individual throughput changes are -5.28% and +30.26%. One response reaches the output limit in the first AdaptiveSpec run and one in the second fixed-K run.
 
+The README deployment example also measures 32 randomly selected APPS **test** prompts (selection seed 42, generation seed 20261103). Its cost table comes from a separate 64-prompt training calibration set. Both arms use Elastic routing and startup capacity K12.
+
+| Fixed K12: seconds / tokens / tokens/s | AdaptiveSpec: seconds / tokens / tokens/s | Throughput improvement |
+|---|---|---:|
+| 1133.725 / 961212 / 847.835 | 942.734 / 943775 / 1001.105 | **18.08%** |
+
 AdaptiveSpec is suited to finite rollouts with mixed response lengths, multiple responses per prompt, and a gradually decreasing active batch. Evidence can be reused across sibling responses, and the drain phase provides room to adjust K.
 
 See [VALIDATION.md](VALIDATION.md) for the test environment and validation results.
