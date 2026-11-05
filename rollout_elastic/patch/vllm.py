@@ -344,14 +344,14 @@ if vLLMHttpServer is not None:
         async for output in generator:
             final_res = output
             if progress_ctx is not None:
-                progress_ctx.checkpoint.ingest(output, global_steps=self.global_steps)
+                progress_ctx.checkpoint.ingest(output)
         assert final_res is not None
 
         # Final flush: ensure terminal fields (finished/finish_reason) are persisted.
         # ``ingest`` already force-flushes on finished=True, but guard against the
         # edge case where the last chunk did not set finished before the loop exited.
         if progress_ctx is not None:
-            progress_ctx.checkpoint.ingest(final_res, global_steps=self.global_steps)
+            progress_ctx.checkpoint.ingest(final_res)
             progress_ctx.checkpoint._maybe_flush(force=True)
 
         extra_fields = {"global_steps": self.global_steps}
