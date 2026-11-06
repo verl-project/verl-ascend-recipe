@@ -4,32 +4,35 @@
 本用例基于8 x Atlas A3 实现， 开发者可以参照调整。
 
 ## 环境版本
-由于当前部分组件依赖尚未发布正式版本，我们将提供用于快速复现的基础镜像及部署方法，获取参照环境部署章节，主要依赖版本如下
-后续会更新正式版本
+由于当前部分组件依赖尚未发布正式版本，以下基础镜像及版本用于快速复现；升级镜像时请同步核对下方镜像摘要和依赖版本。主要依赖版本如下
 
 | 依赖组件                 | 版本            | 
 | :--------------------- | :------         | 
 | CANN                   | 9.1.0           | 
 | PyTorch                | 2.10.0          | 
-| torch\_npu             | 2.10.0          | 
+| torch\_npu             | 2.10.0.post4    |
+| Python                 | 3.12             |
 | verl                   | 809f2d8         | 
 | vLLM                   | v0.23.0         | 
 | vLLM-Ascend            | releases/0.23.0 | 
-| MindSpeed-LLM          | 99f7fc1 (master)| 
-| MindSpeed              | 1becca8 (master)| 
+| MindSpeed-LLM          | repository default branch (not commit-pinned by install.sh) |
+| MindSpeed              | repository default branch (not commit-pinned by install.sh) |
 | Megatron               | core_v0.12.1    | 
 
 
+`install.sh` 对 MindSpeed 与 MindSpeed-LLM 执行默认分支克隆、不固定 commit；表中的 default branch 即克隆时的仓库默认分支。若需复现同一份代码，请记录安装后各仓库的 `git rev-parse HEAD`。
+
 ### 环境部署
-我们基于VLLM+MindSpeed-LLM后端支持DeepSeekV4的强化学习, 使用verl日构建开源镜像作为基础镜像，请使用此镜像作为基础镜像安装环境
+我们基于VLLM+MindSpeed-LLM后端支持DeepSeekV4的强化学习。使用与A3、CANN 9.1.0和Python 3.12匹配的Quay镜像作为基础环境；以下固定到2026-10-22发布的镜像摘要以便复现。升级镜像时应同时核对依赖版本。
 
 ```bash
 
-# verl日构建开源镜像
-docker pull quay.io/ascend/verl:verl-9.0.0-a3-ubuntu22.04-py3.11-latest
+# Quay A3 / CANN 9.1.0 / torch_npu 2.10.0.post4 / Python 3.12 镜像（2026-10-22 摘要）
+IMAGE='quay.io/ascend/verl:v0.9.1-cann9.1.0-torch_npu2.10.0.post4-a3-ubuntu22.04-py3.12-vllm@sha256:975e7a8a38d693ce97330c047b341add8fdb20c9e3b968d918618062fe110984'
+docker pull "$IMAGE"
 
 # 创建容器
-docker run -dit --ipc=host --network host --name 'rl_test' --privileged -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware -v /usr/local/sbin/:/usr/local/sbin/ -v /home/:/home/ -v /data/:/data 镜像名:标签 /bin/bash
+docker run -dit --ipc=host --network host --name 'rl_test' --privileged -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware -v /usr/local/sbin/:/usr/local/sbin/ -v /home/:/home/ -v /data/:/data "$IMAGE" /bin/bash
 
 # 进入容器
 docker exec -it rl_test bash
