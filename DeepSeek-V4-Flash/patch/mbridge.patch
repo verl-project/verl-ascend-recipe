@@ -1,5 +1,5 @@
 diff --git a/mbridge/core/bridge.py b/mbridge/core/bridge.py
-index 031e922..d353fe0 100644
+index 031e922..01386e7 100644
 --- a/mbridge/core/bridge.py
 +++ b/mbridge/core/bridge.py
 @@ -171,7 +171,7 @@ class Bridge(ABC):
@@ -101,7 +101,22 @@ index 031e922..d353fe0 100644
  
          return ret
  
-@@ -852,7 +855,7 @@ class Bridge(ABC):
+@@ -765,10 +768,13 @@ class Bridge(ABC):
+         # Convert weights to the target dtype if needed
+         # This handles cases where HF weights are FP32 but model expects BF16/FP16
+         if (
+             hasattr(self, "dtype")
+             and self.dtype is not None
+             and "expert_bias" not in mcore_weights_name
+         ):
+             hf_weights = [
+-                w.to(self.dtype) if w.dtype != self.dtype else w for w in hf_weights
++                w.to(self.dtype)
++                if w.is_floating_point() and w.dtype != self.dtype
++                else w
++                for w in hf_weights
+             ]
+@@ -852,7 +858,7 @@ class Bridge(ABC):
          if self.mpu.tp_size == 1:
              assert len(mcore_weights) == 1
              return mcore_weights[0]
@@ -110,7 +125,7 @@ index 031e922..d353fe0 100644
              assert len(mcore_weights) == self.mpu.etp_size
          else:
              assert len(mcore_weights) == self.mpu.tp_size
-@@ -880,7 +883,7 @@ class Bridge(ABC):
+@@ -880,7 +886,7 @@ class Bridge(ABC):
              up = torch.cat(up_lst, dim=0)
              ret = torch.cat((gate, up), dim=0)
  
@@ -119,7 +134,7 @@ index 031e922..d353fe0 100644
              ret = torch.cat(mcore_weights, dim=1)
          else:
              assert (
-@@ -928,7 +931,7 @@ class Bridge(ABC):
+@@ -928,7 +934,7 @@ class Bridge(ABC):
              gates = gate.chunk(tp_split_size)
              ups = up.chunk(tp_split_size)
              ret = [torch.cat([g, u], dim=0) for g, u in zip(gates, ups)]

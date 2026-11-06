@@ -54,6 +54,10 @@ ln -s ../Megatron-LM/megatron megatron
 ln -s ../mbridge/mbridge mbridge
 ```
 
+### `tid2eid` 路由表数据完整性
+
+DeepSeek-V4 的 `tid2eid` 是整数路由表；本 recipe 的 mbridge patch 会保留整数张量的数据类型，避免权重加载时将其转为 bf16。此修复不会修复旧配置已保存的检查点；重新使用旧检查点前，请将其中的 `tid2eid` 与原始 Hugging Face 权重逐项比较，并检查 `(t >= 384).any()`。
+
 ### 权重下载与反量化
 
 1. 权重下载
