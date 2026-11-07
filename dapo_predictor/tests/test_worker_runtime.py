@@ -139,3 +139,22 @@ def test_response_mask_counts_valid_tokens_equal_to_pad_id(worker):
     )
     worker.update_predictor(prompts, responses)
     assert worker.actor.predictor_calibration_tokens.tolist() == [2.0, 2.0]
+
+
+def test_online_d2_without_checkpoint_collects_features_and_returns_no_work(worker):
+    worker.config.predictor_reorder.backend = "censored_lognormal"
+    worker.config.predictor_reorder.d2_online = {"enable": True}
+    worker.actor_module_fsdp.config = SimpleNamespace(num_hidden_layers=4)
+    worker.actor.distribution_predictor = None
+    worker.actor.extract_hidden_taps = lambda data, layers: {index: torch.ones((2, 3)) * index for index in layers}
+    output = worker.compute_predictor_score(_prompts(4))
+    assert not output.meta_info["predictor_ready"]
+    assert output.batch["d2_hidden"].shape == (4, 4, 3)
+    assert output.meta_info["d2_feature_keys"] == (
+        "layer_1",
+        "layer_2",
+        "layer_3",
+        "layer_4",
+    )
+    assert torch.isnan(output.batch["epws_predicted_work"]).all()
+    assert torch.equal(output.batch["d2_hidden"][0], output.batch["d2_hidden"][1])

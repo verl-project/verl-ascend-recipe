@@ -17,7 +17,11 @@ from recipe.dapo.dapo_ray_trainer import RayDAPOTrainer
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+)
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     apply_kl_penalty,
@@ -37,9 +41,10 @@ from .length_scheduler.checkpoint import (
 )
 from .length_scheduler.d2_quality import D2QualityConfig, D2QualityLifecycle
 from .predictor_utils import snake_sort_indices
+from .rollout_logging import RolloutJSONMixin
 
 
-class PredictorRayDAPOTrainer(RayDAPOTrainer):
+class PredictorRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
     """DAPO trainer that only injects the predictor-specific reorder steps.
 
     Most heavy lifting is still reused from the current `RayDAPOTrainer` / `RayPPOTrainer` stack:
@@ -68,12 +73,36 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         return None if checkpoint is None else str(checkpoint)
 
     def _d2_quality_enabled(self) -> bool:
-        return self._predictor_backend() == DISTRIBUTION_BACKEND and bool(
-            self._predictor_cfg().get("d2_lifecycle", {}).get("enable", True)
+        return (
+            not self._d2_online_enabled()
+            and self._predictor_backend() == DISTRIBUTION_BACKEND
+            and bool(self._predictor_cfg().get("d2_lifecycle", {}).get("enable", True))
         )
 
     def _init_d2_quality(self):
         self._d2_quality = None
+        self._online_d2 = None
+        if self._d2_online_enabled():
+            from omegaconf import OmegaConf
+
+            from .length_scheduler.d2_online import OnlineD2
+
+            if self._scheduler_name() != "epws":
+                raise ValueError("online D2 requires scheduler=epws")
+            cfg = self._predictor_cfg().get("d2_online", {})
+            options = OmegaConf.to_container(cfg, resolve=True) if OmegaConf.is_config(cfg) else dict(cfg)
+            self._online_d2 = OnlineD2(
+                os.path.join(self.config.trainer.default_local_dir, "d2_online"),
+                options,
+            )
+            if self.config.trainer.total_epochs <= int(
+                self._predictor_cfg().get("activation", {}).get("min_epoch", 10)
+            ):
+                warnings.warn(
+                    "Training ends before D2 warm-up completes; scheduling will remain FCFS",
+                    stacklevel=2,
+                )
+            return
         if not self._d2_quality_enabled():
             return
         if self._scheduler_name() != "epws":
@@ -149,7 +178,11 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             except ValueError:
                 quality.status = "suspended"
                 self._predictor_ready = False
-                warnings.warn("Invalid D2 monitor row: scheduling falls back to FCFS", UserWarning, stacklevel=2)
+                warnings.warn(
+                    "Invalid D2 monitor row: scheduling falls back to FCFS",
+                    UserWarning,
+                    stacklevel=2,
+                )
                 break
 
     def _save_checkpoint(self):
@@ -158,6 +191,22 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             return
         predictor_path, state_path = self._predictor_checkpoint_paths()
         backend = self._predictor_backend()
+        online = getattr(self, "_online_d2", None)
+        if online is not None:
+            from .length_scheduler.d2_online import atomic_save
+
+            atomic_save(online.state_dict(), predictor_path)
+            state = {
+                "schema": "online-d2-lifecycle-v1",
+                "backend": backend,
+                "observed_rollouts": self._predictor_observed_rollouts,
+                "ready": self._predictor_ready,
+                "activation": dict(self._predictor_cfg().get("activation", {})),
+            }
+            with open(state_path + ".tmp", "w", encoding="utf-8") as stream:
+                json.dump(state, stream, sort_keys=True)
+            os.replace(state_path + ".tmp", state_path)
+            return
         if backend == LINEAR_BACKEND:
             self.actor_rollout_wg.save_predictor(predictor_path)
         state = build_lifecycle_state(
@@ -188,6 +237,24 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         with open(state_path, encoding="utf-8") as stream:
             state = json.load(stream)
         backend = self._predictor_backend()
+        online = getattr(self, "_online_d2", None)
+        if online is not None:
+            if state.get("schema") != "online-d2-lifecycle-v1" or state.get("backend") != backend:
+                raise ValueError("online D2 lifecycle/backend mismatch")
+            if state.get("activation") != dict(self._predictor_cfg().get("activation", {})):
+                raise ValueError("online D2 activation gates changed on resume")
+            online.load_state_dict(torch.load(predictor_path, map_location="cpu", weights_only=True))
+            if state["observed_rollouts"] != online.observed_rollouts:
+                raise ValueError("online D2 replay and lifecycle counts disagree")
+            if bool(state["ready"]) != (online.checkpoint is not None):
+                raise ValueError("online D2 readiness and checkpoint disagree")
+            if online.checkpoint is not None:
+                from .length_scheduler.checkpoint import file_sha256
+
+                self.actor_rollout_wg.load_d2_candidate(str(online.path), file_sha256(online.path))
+            self._predictor_observed_rollouts = online.observed_rollouts
+            self._predictor_ready = online.checkpoint is not None
+            return result
         if getattr(self, "_d2_quality", None) is not None:
             if state.get("backend", LINEAR_BACKEND) != backend:
                 raise ValueError("predictor backend mismatch on D2 quality resume")
@@ -233,6 +300,82 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
     def _predictor_enabled(self) -> bool:
         return self._predictor_cfg().get("enable", False)
 
+    def _d2_online_enabled(self) -> bool:
+        return (
+            self._predictor_enabled()
+            and self._predictor_backend() == DISTRIBUTION_BACKEND
+            and bool(self._predictor_cfg().get("d2_online", {}).get("enable", False))
+        )
+
+    def _needs_predictor_features(self, epoch: int) -> bool:
+        return self._predictor_active(epoch) or self._d2_online_enabled()
+
+    def _poll_online_d2(self):
+        online = getattr(self, "_online_d2", None)
+        if online is not None and online.poll():
+            from .length_scheduler.checkpoint import file_sha256
+
+            self.actor_rollout_wg.load_d2_candidate(str(online.path), file_sha256(online.path))
+            self._predictor_ready = True
+            print(
+                f"D2 online published version={online.version} "
+                f"trained_through_step={online.checkpoint['trained_through_step']}"
+            )
+        if online is not None and online.failure:
+            warnings.warn(
+                f"D2 CPU fit failed; retaining previous head: {online.failure}",
+                stacklevel=2,
+            )
+
+    def _observe_online_d2(self, predictions, completed, hidden):
+        online = getattr(self, "_online_d2", None)
+        if online is None:
+            return
+        n = int(self.config.actor_rollout_ref.rollout.n)
+        if "response_mask" in completed.batch:
+            mask = completed.batch["response_mask"]
+        else:
+            width = completed.batch["responses"].shape[-1]
+            mask = completed.batch["attention_mask"][:, -width:]
+        lengths = mask.sum(-1).detach().cpu().reshape(-1, n)
+        cap = int(self.config.actor_rollout_ref.rollout.response_length)
+        online.observe(
+            hidden[::n],
+            lengths,
+            lengths >= cap,
+            predictions.meta_info["d2_feature_keys"],
+            online.step + 1,
+        )
+        if "d2_expected" in predictions.batch and predictions.meta_info.get("predictor_ready", False):
+            from .length_scheduler.d2_online import spearman
+
+            expected = predictions.batch["d2_expected"].detach().cpu().reshape(-1, n)
+            p90 = predictions.batch["d2_p90"].detach().cpu().reshape(-1, n)
+            exact = (lengths < cap).all(-1)
+            score = predictions.batch["epws_predicted_work"].detach().cpu().reshape(-1, n).mean(-1)
+            correlation = spearman(score[exact], lengths[exact].float().mean(-1))
+            self._online_prediction_metrics = {
+                "predictor/online_spearman": correlation if correlation is not None else 0.0,
+                "predictor/online_spearman_defined": int(correlation is not None),
+                "predictor/online_evaluated_version": online.version,
+                "predictor/online_mae_tokens": float(
+                    (expected[exact].mean(-1) - lengths[exact].float().mean(-1)).abs().mean()
+                )
+                if exact.any()
+                else 0.0,
+                "predictor/online_exact_prompts": int(exact.sum()),
+                "predictor/online_p90_coverage_lower": float(((lengths < cap) & (lengths <= p90)).float().mean()),
+                "predictor/online_p90_coverage_upper": float((lengths <= p90).float().mean()),
+                "predictor/online_censored_fraction": float((lengths >= cap).float().mean()),
+            }
+        online.submit()
+        self._predictor_observed_rollouts = online.observed_rollouts
+
+    def close_predictor(self):
+        online = getattr(self, "_online_d2", None)
+        if online is not None:
+            online.close()
+
     def _scheduler_name(self) -> str:
         return str(self._predictor_cfg().get("scheduler", "static_snake"))
 
@@ -263,12 +406,12 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                         UserWarning,
                         stacklevel=2,
                     )
-        if active:
+        if active or self._d2_online_enabled():
             predictor_output = self.actor_rollout_wg.compute_predictor_score(gen_batch)
             ready = bool(predictor_output.meta_info.get("predictor_ready", False))
-            if ready:
+            if ready or self._d2_online_enabled():
                 gen_batch = gen_batch.union(predictor_output)
-            else:
+            if not ready:
                 active = False
         gen_batch.meta_info["epws_predictor_active"] = active
         return gen_batch
@@ -400,7 +543,11 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                 if input_id_list:
                     max_len = max(x.shape[-1] for x in input_id_list)
                     pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                    input_ids = torch.full((len(input_id_list), max_len), fill_value=pad_token_id, dtype=torch.long)
+                    input_ids = torch.full(
+                        (len(input_id_list), max_len),
+                        fill_value=pad_token_id,
+                        dtype=torch.long,
+                    )
                     attention_mask = torch.zeros((len(attn_mask_list), max_len), dtype=torch.long)
                     is_3d_pos = pos_id_list[0].dim() == 2
                     if is_3d_pos:
@@ -489,13 +636,22 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         """Pop a lightweight gen batch containing only predictor-required keys."""
         batch_keys = []
         if source_batch.batch is not None:
-            preferred_batch_keys = ["input_ids", "attention_mask", "position_ids", "prompts"]
+            preferred_batch_keys = [
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "prompts",
+            ]
             source_batch_keys = set(source_batch.batch.keys())
             batch_keys = [k for k in preferred_batch_keys if k in source_batch_keys]
             if not batch_keys:
                 batch_keys = list(source_batch_keys)
 
-        preferred_non_tensor_keys = ["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs"]
+        preferred_non_tensor_keys = [
+            "raw_prompt_ids",
+            "multi_modal_data",
+            "multi_modal_inputs",
+        ]
         non_tensor_batch_keys = [k for k in preferred_non_tensor_keys if k in source_batch.non_tensor_batch]
 
         gen_batch = source_batch.pop(batch_keys=batch_keys, non_tensor_batch_keys=non_tensor_batch_keys)
@@ -518,6 +674,20 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         raise ValueError("Cannot restore order: neither `uid` nor `extra_info.index` found in non_tensor_batch")
 
     def _maybe_update_predictor(self, gen_batch: DataProto, batch: DataProto, metrics, timing_raw):
+        online = getattr(self, "_online_d2", None)
+        if online is not None:
+            metrics.update(getattr(self, "_online_prediction_metrics", {}))
+            metrics.update(
+                {
+                    "predictor/observed_rollouts_cumulative": online.observed_rollouts,
+                    "predictor/online_version": online.version,
+                    "predictor/online_fit_pending": int(online.process is not None),
+                    "predictor/online_fit_failures": online.failures,
+                    "predictor/online_fit_seconds": float((online.checkpoint or {}).get("fit_seconds", 0)),
+                    "predictor/online_fit_loss": float((online.checkpoint or {}).get("fit_loss", 0)),
+                }
+            )
+            return
         with marked_timer("update_predictor", timing_raw, "orange"):
             prompt_length = batch.batch["prompts"].shape[-1]
             prompt_input_ids = batch.batch["prompts"]
@@ -588,7 +758,11 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             rollout_skip.wrap_generate_sequences()
 
         # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        progress_bar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_steps,
+            desc="Training Progress",
+        )
 
         # we start from step 1
         self.global_steps += 1
@@ -629,13 +803,15 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                     )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                self._poll_online_d2()
                 new_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                 num_gen_batches += 1
                 # print(f"new_batch{new_batch}")
                 gen_batch = self._get_gen_batch(new_batch)
                 # print(f"gen_batch{gen_batch}")
                 gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    repeat_times=self.config.actor_rollout_ref.rollout.n,
+                    interleave=True,
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -644,20 +820,20 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                     with marked_timer("predictor_score", timing_raw, "purple"):
                         if self._scheduler_name() == "epws":
                             predictor_order = None
-                            if self._predictor_active(epoch):
+                            if self._needs_predictor_features(epoch):
                                 with marked_timer("predictor_hydrate", timing_raw, "purple"):
                                     predictor_input_batch = gen_batch_output.select(deepcopy=True)
                                     predictor_input_batch = self._ensure_gen_batch_has_tensors(
                                         predictor_input_batch,
                                         new_batch.repeat(
-                                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                                            repeat_times=self.config.actor_rollout_ref.rollout.n,
+                                            interleave=True,
                                         ),
                                     )
                                     predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
                                 gen_batch_output = self._attach_epws_predictions(predictor_input_batch, epoch)
                             else:
-                                # Cold start is a true zero-predictor path: no
-                                # prompt hydration and no actor forward.
+                                # D1 cold start does not need a scoring forward.
                                 gen_batch_output.meta_info["epws_predictor_active"] = False
                         elif self._scheduler_name() == "static_snake":
                             with marked_timer("predictor_hydrate", timing_raw, "purple"):
@@ -665,7 +841,8 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                                 predictor_input_batch = self._ensure_gen_batch_has_tensors(
                                     predictor_input_batch,
                                     new_batch.repeat(
-                                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                                        repeat_times=self.config.actor_rollout_ref.rollout.n,
+                                        interleave=True,
                                     ),
                                 )
                                 predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
@@ -678,7 +855,13 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                     with marked_timer("gen", timing_raw, "red"):
                         # print(f'gen_batch_output{gen_batch_output}')
                         d2_forecasts = gen_batch_output
+                        d2_hidden = (
+                            gen_batch_output.batch.pop("d2_hidden")
+                            if gen_batch_output.batch is not None and "d2_hidden" in gen_batch_output.batch
+                            else None
+                        )
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        self._observe_online_d2(d2_forecasts, gen_batch_output, d2_hidden)
                         self._observe_d2_rollout(d2_forecasts, gen_batch_output, epoch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -708,10 +891,14 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                             del rm_scores, gen_baseline_batch, gen_baseline_output
 
                     new_batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
+                        [str(uuid.uuid4()) for _ in range(len(new_batch.batch))],
+                        dtype=object,
                     )
                     # repeat to align with repeated responses in rollout
-                    new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    new_batch = new_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n,
+                        interleave=True,
+                    )
                     self._apply_predictor_order(new_batch, predictor_order)
                     new_batch = new_batch.union(gen_batch_output)
 
@@ -742,7 +929,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             new_batch, kl_metrics = apply_kl_penalty(
-                                new_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                new_batch,
+                                kl_ctrl=self.kl_ctrl_in_reward,
+                                kl_penalty=self.config.algorithm.kl_penalty,
                             )
                             metrics.update(
                                 kl_metrics
@@ -768,7 +957,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                         # Collect the sequence reward for each trajectory
                         prompt_uid2metric_vals = defaultdict(list)
                         for uid, metric_val in zip(
-                            new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name], strict=True
+                            new_batch.non_tensor_batch["uid"],
+                            new_batch.non_tensor_batch[metric_name],
+                            strict=True,
                         ):
                             prompt_uid2metric_vals[uid].append(metric_val)
 
@@ -845,7 +1036,9 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                             batch = batch.union(values)
 
                     # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
-                    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+                    from verl.trainer.ppo.rollout_corr_helper import (
+                        compute_rollout_correction_and_add_to_batch,
+                    )
 
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:

@@ -24,16 +24,34 @@ class PredictorReviewRegressionTests(unittest.TestCase):
     def test_predictor_reorders_repeated_prompts_before_union_with_rollouts(self):
         fit_source = _function_source(TRAINER, "fit")
 
-        repeat_pos = fit_source.index(
-            "new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)"
-        )
-        reorder_pos = fit_source.index("self._apply_predictor_order(new_batch, predictor_order)")
-        union_pos = fit_source.index("new_batch = new_batch.union(gen_batch_output)")
+        statements = ast.walk(ast.parse(fit_source))
+        operations = {}
+        for node in statements:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "new_batch" for t in node.targets
+            ):
+                if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute):
+                    if node.value.func.attr == "repeat":
+                        operations["repeat"] = node.lineno
+                    elif (
+                        node.value.func.attr == "union"
+                        and node.value.args
+                        and isinstance(node.value.args[0], ast.Name)
+                        and node.value.args[0].id == "gen_batch_output"
+                    ):
+                        operations["union"] = node.lineno
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "_apply_predictor_order" and isinstance(node.args[0], ast.Name):
+                    if node.args[0].id == "new_batch":
+                        operations["reorder"] = node.lineno
+        repeat_pos, reorder_pos, union_pos = (operations[key] for key in ("repeat", "reorder", "union"))
 
         self.assertGreater(reorder_pos, repeat_pos)
         self.assertLess(reorder_pos, union_pos)
 
-    def test_predictor_worker_training_guards_small_response_length_and_uses_stable_shuffle(self):
+    def test_predictor_worker_training_guards_small_response_length_and_uses_stable_shuffle(
+        self,
+    ):
         update_source = _function_source(WORKER, "update_predictor")
 
         self.assertIn("max(1,", update_source)
@@ -71,15 +89,23 @@ class PredictorReviewRegressionTests(unittest.TestCase):
         self.assertIn("ImportError", update_source)
         self.assertIn("kendalltau", update_source)
 
-    def test_epws_cold_start_skips_prompt_hydration(self):
-        fit_source = _function_source(TRAINER, "fit")
+    def test_cold_d1_skips_features_but_online_d2_collects_before_activation(self):
+        from types import SimpleNamespace
 
-        active_guard = fit_source.index("if self._predictor_active(epoch):")
-        hydrate = fit_source.index("self._hydrate_gen_batch_model_inputs(predictor_input_batch)", active_guard)
-        cold_fallback = fit_source.index('gen_batch_output.meta_info["epws_predictor_active"] = False', active_guard)
-
-        self.assertLess(active_guard, hydrate)
-        self.assertLess(hydrate, cold_fallback)
+        source = _function_source(TRAINER, "_needs_predictor_features")
+        namespace = {}
+        exec(source, namespace)
+        needs_features = namespace["_needs_predictor_features"]
+        for active, online, expected in (
+            (False, False, False),
+            (False, True, True),
+            (True, False, True),
+        ):
+            value = SimpleNamespace(
+                _predictor_active=lambda epoch, active=active: active,
+                _d2_online_enabled=lambda online=online: online,
+            )
+            self.assertEqual(needs_features(value, 0), expected)
 
 
 if __name__ == "__main__":

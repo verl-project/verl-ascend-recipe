@@ -5,16 +5,23 @@ import socket
 
 import hydra
 import ray
+from recipe.dapo.dapo_ray_trainer import RayDAPOTrainer
 from recipe.dapo.main_dapo import DAPOTaskRunner
 from recipe.dapo_predictor.config import configure_predictor
 from recipe.dapo_predictor.predictor_dapo_trainer import PredictorRayDAPOTrainer
 from recipe.dapo_predictor.predictor_worker import PredictorAsyncActorRolloutRefWorker
+from recipe.dapo_predictor.rollout_logging import RolloutJSONMixin
+from recipe.dapo_predictor.runtime import close_rollout_servers
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
+
+
+class LoggedRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
+    """Upstream DAPO training with JSON-safe rollout metadata."""
 
 
 class PredictorDAPOTaskRunner(DAPOTaskRunner):
@@ -58,7 +65,8 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
         )
 
         local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+            config.actor_rollout_ref.model.path,
+            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
@@ -81,7 +89,12 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
             max_samples=config.data.get("val_max_samples", -1),
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
-        trainer = PredictorRayDAPOTrainer(
+        trainer_type = (
+            PredictorRayDAPOTrainer
+            if config.trainer.get("predictor_reorder", {}).get("enable", False)
+            else LoggedRayDAPOTrainer
+        )
+        trainer = trainer_type(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
@@ -93,8 +106,15 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        trainer.init_workers()
-        trainer.fit()
+        try:
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            try:
+                if hasattr(trainer, "close_predictor"):
+                    trainer.close_predictor()
+            finally:
+                close_rollout_servers(trainer)
 
 
 @hydra.main(config_path="../dapo/config", config_name="dapo_trainer", version_base=None)

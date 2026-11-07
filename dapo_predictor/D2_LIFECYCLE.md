@@ -1,4 +1,24 @@
-# Frozen D2 admission and monitoring
+# D2 training and activation
+
+## Default: online CPU fitting
+
+The default backend starts without a prediction checkpoint. Before each rollout, the actor extracts the configured hidden taps for one row per prompt group. The driver pairs those features with this rollout's sibling lengths and cap-censor flags before reward filtering or actor updates. Answers from the current rollout cannot affect the forecasts already used for it.
+
+A single CPU subprocess fits immutable replay snapshots. The replay retains up to 512 recent prompt observations by default, each with its sibling lengths. The first fit needs 32 observations. The head is a gated fusion of projected taps followed by mu/sigma prediction for standardized log(1 + response_tokens). Exact observations use Gaussian density; censored observations use the log survival function. PCA projection and label normalization are fitted once; subsequent candidates retain those transforms and warm-start head and AdamW state. Each job performs 50 minibatch updates by default.
+
+RL never waits for a pending fit. A busy fitter coalesces additional observations into its next snapshot instead of queueing multiple jobs. Before a new rollout, the driver polls for a completed candidate, validates its numeric/schema state, and loads the same hash-bound checkpoint onto every actor rank. Candidate loading finishes before any rank scores the batch. A fit failure leaves the previous head in place, or FCFS if no head has been published. An all-rank load failure aborts to prevent mixed heads.
+
+EWS remains FCFS until all three conditions hold: ten complete RL dataset passes, 2560 observed rollout responses, and a published head. These gates are configurable in epochs and sample count; there is no step-based activation. Head training continues during and after warm-up. There is no error-threshold retraining rule or automatic D1/D2 switch. CPU fitting can overlap NPU work, but hidden extraction, transfer and candidate publication still have costs that must be measured.
+
+Pre-response forecasts are evaluated against future completed outputs before adding their labels to training. Metrics include prompt-level Spearman of scheduling risk vs observed mean length, token MAE on fully uncensored prompt groups, p90 coverage lower/upper bounds and censored fraction. Constant forecasts or fewer than two exact prompts mark correlation undefined rather than manufacturing a score. Training loss is a separate metric. Repeated responses from the same prompt do not establish cross-prompt generalization.
+
+Online checkpoints save the bounded replay, fixed feature schema/transforms, head, optimizer, published version, data cutoff and observation counters. An unfinished background job is not a published head; restored pending observations can be fitted again. Resume validates the backend, configuration, activation gates and replay/head counters before loading. Saving only an external weight path is insufficient for online resume.
+
+For a short run ending at or before the warm-up boundary, the code warns that scheduling remains FCFS. A 20-epoch run leaves ten epochs after the default boundary, but does not guarantee that this amortizes overhead for every dataset size or model. Use the public launcher and device workload in [README.md](README.md).
+
+## Explicit compatibility: external frozen D2
+
+This section applies when `d2_online.enable=false`, for example by supplying `D2_CANDIDATE_REPORT` to the launcher. It does not describe default online training.
 
 D2 uses an externally trained multi-tap LogNormal checkpoint. The recipe loads and validates that checkpoint; it does not collect a D2 training dataset or fit the head. Configure the shared candidate-report path before launch. All actor ranks must be able to read the immutable weight file named by the report.
 

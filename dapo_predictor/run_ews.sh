@@ -8,7 +8,7 @@ set -euo pipefail
 : "${OUTPUT_DIR:?Set OUTPUT_DIR to a run-specific checkpoint directory}"
 
 python_bin="${PYTHON:-python3}"
-backend="${BACKEND:-linear_listmle}"
+backend="${BACKEND:-censored_lognormal}"
 npu_count="${NPU_COUNT:-2}"
 tp_size="${TP_SIZE:-1}"
 batch_size="${BATCH_SIZE:-8}"
@@ -47,6 +47,7 @@ command=(
     data.truncation=error
     "actor_rollout_ref.model.path=$MODEL_PATH"
     actor_rollout_ref.model.use_remove_padding=false
+    ++actor_rollout_ref.model.override_config.attn_implementation=sdpa
     actor_rollout_ref.model.enable_gradient_checkpointing=true
     actor_rollout_ref.actor.strategy=fsdp
     actor_rollout_ref.actor.optim.lr=1e-6
@@ -65,6 +66,7 @@ command=(
     actor_rollout_ref.rollout.mode=async
     "actor_rollout_ref.rollout.tensor_model_parallel_size=$tp_size"
     "actor_rollout_ref.rollout.n=${ROLLOUT_N:-2}"
+    "actor_rollout_ref.rollout.max_num_seqs=${SLOTS_PER_SERVER:-8}"
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5
@@ -76,13 +78,14 @@ command=(
     "trainer.n_gpus_per_node=$npu_count"
     trainer.nnodes=1
     trainer.device=npu
+    trainer.use_legacy_worker_impl=enable
     'trainer.logger=["console"]'
     trainer.project_name=dapo-ews
     trainer.experiment_name=ews
     trainer.val_before_train=false
     trainer.test_freq=-1
     "trainer.save_freq=${SAVE_FREQ:-10}"
-    "trainer.total_epochs=${TOTAL_EPOCHS:-12}"
+    "trainer.total_epochs=${TOTAL_EPOCHS:-20}"
     "trainer.default_local_dir=$OUTPUT_DIR"
     trainer.resume_mode=disable
     "+trainer.predictor_reorder.enable=${PREDICTOR_ENABLE:-true}"
@@ -100,8 +103,12 @@ command=(
     +trainer.predictor_reorder.epws.max_concurrent_requests=null
 )
 if [[ "$backend" == censored_lognormal ]]; then
-    : "${D2_CANDIDATE_REPORT:?Set D2_CANDIDATE_REPORT to the shared external validation report path}"
-    command+=("+trainer.predictor_reorder.d2_lifecycle.candidate_report=$D2_CANDIDATE_REPORT")
+    if [[ -n "${D2_CANDIDATE_REPORT:-}" ]]; then
+        command+=(+trainer.predictor_reorder.d2_online.enable=false
+            "+trainer.predictor_reorder.d2_lifecycle.candidate_report=$D2_CANDIDATE_REPORT")
+    else
+        command+=(+trainer.predictor_reorder.d2_online.enable=true)
+    fi
 fi
 if [[ "${1:-}" == --dry-run ]]; then
     shift

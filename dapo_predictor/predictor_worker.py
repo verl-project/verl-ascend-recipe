@@ -12,13 +12,26 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from verl import DataProto
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
-from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+from verl.single_controller.base.decorator import (
+    Dispatch,
+    make_nd_compute_dataproto_dispatch_fn,
+    register,
+)
+from verl.utils.attention_utils import (
+    index_first_axis,
+    pad_input,
+    rearrange,
+    unpad_input,
+)
 from verl.utils.device import get_device_id
 from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.utils.profiler import DistProfiler
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.utils.ulysses import (
+    gather_outputs_and_unpad,
+    ulysses_pad,
+    ulysses_pad_and_slice_inputs,
+)
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
 
@@ -46,6 +59,8 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
         self.predictor_calibration_tokens = torch.empty((0,), dtype=torch.float32)
         self.distribution_predictor: CensoredLogNormalPredictor | None = None
         if torch.distributed.is_initialized():
+            if self.device_name != "cpu":
+                self.predictor_scorer = self.predictor_scorer.to(torch.device(self.device_name, get_device_id()))
             for param in self.predictor_scorer.parameters():
                 torch.distributed.broadcast(param.data, src=0)
 
@@ -140,7 +155,8 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
                 else:
                     for key in micro_batch["multi_modal_inputs"][0].keys():
                         multi_modal_inputs[key] = torch.cat(
-                            [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
+                            [inputs[key] for inputs in micro_batch["multi_modal_inputs"]],
+                            dim=0,
                         )
 
             # Handle position_ids dimensionality for Qwen2VL mrope
@@ -161,15 +177,22 @@ class PredictorDataParallelPPOActor(DataParallelPPOActor):
                     )  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
                 else:
                     position_ids_rmpad = index_first_axis(
-                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                        indices,
                     ).transpose(0, 1)
 
                 # Unpad multi-modal inputs
                 if "image_bound" in multi_modal_inputs:
-                    from verl.utils.dataset.vision_utils import process_multi_modal_inputs_for_minicpmo
+                    from verl.utils.dataset.vision_utils import (
+                        process_multi_modal_inputs_for_minicpmo,
+                    )
 
                     multi_modal_inputs = process_multi_modal_inputs_for_minicpmo(
-                        input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        cu_seqlens,
+                        multi_modal_inputs,
                     )
 
                 # Ulysses sequence parallel processing
@@ -285,7 +308,8 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             if backend == "censored_lognormal":
                 checkpoint = cfg.get("d2_checkpoint")
                 quality_enabled = cfg.get("d2_lifecycle", {}).get("enable", True)
-                if not checkpoint and not quality_enabled:
+                online = cfg.get("d2_online", {}).get("enable", False)
+                if not checkpoint and not quality_enabled and not online:
                     raise ValueError("predictor_reorder.d2_checkpoint is required for censored_lognormal")
                 self.actor.distribution_predictor = (
                     CensoredLogNormalPredictor.from_checkpoint(checkpoint) if checkpoint else None
@@ -304,7 +328,7 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_d2_candidate(self, path: str, expected_sha256: str) -> None:
-        """Load one admitted immutable candidate on every actor rank, never train it."""
+        """Load a completed CPU candidate on all actor ranks at a batch boundary."""
         if str(self._predictor_cfg().get("backend", "linear_listmle")) != "censored_lognormal":
             raise RuntimeError("load_d2_candidate is only valid for censored_lognormal")
         if file_sha256(path) != expected_sha256:
@@ -347,7 +371,12 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 {
                     "weight": self.actor.predictor_scorer.weight.detach().cpu(),
                     "length_calibration": (
-                        None if calibration is None else {"scores": calibration.scores, "tokens": calibration.tokens}
+                        None
+                        if calibration is None
+                        else {
+                            "scores": calibration.scores,
+                            "tokens": calibration.tokens,
+                        }
                     ),
                     "calibration_hidden": self.actor.predictor_calibration_hidden,
                     "calibration_tokens": self.actor.predictor_calibration_tokens,
@@ -375,7 +404,8 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             else MonotoneCalibration(tuple(calibration["scores"]), tuple(calibration["tokens"]))
         )
         self.actor.predictor_calibration_hidden = checkpoint.get(
-            "calibration_hidden", torch.empty((0, self.actor.predictor_scorer.in_features))
+            "calibration_hidden",
+            torch.empty((0, self.actor.predictor_scorer.in_features)),
         ).float()
         self.actor.predictor_calibration_tokens = checkpoint.get("calibration_tokens", torch.empty(0)).float()
 
@@ -438,26 +468,42 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         with self.ulysses_sharding_manager:
             if backend == "censored_lognormal":
                 predictor = self.actor.distribution_predictor
-                if predictor is None:
+                online = bool(cfg.get("d2_online", {}).get("enable", False))
+                if predictor is None and not online:
                     raise RuntimeError("censored_lognormal predictor was not initialized")
-                feature_keys = predictor.prior.feature_keys
+                if predictor is None:
+                    model_config = self.actor_module_fsdp.config
+                    model_config = getattr(model_config, "text_config", model_config)
+                    depth = int(model_config.num_hidden_layers)
+                    taps = sorted({1 + (depth - 1) * index // 4 for index in range(5)})
+                    feature_keys = tuple(cfg.get("d2_online", {}).get("feature_keys", [f"layer_{i}" for i in taps]))
+                else:
+                    feature_keys = predictor.prior.feature_keys
                 try:
                     layer_indices = tuple(int(key.removeprefix("layer_")) for key in feature_keys)
                 except ValueError as error:
                     raise ValueError("D2 feature keys must use the layer_<index> schema") from error
                 hidden_by_index = self.actor.extract_hidden_taps(sampled_data, layer_indices)
-                predictions = predictor.predict_distribution_batch(
-                    {key: hidden_by_index[index] for key, index in zip(feature_keys, layer_indices, strict=True)}
+                predictions = (
+                    predictor.predict_distribution_batch(
+                        {key: hidden_by_index[index] for key, index in zip(feature_keys, layer_indices, strict=True)}
+                    )
+                    if predictor is not None
+                    else None
                 )
                 risk_weight = float(cfg.get("risk_weight", 0.5))
                 actor_device = next(self.actor_module_fsdp.parameters()).device
                 predicted_work_per_prompt = torch.tensor(
-                    [row.as_length_prediction().risk(risk_weight) for row in predictions],
+                    (
+                        [row.as_length_prediction().risk(risk_weight) for row in predictions]
+                        if predictions is not None
+                        else [float("nan")] * len(sample_indices)
+                    ),
                     device=actor_device,
                     dtype=torch.float32,
                 )
                 scores = predicted_work_per_prompt
-                predictor_ready = True
+                predictor_ready = predictor is not None
             else:
                 sampled_hidden_states = self.actor.extract_hidden_states(data=sampled_data)
                 with torch.no_grad():
@@ -485,16 +531,33 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             predictor_scores[sample_idx : min(sample_idx + n, batch_size)] = scores[i]
             predicted_work[sample_idx : min(sample_idx + n, batch_size)] = predicted_work_per_prompt[i]
 
-        tensors = {"predictor_scores": predictor_scores, "epws_predicted_work": predicted_work}
+        tensors = {
+            "predictor_scores": predictor_scores,
+            "epws_predicted_work": predicted_work,
+        }
         if backend == "censored_lognormal":
+            if online:
+                tensors["d2_hidden"] = torch.stack(
+                    [hidden_by_index[index] for index in layer_indices], dim=1
+                ).repeat_interleave(n, dim=0)[:batch_size]
             for key in ("expected", "median", "p90"):
                 values = torch.tensor(
-                    [getattr(row, key) for row in predictions], device=scores.device, dtype=torch.float32
+                    (
+                        [getattr(row, key) for row in predictions]
+                        if predictions is not None
+                        else [float("nan")] * len(sample_indices)
+                    ),
+                    device=scores.device,
+                    dtype=torch.float32,
                 )
                 tensors[f"d2_{key}"] = values.repeat_interleave(n)[:batch_size]
         output = DataProto.from_dict(
             tensors=tensors,
-            meta_info={"predictor_ready": predictor_ready, "predictor_backend": backend},
+            meta_info={
+                "predictor_ready": predictor_ready,
+                "predictor_backend": backend,
+                **({"d2_feature_keys": feature_keys} if backend == "censored_lognormal" else {}),
+            },
         ).to("cpu")
         if self._pending_offload_param_restore is not None:
             self._is_offload_param = self._pending_offload_param_restore
@@ -603,6 +666,8 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             predictor.parameters(),
             lr=cfg.get("lr", 3e-5),
             weight_decay=cfg.get("weight_decay", 1e-4),
+            foreach=False,
+            fused=False,
         )
         dataset = TensorDataset(hidden_states.float(), response_lengths.float())
         predictor_seed = int(cfg.get("seed", 1))
@@ -663,7 +728,11 @@ class PredictorAsyncActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         if calibration_max_samples < 2:
             raise ValueError("predictor_reorder.calibration_max_samples must be at least 2")
         replay_hidden = torch.cat(
-            [self.actor.predictor_calibration_hidden, hidden_states.detach().cpu().float()], dim=0
+            [
+                self.actor.predictor_calibration_hidden,
+                hidden_states.detach().cpu().float(),
+            ],
+            dim=0,
         )[-calibration_max_samples:]
         replay_tokens = torch.cat([self.actor.predictor_calibration_tokens, token_lengths], dim=0)[
             -calibration_max_samples:

@@ -21,6 +21,7 @@ from dapo_predictor.length_scheduler.checkpoint import (
     validate_lifecycle_state,
 )
 from dapo_predictor.length_scheduler.d2_quality import D2QualityConfig, D2QualityLifecycle
+from dapo_predictor.rollout_logging import RolloutJSONMixin
 
 torch = pytest.importorskip("torch")
 
@@ -29,6 +30,11 @@ class Proto:
     def __init__(self, batch, meta_info=None):
         self.batch = batch
         self.meta_info = meta_info or {}
+
+    def union(self, other):
+        self.batch.update(other.batch)
+        self.meta_info.update(other.meta_info)
+        return self
 
 
 @pytest.fixture
@@ -41,6 +47,7 @@ def trainer_type():
     base = type("Base", (), {"_load_checkpoint": lambda self: None, "_save_checkpoint": lambda self: None})
     namespace = dict(
         RayDAPOTrainer=base,
+        RolloutJSONMixin=RolloutJSONMixin,
         D2QualityConfig=D2QualityConfig,
         D2QualityLifecycle=D2QualityLifecycle,
         DISTRIBUTION_BACKEND=DISTRIBUTION_BACKEND,
@@ -98,6 +105,28 @@ def test_d1_does_not_enter_new_lifecycle(trainer_type):
     assert not value._predictor_active(9)
     value._d2_epoch_boundary(10)
     value.actor_rollout_wg.load_d2_candidate.assert_not_called()
+
+
+def test_online_cold_start_returns_training_features_without_enabling_admission(trainer_type):
+    value = trainer_type()
+    config = {
+        "enable": True,
+        "backend": "censored_lognormal",
+        "d2_online": {"enable": True},
+        "activation": {"min_epoch": 10, "min_samples": 2560},
+    }
+    value.config = SimpleNamespace(trainer=SimpleNamespace(get=lambda key, default=None: config))
+    value._predictor_ready = False
+    value._predictor_observed_rollouts = 0
+    value._d2_quality = None
+    hidden = torch.ones((2, 3, 4))
+    result = Proto(
+        {"d2_hidden": hidden, "epws_predicted_work": torch.full((2,), float("nan"))}, {"predictor_ready": False}
+    )
+    value.actor_rollout_wg = SimpleNamespace(compute_predictor_score=lambda data: result)
+    output = value._attach_epws_predictions(Proto({}), epoch=0)
+    assert torch.equal(output.batch["d2_hidden"], hidden)
+    assert not output.meta_info["epws_predictor_active"]
 
 
 def test_twenty_is_warning_not_disable_gate(trainer_type):

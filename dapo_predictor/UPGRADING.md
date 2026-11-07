@@ -19,7 +19,7 @@ Inference server selection belongs to verl's `GlobalRequestLoadBalancer`. EWS ha
 1. Read the target verl and rollout-backend release requirements. Select matching PyTorch/torch-npu, CANN, vLLM and vLLM-Ascend builds; do not upgrade just one package inside a shared container.
 2. Create an isolated checkout/environment. Compare the pinned contracts above with the target source before changing `REQUIRED_VERL.txt`.
 3. Run the CPU suites and configuration composition in [VALIDATION.md](VALIDATION.md). Keep D1 output dtype, grouped row order, response-mask labels and checkpoint behavior covered.
-4. On allocated devices, execute the baseline, cold-start, activated D1, save/resume and optional D2 admission/fallback paths through the documented launcher.
+4. On allocated devices, execute the baseline, default online D2 cold-start/fitting/activation, checkpoint/resume and normal exit through the documented launcher. Check D1 when using that optional backend and the external D2 admission/fallback path when selecting frozen weights.
 5. Check output/reward alignment, the global in-flight bound, generation token count, predictor overhead and normal shutdown. Measure both rollout and full-step time.
 6. Update the tested-version table and installer pin only after validation on that combination. If an actor/model/tokenizer/tap schema changes, collect matching D2 features and validate its checkpoint again.
 
