@@ -89,7 +89,7 @@ command=(
     "trainer.default_local_dir=$OUTPUT_DIR"
     trainer.resume_mode=disable
     "+trainer.predictor_reorder.enable=${PREDICTOR_ENABLE:-true}"
-    +trainer.predictor_reorder.scheduler=epws
+    +trainer.predictor_reorder.scheduler=ews
     "+trainer.predictor_reorder.backend=$backend"
     "+trainer.predictor_reorder.activation.min_epoch=${MIN_EPOCH:-10}"
     "+trainer.predictor_reorder.activation.min_samples=${MIN_SAMPLES:-2560}"
@@ -99,8 +99,8 @@ command=(
     +trainer.predictor_reorder.weight_decay=1e-4
     +trainer.predictor_reorder.seed=1
     +trainer.predictor_reorder.calibration_max_samples=4096
-    "+trainer.predictor_reorder.epws.slots_per_server=${SLOTS_PER_SERVER:-8}"
-    +trainer.predictor_reorder.epws.max_concurrent_requests=null
+    "+trainer.predictor_reorder.ews.slots_per_server=${SLOTS_PER_SERVER:-8}"
+    +trainer.predictor_reorder.ews.max_concurrent_requests=null
 )
 if [[ "$backend" == censored_lognormal ]]; then
     if [[ -n "${D2_CANDIDATE_REPORT:-}" ]]; then

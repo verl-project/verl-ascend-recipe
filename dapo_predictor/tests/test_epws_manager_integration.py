@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("verl")
 
 from dapo_predictor.epws_manager import EPWSAgentLoopManager
+from dapo_predictor.ews_manager import EWSAgentLoopManager
 from verl.protocol import DataProto
 
 
@@ -31,11 +32,12 @@ class _FakeWorker:
         self.generate_sequences = _RemoteGenerate(starts)
 
 
-def test_manager_admits_long_first_and_restores_original_batch_order() -> None:
+@pytest.mark.parametrize("manager_type,section", [(EWSAgentLoopManager, "ews"), (EPWSAgentLoopManager, "epws")])
+def test_manager_admits_long_first_and_restores_original_batch_order(manager_type, section) -> None:
     starts: list[int] = []
-    manager = EPWSAgentLoopManager.__new__(EPWSAgentLoopManager)
+    manager = manager_type.__new__(manager_type)
     manager.config = SimpleNamespace(
-        trainer={"predictor_reorder": {"epws": {"slots_per_server": 1, "max_concurrent_requests": 1}}}
+        trainer={"predictor_reorder": {section: {"slots_per_server": 1, "max_concurrent_requests": 1}}}
     )
     manager.server_handles = [object()]
     manager.agent_loop_workers = [_FakeWorker(starts), _FakeWorker(starts)]
@@ -56,6 +58,8 @@ def test_manager_admits_long_first_and_restores_original_batch_order() -> None:
     assert output.batch["row_id"].tolist() == [0, 1, 2]
     assert output.meta_info["timing"]["epws/predicted_long_first"] == 3
     assert output.meta_info["timing"]["epws/fcfs_fallback"] == 0
+    assert output.meta_info["timing"]["ews/predicted_long_first"] == 3
+    assert output.meta_info["timing"]["ews/max_concurrent_requests"] == 1
 
 
 @pytest.mark.parametrize("invalid", [None, float("nan"), float("inf"), -1.0, "bad", True])

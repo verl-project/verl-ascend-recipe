@@ -8,7 +8,7 @@ from .lifecycle import PredictorLifecycle
 from .types import DispatchDecision, WaitingRequest
 
 
-class EPWSWaitingPool:
+class EWSWaitingPool:
     """Choose the next request whenever the runtime exposes a free slot.
 
     Before predictor activation this is stable FCFS. After activation it is
@@ -55,3 +55,7 @@ class EPWSWaitingPool:
             reason=reason,
             predicted_work=request.predicted_work,
         )
+
+
+# Compatibility for callers importing the former public class name.
+EPWSWaitingPool = EWSWaitingPool

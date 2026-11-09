@@ -137,19 +137,19 @@ For a matched standard-DAPO baseline, use `PREDICTOR_ENABLE=false` with the same
 
 ## Predictor configuration
 
-The legacy `epws` configuration keys, Python class names and metric prefixes remain compatible with the EWS display name.
+Use `scheduler=ews` and the `ews` capacity settings. Legacy `epws` configurations and imports remain accepted; conflicting old and new capacity settings are rejected.
 
 | Option under `trainer.predictor_reorder` | Default | Meaning |
 | --- | --- | --- |
 | `enable` | false in the library; true in run_ews.sh | Opt in to predictor worker and scheduling |
-| `scheduler` | epws when enabled | EWS; static_snake remains an explicit D1 option |
+| `scheduler` | ews when enabled | EWS; static_snake remains an explicit D1 option |
 | `backend` | censored_lognormal when enabled | D2; linear_listmle selects D1 |
 | `activation.min_epoch` | 10 | Completed RL dataset passes before activation |
 | `activation.min_samples` | 2560 | Observed rollout-request count |
 | `epochs / batch_size / lr / weight_decay` | 10 / 32 / 3e-5 / 1e-4 | D1 optimizer settings |
 | `calibration_max_samples` | 4096 | D1 historical prompt/length replay capacity |
-| `epws.slots_per_server` | 8 | Admission capacity per server |
-| `epws.max_concurrent_requests` | null | Explicit global window; null derives servers × slots |
+| `ews.slots_per_server` | 8 | Admission capacity per server |
+| `ews.max_concurrent_requests` | null | Explicit global window; null derives servers × slots |
 | `risk_weight` | 0.5 | D2 tail-risk weight |
 | `d2_online.enable` | true for D2 without external checkpoint/report | Background incremental fitting |
 | `d2_online.min_fit_prompts` | 32 | Prompt observations before the first fit |
@@ -177,7 +177,7 @@ Supplying `D2_CANDIDATE_REPORT` explicitly selects the external frozen workflow.
 | File | Responsibility |
 | --- | --- |
 | `config.py`, `main_dapo_predictor_reorder.py` | Validate opt-in settings, choose the worker and register the manager |
-| `epws_manager.py` | Bound requests in flight, refill after completion and restore original output order |
+| `ews_manager.py` | Bound requests in flight, refill after completion and restore original output order |
 | `predictor_dapo_trainer.py` | Activation, scoring, DAPO training-loop integration and checkpoint lifecycle |
 | `predictor_worker.py` | Pre-rollout hidden taps, D1 fitting/calibration, D2 inference and all-rank loading RPCs |
 | `length_scheduler/d2_online.py` | Bounded replay, asynchronous CPU fitting, optimizer and publication |

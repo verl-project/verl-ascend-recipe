@@ -87,8 +87,8 @@ class PredictorRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
 
             from .length_scheduler.d2_online import OnlineD2
 
-            if self._scheduler_name() != "epws":
-                raise ValueError("online D2 requires scheduler=epws")
+            if self._scheduler_name() != "ews":
+                raise ValueError("online D2 requires scheduler=ews")
             cfg = self._predictor_cfg().get("d2_online", {})
             options = OmegaConf.to_container(cfg, resolve=True) if OmegaConf.is_config(cfg) else dict(cfg)
             self._online_d2 = OnlineD2(
@@ -105,8 +105,8 @@ class PredictorRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
             return
         if not self._d2_quality_enabled():
             return
-        if self._scheduler_name() != "epws":
-            raise ValueError("D2 quality lifecycle requires scheduler=epws; disable it explicitly for legacy snake")
+        if self._scheduler_name() != "ews":
+            raise ValueError("D2 quality lifecycle requires scheduler=ews; disable it explicitly for legacy snake")
         cfg = self._predictor_cfg()
         lifecycle = cfg.get("d2_lifecycle", {})
         activation = cfg.get("activation", {})
@@ -377,7 +377,8 @@ class PredictorRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
             online.close()
 
     def _scheduler_name(self) -> str:
-        return str(self._predictor_cfg().get("scheduler", "static_snake"))
+        name = str(self._predictor_cfg().get("scheduler", "static_snake"))
+        return "ews" if name == "epws" else name
 
     def _predictor_active(self, epoch: int) -> bool:
         activation = self._predictor_cfg().get("activation", {})
@@ -818,7 +819,7 @@ class PredictorRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
 
                 with marked_timer("step", timing_raw):
                     with marked_timer("predictor_score", timing_raw, "purple"):
-                        if self._scheduler_name() == "epws":
+                        if self._scheduler_name() == "ews":
                             predictor_order = None
                             if self._needs_predictor_features(epoch):
                                 with marked_timer("predictor_hydrate", timing_raw, "purple"):
@@ -849,7 +850,7 @@ class PredictorRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
                             predictor_order = self._build_predictor_order(predictor_input_batch)
                             self._apply_predictor_order(gen_batch_output, predictor_order)
                         else:
-                            raise ValueError("trainer.predictor_reorder.scheduler must be 'epws' or 'static_snake'")
+                            raise ValueError("trainer.predictor_reorder.scheduler must be 'ews' or 'static_snake'")
                         # print(f'predictor_scores{predictor_scores}')
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):

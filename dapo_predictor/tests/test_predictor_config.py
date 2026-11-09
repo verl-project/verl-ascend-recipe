@@ -11,7 +11,7 @@ from dapo_predictor.config import configure_predictor
 def _config(**overrides):
     predictor = {
         "enable": True,
-        "scheduler": "epws",
+        "scheduler": "ews",
         "backend": "linear_listmle",
         **overrides,
     }
@@ -44,7 +44,7 @@ def test_ews_wiring_preserves_other_agent_options(backend):
     configure_predictor(config)
     assert config.actor_rollout_ref.predictor_reorder.backend == backend
     assert config.actor_rollout_ref.rollout.agent.num_workers == 2
-    assert config.actor_rollout_ref.rollout.agent.agent_loop_manager_class.endswith(".EPWSAgentLoopManager")
+    assert config.actor_rollout_ref.rollout.agent.agent_loop_manager_class.endswith(".EWSAgentLoopManager")
 
 
 def test_static_snake_keeps_existing_manager():
@@ -83,8 +83,22 @@ def test_default_enabled_recipe_selects_online_d2_and_ews():
     del config.trainer.predictor_reorder.scheduler
     configure_predictor(config)
     assert config.actor_rollout_ref.predictor_reorder.backend == "censored_lognormal"
-    assert config.actor_rollout_ref.predictor_reorder.scheduler == "epws"
+    assert config.actor_rollout_ref.predictor_reorder.scheduler == "ews"
     assert config.actor_rollout_ref.predictor_reorder.d2_online.enable
+
+
+def test_legacy_scheduler_and_capacity_are_normalized():
+    config = _config(scheduler="epws", epws={"slots_per_server": 3})
+    configure_predictor(config)
+    assert config.trainer.predictor_reorder.scheduler == "ews"
+    assert config.actor_rollout_ref.predictor_reorder.ews.slots_per_server == 3
+    assert "epws" not in config.trainer.predictor_reorder
+
+
+def test_conflicting_capacity_names_are_rejected():
+    config = _config(ews={"slots_per_server": 3}, epws={"slots_per_server": 8})
+    with pytest.raises(ValueError, match="conflicting"):
+        configure_predictor(config)
 
 
 def test_external_report_preserves_frozen_compatibility():

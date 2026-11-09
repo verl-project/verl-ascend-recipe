@@ -7,7 +7,7 @@ The recipe is pinned to verl commit `bcb638649a50e58494a8ddd92085ad1174f674b8`. 
 | Integration | Dependencies to check | Files | Typical work |
 | --- | --- | --- | --- |
 | Manager registration | `rollout.agent.agent_loop_manager_class`, worker handles, server handles | `config.py`, `main_dapo_predictor_reorder.py` | None if the extension contract is unchanged; low for configuration/import changes |
-| Bounded dispatch | `AgentLoopManager.generate_sequences`, awaitable worker RPCs, DataProto slicing/concat, per-row metrics | `epws_manager.py` | Low for field/method changes; medium if worker batching or RPC semantics change |
+| Bounded dispatch | `AgentLoopManager.generate_sequences`, awaitable worker RPCs, DataProto slicing/concat, per-row metrics | `ews_manager.py` | Low for field/method changes; medium if worker batching or RPC semantics change |
 | Actor representation | FSDP worker/actor classes, hidden-state outputs, padding, dynamic batches, Ulysses/SP gather | `predictor_worker.py` | Medium for hidden-state layout, sharding or offload changes |
 | Trainer lifecycle | DAPO fit order, reward/filtering, actor updates, checkpoint manager and dataloader resume | `predictor_dapo_trainer.py` | Medium for local API changes; high for training-loop or checkpoint orchestration redesign |
 | Predictor math | PyTorch CPU tensor operations, checkpoint schema and projection/tap identity | `length_scheduler/` | No backend-specific changes if these inputs remain unchanged; re-fit/revalidate for a changed model or feature schema |
