@@ -26,7 +26,14 @@ D2 uses an externally trained multi-tap LogNormal checkpoint. The recipe loads a
 
 The checkpoint is a torch.save mapping with feature_keys (layer_<index> taps), projection_dim, projection_bank, standardized_sigma_floor, head_state_dict, log_length_center and log_length_scale. The projection bank contains center, components and scale tensors per tap. The head predicts a Gaussian over standardized log(1 + response_tokens); inference reverses the standardization before computing token statistics. Use the same actor, tokenizer, chat template and tap schema when collecting features and deploying the checkpoint.
 
-The external collector/trainer must produce held-out, pre-response forecasts in the JSONL format below. A JSONL of forecasts alone does not train a head. See [README](README.md#predictor-configuration) for the D2 launch options.
+The external collector/trainer must produce held-out, pre-response forecasts in the JSONL format below. A JSONL of forecasts alone does not train a head. After preparing the report, use the environment from the [README](README.md#4-launch-and-configuration):
+
+```bash
+BACKEND=censored_lognormal \
+D2_CANDIDATE_REPORT=/absolute/shared/path/d2-candidate.json \
+OUTPUT_DIR="$WORK_ROOT/runs/d2-external" \
+  bash recipe/dapo_predictor/run_ews.sh
+```
 
 ## Fitting and validation
 
