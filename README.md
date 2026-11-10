@@ -61,6 +61,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | grpo/router_replay | [`grpo/router_replay/REQUIRED_VERL.txt`](grpo/router_replay/REQUIRED_VERL.txt) |
 | mopd | [`mopd/REQUIRED_VERL.txt`](mopd/REQUIRED_VERL.txt) — [Qwen3 multi-teacher FSDP recipe](verl_ascend_practice/reports/mopd/README.md) |
 | retool | [`recipe/retool/REQUIRED_VERL.txt`](retool/REQUIRED_VERL.txt) |
+| atrl | [`atrl/REQUIRED_VERL.txt`](atrl/REQUIRED_VERL.txt) |
 
 ## Contribution
 
