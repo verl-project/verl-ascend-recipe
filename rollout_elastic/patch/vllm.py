@@ -135,8 +135,17 @@ if ServerAdapter is not None:
 
     @patch(ServerAdapter, "update_weights")
     @torch.no_grad()
-    async def update_weights(self, weights, global_steps: int = None, **kwargs):
+    async def update_weights(
+        self,
+        weights,
+        global_steps: int = None,
+        wire_format: str = "named_tensors",
+        **kwargs,
+    ):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+        assert wire_format == "named_tensors", (
+            f"vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
+        )
         start_time = time.time()
         attempt_id = kwargs.get("attempt_id")
         target_version = kwargs.get("target_version")
@@ -229,7 +238,10 @@ if vLLMHttpServer is not None:
         request_id: str,
         image_data=None,
         video_data=None,
+        audio_data=None,
+        mm_processor_kwargs=None,
         priority: int = 0,
+        kv_transfer_params=None,
         progress_ctx=None,
     ):
         """Generate sequence with token-in-token-out.
@@ -244,15 +256,24 @@ if vLLMHttpServer is not None:
         from vllm.inputs import TokensPrompt
         from vllm.lora.request import LoRARequest
 
+        if progress_ctx is not None:
+            from verl.workers.rollout.fault_tolerance import ServerUnavailable
+
+            expected_version = progress_ctx.checkpoint.model_weight_version
+            actual_version = str(self.global_steps) if self.global_steps is not None else None
+            if expected_version != actual_version:
+                # A sync raced with client preparation. Reject before producing tokens.
+                raise ServerUnavailable("<version-change>")
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
-        if max_possible_tokens < 0:
+        if max_possible_tokens < 1:
             raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
-                f"({self.config.max_model_len})."
+                f"Prompt length ({len(prompt_ids)}) leaves no generation token space under the model's "
+                f"maximum context length ({self.config.max_model_len})."
             )
 
         # Determine max_tokens from sampling_params or use configured response_length as default
@@ -269,14 +290,27 @@ if vLLMHttpServer is not None:
                 self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
             )
 
-        # Clamp max_tokens to the valid range [0, max_possible_tokens]
-        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+        # vLLM requires at least one generation token.  A zero budget is a
+        # continuation boundary and must be handled by the client before this
+        # server method is called; silently changing it to one would generate
+        # an extra token beyond the request budget.
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"max_tokens must be a positive integer, got {max_tokens!r}") from exc
+        if max_tokens < 1:
+            raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+        max_tokens = min(max_tokens, max_possible_tokens)
 
-        assert max_tokens <= max_possible_tokens, (
+        assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        if kv_transfer_params is not None:
+            extra_args = dict(sampling_params.pop("extra_args", None) or {})
+            extra_args["kv_transfer_params"] = kv_transfer_params
+            sampling_params["extra_args"] = extra_args
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -284,8 +318,17 @@ if vLLMHttpServer is not None:
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        if mm_processor_kwargs:
+            prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        try:
+            prompt = TokensPrompt(**prompt_kwargs)
+        except TypeError:
+            # Older vLLM prompt classes may not expose optional processor kwargs.
+            prompt = prompt_kwargs
 
         # Add lora request
         lora_request = None
@@ -310,14 +353,14 @@ if vLLMHttpServer is not None:
         async for output in generator:
             final_res = output
             if progress_ctx is not None:
-                progress_ctx.checkpoint.ingest(output)
+                progress_ctx.checkpoint.ingest(output, global_steps=self.global_steps)
         assert final_res is not None
 
         # Final flush: ensure terminal fields (finished/finish_reason) are persisted.
         # ``ingest`` already force-flushes on finished=True, but guard against the
         # edge case where the last chunk did not set finished before the loop exited.
         if progress_ctx is not None:
-            progress_ctx.checkpoint.ingest(final_res)
+            progress_ctx.checkpoint.ingest(final_res, global_steps=self.global_steps)
             progress_ctx.checkpoint._maybe_flush(force=True)
 
         extra_fields = {"global_steps": self.global_steps}

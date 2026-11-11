@@ -23,13 +23,12 @@ This area replaces the LB actor and extends the native client/manager classes:
 - ``LLMServerClient``: accepts ``run_id`` / ``progress_store`` / ``max_model_len``,
   and gains the single-attempt primitive ``_generate_once`` with transient-fault
   translation (``ServerUnavailable``) and ``_mark_server_failed``.
-- ``FullyLLMServerClient``: its ``generate`` loop becomes fault-tolerant
+- ``FullyAsyncLLMServerClient``: its ``generate`` loop becomes fault-tolerant
   (retry on a fresh server) and token-continuation aware (mode C).
 - ``LLMServerManager``: tracks a process-level ``run_id``, can assemble the
   ``RolloutProgressStoreActor``, and can spawn replacement replicas
-  (``spawn_replacement`` / ``_reclaim_ray_resources``). Its control-plane
-  ``clear_kv_cache`` isolates transient rollout faults via the trainer-wired
-  callback (one-step) instead of failing the weight-sync step.
+  (``spawn_replacement`` / ``_reclaim_ray_resources``). KV-cache operations
+  remain on the replica/server paths, where the target verl API exposes them.
 
 The LB actor is defined completely before Ray decorates it. The core and retry
 client live under ``fault_tolerance``; native clients and the manager are extended
@@ -50,12 +49,11 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.llm_server import (
     DEFAULT_ROUTING_CACHE_SIZE,
-    FullyLLMServerClient,
+    FullyAsyncLLMServerClient,
     LLMServerClient,
     LLMServerManager,
 )
@@ -153,14 +151,22 @@ def _client_init(
     orig,
     self,
     config: DictConfig,
-    servers: dict[str, ray.actor.ActorHandle],
-    load_balancer_handle: ray.actor.ActorHandle,
+    load_balancer_handle: ray.actor.ActorHandle = None,
+    servers: Optional[dict[str, ray.actor.ActorHandle]] = None,
     run_id: Optional[str] = None,
     progress_store: Optional[ray.actor.ActorHandle] = None,
     max_model_len: Optional[int] = None,
+    **kwargs: Any,
 ):
-    """LLMServerClient accepting the recipe's FT/progress kwargs."""
-    orig(self, config, servers, load_balancer_handle)
+    """LLMServerClient accepting the recipe's FT/progress kwargs.
+
+    Native v0.9.0 ``__init__(config, load_balancer_handle=None, **kwargs)`` only
+    stores config and the LB handle; the recipe pops its FT/progress context
+    out of ``kwargs`` and owns the ``_server_id_to_handle`` registry itself
+    (native clients no longer keep one).
+    """
+    orig(self, config, load_balancer_handle=load_balancer_handle, **kwargs)
+    self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers) if servers else {}
     self._run_id = run_id
     self._progress_store = progress_store
     self.max_model_len = max_model_len
@@ -230,20 +236,42 @@ async def _call_server(
     server_id: str,
     server: ray.actor.ActorHandle,
     *,
+    request_id: str,
     prompt_ids: list[int],
     sampling_params: dict[str, Any],
-    image_data: Optional[list[Any]],
-    video_data: Optional[list[Any]],
-    kwargs: dict[str, Any],
-    call_timeout_s: Optional[float],
+    image_data: Optional[list[Any]] = None,
+    video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    kwargs: dict[str, Any] = None,
+    call_timeout_s: Optional[float] = None,
 ) -> TokenOutput:
-    """Issue a single ``server.generate.remote`` call, optionally bounded by a timeout."""
+    """Issue a single ``server.generate.remote`` call, optionally bounded by a timeout.
+
+    Applies the native v0.9.0 request-shaping rules before the RPC: audio only
+    when non-None, mm_processor_kwargs only when non-empty, priority only when
+    non-zero and the rollout backend is vLLM. ``request_id`` is normalized via
+    the native ``_vllm_request_id`` so ``full_determinism`` keeps stable vLLM ids.
+    """
+    kwargs = dict(kwargs) if kwargs else {}
+    multimodal_kwargs = {}
+    if audio_data is not None:
+        multimodal_kwargs["audio_data"] = audio_data
+    if mm_processor_kwargs:
+        multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+    # priority is only supported by vLLM rollout server.
+    priority = kwargs.pop("priority", 0)
+    priority_kwargs = (
+        {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
+    )
     call = server.generate.remote(
-        request_id=uuid4().hex,
+        request_id=self._vllm_request_id(request_id),
         prompt_ids=prompt_ids,
         sampling_params=sampling_params,
         image_data=image_data,
         video_data=video_data,
+        **multimodal_kwargs,
+        **priority_kwargs,
         **kwargs,
     )
     if call_timeout_s is not None:
@@ -258,12 +286,15 @@ async def _generate_once(
     *,
     prompt_ids: list[int],
     sampling_params: dict[str, Any],
-    image_data: Optional[list[Any]],
-    video_data: Optional[list[Any]],
-    kwargs: dict[str, Any],
-    call_timeout_s: Optional[float],
-    translate_fault: bool,
+    image_data: Optional[list[Any]] = None,
+    video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    kwargs: dict[str, Any] = None,
+    call_timeout_s: Optional[float] = None,
+    translate_fault: bool = False,
     progress_ctx: Optional[Any] = None,
+    prepare_request=None,
 ) -> tuple[TokenOutput, str]:
     """Single acquire -> call -> release on one server.
 
@@ -284,20 +315,32 @@ async def _generate_once(
 
     try:
         try:
+            if prepare_request is not None:
+                prepared = await prepare_request(server)
+                if isinstance(prepared, TokenOutput):
+                    return prepared, server_id
+                prompt_ids, sampling_params, progress_ctx = prepared
             if progress_ctx is not None:
-                kwargs = {**kwargs, "progress_ctx": progress_ctx}
+                kwargs = {**(kwargs or {}), "progress_ctx": progress_ctx}
             output = await self._call_server(
                 server_id,
                 server,
+                request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
                 kwargs=kwargs,
                 call_timeout_s=call_timeout_s,
             )
             return output, server_id
         except Exception as e:
+            cause = getattr(e, "cause", None) or e
+            if isinstance(cause, ServerUnavailable):
+                # A version race requires retry, not isolation of a healthy replica.
+                raise ServerUnavailable(server_id, cause=cause) from e
             if translate_fault and is_transient_fault(e):
                 await self._mark_server_failed(server_id)
                 raise ServerUnavailable(server_id, cause=e) from e
@@ -359,6 +402,8 @@ async def generate(
     sampling_params: dict[str, Any],
     image_data: Optional[list[Any]] = None,
     video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
     progress_ctx: Optional[Any] = None,
     **kwargs: Any,
 ) -> TokenOutput:
@@ -386,21 +431,28 @@ async def generate(
         sampling_params=sampling_params,
         image_data=image_data,
         video_data=video_data,
+        audio_data=audio_data,
+        mm_processor_kwargs=mm_processor_kwargs,
         progress_ctx=progress_ctx,
         kwargs=kwargs,
         call_timeout_s=self._ft_call_timeout_s() if ft_on else None,
         translate_fault=ft_on,
     )
+    # Match the native v0.9.0 convention: a plain successful result reports its
+    # weight version as both min and max (never overwrite an existing range).
+    global_steps = output.extra_fields.get("global_steps")
+    output.extra_fields.setdefault("min_global_steps", global_steps)
+    output.extra_fields.setdefault("max_global_steps", global_steps)
     output.extra_fields["llm_generate_attempts"] = 1
     return output
 
 
 # ---------------------------------------------------------------------------
-# FullyLLMServerClient — FT + token continuation in the resume loop
+# FullyAsyncLLMServerClient — FT + token continuation in the resume loop
 # ---------------------------------------------------------------------------
 
 
-@add(FullyLLMServerClient, "_ft_max_request_retries")
+@add(FullyAsyncLLMServerClient, "_ft_max_request_retries")
 def _fully_ft_max_request_retries(self) -> int:
     try:
         return int(self.config.async_training.fault_tolerance.max_request_retries)
@@ -408,7 +460,7 @@ def _fully_ft_max_request_retries(self) -> int:
         return 3
 
 
-@add(FullyLLMServerClient, "_progress_enabled")
+@add(FullyAsyncLLMServerClient, "_progress_enabled")
 def _progress_enabled(self) -> bool:
     """True only when FT master switch AND progress sub-switch are both on."""
     if not self._ft_enabled():
@@ -421,7 +473,7 @@ def _progress_enabled(self) -> bool:
         return False
 
 
-@add(FullyLLMServerClient, "_flush_token_interval")
+@add(FullyAsyncLLMServerClient, "_flush_token_interval")
 def _flush_token_interval(self) -> int:
     try:
         return int(
@@ -435,7 +487,7 @@ def _flush_token_interval(self) -> int:
         return 64
 
 
-@add(FullyLLMServerClient, "_model_version_policy")
+@add(FullyAsyncLLMServerClient, "_model_version_policy")
 def _model_version_policy(self):
     from verl.workers.rollout.fault_tolerance import ModelVersionPolicy
 
@@ -449,8 +501,8 @@ def _model_version_policy(self):
     return ModelVersionPolicy(mode="exact")
 
 
-@patch(FullyLLMServerClient, "generate")
-@_native_when_ft_disabled(FullyLLMServerClient)
+@patch(FullyAsyncLLMServerClient, "generate")
+@_native_when_ft_disabled(FullyAsyncLLMServerClient)
 @rollout_trace_op
 async def _fully_generate(
     self,
@@ -460,6 +512,9 @@ async def _fully_generate(
     sampling_params: dict[str, Any],
     image_data: Optional[list[Any]] = None,
     video_data: Optional[list[Any]] = None,
+    audio_data: Optional[list[Any]] = None,
+    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    **kwargs: Any,
 ) -> TokenOutput:
     """Generate tokens from prompt ids with FT retry and token continuation.
 
@@ -485,7 +540,7 @@ async def _fully_generate(
         sampling_params[budget_key] = original_max_tokens
     else:
         logger.warning(
-            "[FT] FullyLLMServerClient: cannot resolve generation budget from rollout config; "
+            "[FT] FullyAsyncLLMServerClient: cannot resolve generation budget from rollout config; "
             "token continuation will fall back to the server-side per-attempt default "
             "(each attempt may re-earn a full response_length)"
         )
@@ -503,80 +558,119 @@ async def _fully_generate(
         # ----- decide prefix + progress_ctx for this attempt -----
         checkpoint = None
         progress_ctx = None
-        if progress_on:
-            from verl.workers.rollout.fault_tolerance import (
-                ProgressContext,
-                VLLMProgressCheckPoint,
-                is_transient_fault,
-            )
 
-            try:
-                result = await VLLMProgressCheckPoint.create_or_resume(
-                    store=self._progress_store,
-                    run_id=self._run_id,
-                    recovery_id=recovery_id,
-                    prompt_token_ids=original_prompt,
-                    sampling_params=original_sampling,
-                    model_weight_version=model_weight_version,
-                    flush_token_interval=self._flush_token_interval(),
-                    model_version_policy=self._model_version_policy(),
+        async def prepare_request(server):
+            nonlocal checkpoint, progress_ctx, final_output, sampling_params, recovery_id
+            nonlocal min_global_steps, max_global_steps, global_steps, model_weight_version
+            if progress_on:
+                from verl.workers.rollout.fault_tolerance import (
+                    ProgressContext,
+                    VLLMProgressCheckPoint,
+                    is_transient_fault,
                 )
-            except Exception as e:
-                if not is_transient_fault(e):
-                    raise
-                logger.warning(
-                    "[FT] FullyLLMServerClient: progress store unavailable (%s), "
-                    "degrading to fresh attempt (run=%s, recovery_id=%s)",
-                    type(e).__name__,
-                    self._run_id,
-                    recovery_id,
+
+                model_weight_version = await asyncio.wait_for(
+                    server.get_global_steps.remote(), timeout=self._ft_call_timeout_s()
                 )
-                prefix_for_call = original_prompt
-                call_sampling = sampling_params
-            else:
-                checkpoint = result.checkpoint
-                progress_ctx = ProgressContext(checkpoint=checkpoint)
-                prefix_for_call = checkpoint.resume_prefix_token_ids()
-                call_sampling = copy.deepcopy(original_sampling)
-                if original_max_tokens is not None:
-                    call_sampling[budget_key] = checkpoint.remaining_max_tokens()
-                # Seed final_output with inherited cumulative so that after fault reset
-                # (where final_output was cleared) the persisted tokens are not lost.
-                # On the abort path this is idempotent (cumulative == existing final_output).
-                if checkpoint.inherited_prefix_len > 0:
+                if model_weight_version is not None:
+                    model_weight_version = str(model_weight_version)
+                try:
+                    result = await VLLMProgressCheckPoint.create_or_resume(
+                        store=self._progress_store,
+                        run_id=self._run_id,
+                        recovery_id=recovery_id,
+                        prompt_token_ids=original_prompt,
+                        sampling_params=original_sampling,
+                        model_weight_version=model_weight_version,
+                        flush_token_interval=self._flush_token_interval(),
+                        model_version_policy=self._model_version_policy(),
+                    )
+                except Exception as e:
+                    if not is_transient_fault(e):
+                        raise
                     logger.warning(
-                        "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
-                        "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
-                        checkpoint.inherited_prefix_len,
+                        "[FT] FullyAsyncLLMServerClient: progress store unavailable (%s), "
+                        "degrading to fresh attempt (run=%s, recovery_id=%s)",
+                        type(e).__name__,
                         self._run_id,
                         recovery_id,
-                        checkpoint.attempt_id,
-                        len(prefix_for_call),
-                        call_sampling.get(budget_key),
                     )
-                    final_output = TokenOutput(
-                        token_ids=list(checkpoint.cumulative_token_ids),
-                        log_probs=list(checkpoint.cumulative_log_probs) if checkpoint.cumulative_log_probs else [],
-                        routed_experts=checkpoint.cumulative_routed_experts,
-                        num_preempted=checkpoint.num_preempted,
-                    )
-        else:
-            progress_ctx = None
-            prefix_for_call = original_prompt + final_output.token_ids
-            call_sampling = sampling_params
+                    # Discard the old answer branch and its recovery identity together.
+                    final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
+                    min_global_steps, max_global_steps, global_steps = None, None, None
+                    recovery_id = uuid4().hex
+                    sampling_params = copy.deepcopy(original_sampling)
+                    prefix_for_call = original_prompt
+                    call_sampling = copy.deepcopy(original_sampling)
+                else:
+                    checkpoint = result.checkpoint
+                    # The retained tokens, rather than previous failed RPCs, own the range.
+                    min_global_steps = checkpoint.min_global_steps
+                    max_global_steps = checkpoint.max_global_steps
+                    progress_ctx = ProgressContext(checkpoint=checkpoint)
+                    prefix_for_call = checkpoint.resume_prefix_token_ids()
+                    call_sampling = copy.deepcopy(original_sampling)
+                    if original_max_tokens is not None:
+                        remaining_max_tokens = checkpoint.remaining_max_tokens()
+                        if remaining_max_tokens <= 0:
+                            # The persisted continuation already consumed the
+                            # complete request budget.  Finish locally instead of
+                            # passing zero to the server, which would either be
+                            # rejected by vLLM or be coerced to one token.
+                            final_output = TokenOutput(
+                                token_ids=list(checkpoint.cumulative_token_ids),
+                                log_probs=(
+                                    list(checkpoint.cumulative_log_probs)
+                                    if checkpoint.cumulative_log_probs is not None
+                                    else []
+                                ),
+                                routed_experts=checkpoint.cumulative_routed_experts,
+                                num_preempted=checkpoint.num_preempted,
+                                stop_reason="length",
+                            )
+                            return final_output
+                        call_sampling[budget_key] = remaining_max_tokens
+                    # Seed final_output with inherited cumulative so that after fault reset
+                    # (where final_output was cleared) the persisted tokens are not lost.
+                    # On the abort path this is idempotent (cumulative == existing final_output).
+                    if checkpoint.inherited_prefix_len > 0:
+                        logger.warning(
+                            "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
+                            "(run=%s, recovery_id=%s, attempt=%s, resume_prefix_len=%d, remaining_max_tokens=%s)",
+                            checkpoint.inherited_prefix_len,
+                            self._run_id,
+                            recovery_id,
+                            checkpoint.attempt_id,
+                            len(prefix_for_call),
+                            call_sampling.get(budget_key),
+                        )
+                        final_output = TokenOutput(
+                            token_ids=list(checkpoint.cumulative_token_ids),
+                            log_probs=list(checkpoint.cumulative_log_probs) if checkpoint.cumulative_log_probs else [],
+                            routed_experts=checkpoint.cumulative_routed_experts,
+                            num_preempted=checkpoint.num_preempted,
+                        )
+            else:
+                progress_ctx = None
+                prefix_for_call = original_prompt + final_output.token_ids
+                call_sampling = sampling_params
+
+            return prefix_for_call, call_sampling, progress_ctx
 
         # 1. generate tokens — catch ServerUnavailable to retry on a fresh server
         try:
             output, _ = await self._generate_once(
                 request_id=current_request_id,
-                prompt_ids=prefix_for_call,
-                sampling_params=call_sampling,
+                prompt_ids=original_prompt,
+                sampling_params=original_sampling,
                 image_data=image_data,
                 video_data=video_data,
-                kwargs={},
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                kwargs=dict(kwargs),
                 call_timeout_s=self._ft_call_timeout_s() if ft_on else None,
                 translate_fault=ft_on,
-                progress_ctx=progress_ctx,
+                prepare_request=prepare_request,
             )
             total_llm_generate_attempts += 1
         except ServerUnavailable as e:
@@ -594,7 +688,9 @@ async def _fully_generate(
                     max_retries,
                     total_llm_generate_attempts,
                 )
-                raise AllServersFailed(f"FullyLLMServerClient: retries exhausted after {retries} attempts") from None
+                raise AllServersFailed(
+                    f"FullyAsyncLLMServerClient: retries exhausted after {retries} attempts"
+                ) from None
             logger.warning(
                 "[FT] prompt retry %d/%d: server %s failed (%s: %s) for request_id=%s, "
                 "resetting to original prompt and retrying on a fresh server",
@@ -611,6 +707,9 @@ async def _fully_generate(
             current_request_id = uuid4().hex
             model_weight_version = None
             continue
+
+        if output is final_output:
+            break
 
         # 2. merge output into final_output
         if progress_on and checkpoint is not None:
@@ -647,9 +746,19 @@ async def _fully_generate(
             final_output.stop_reason = output.stop_reason
 
         global_steps = output.extra_fields.get("global_steps", None)
-        if min_global_steps is None:
-            min_global_steps = global_steps
-        max_global_steps = global_steps
+        if output.token_ids:
+            lower = [
+                v
+                for v in (min_global_steps, output.extra_fields.get("min_global_steps", global_steps))
+                if v is not None
+            ]
+            upper = [
+                v
+                for v in (max_global_steps, output.extra_fields.get("max_global_steps", global_steps))
+                if v is not None
+            ]
+            min_global_steps = min(lower) if lower else None
+            max_global_steps = max(upper) if upper else None
         model_weight_version = global_steps
 
         # 3. update the generation budget; truncate (FT only) to the original budget
@@ -678,7 +787,7 @@ async def _fully_generate(
             len(output.token_ids),
             current_request_id,
             total_llm_generate_attempts,
-            len(prefix_for_call) + len(output.token_ids),
+            len(original_prompt) + len(final_output.token_ids),
         )
 
     final_output.extra_fields["global_steps"] = global_steps
@@ -688,7 +797,7 @@ async def _fully_generate(
     final_output.extra_fields["llm_generate_retries"] = retries
     if retries > 0 or total_llm_generate_attempts > 1:
         logger.warning(
-            "[FT] FullyLLMServerClient.generate completed after recovery: request_id=%s "
+            "[FT] FullyAsyncLLMServerClient.generate completed after recovery: request_id=%s "
             "attempts=%d retries=%d tokens=%d stop_reason=%s",
             request_id,
             total_llm_generate_attempts,
@@ -705,9 +814,28 @@ async def _fully_generate(
 
 
 @wrap(LLMServerManager, "__init__")
-def _manager_init(orig, self, config, worker_group=None, rollout_resource_pool=None):
-    """LLMServerManager tracking a process-level run_id for token continuation."""
-    orig(self, config, worker_group=worker_group, rollout_resource_pool=rollout_resource_pool)
+def _manager_init(
+    orig,
+    self,
+    config,
+    worker_group=None,
+    rollout_resource_pool=None,
+    start_rank: int = 0,
+    load_balancer_cls=None,
+):
+    """LLMServerManager tracking a process-level run_id for token continuation.
+
+    Must accept and forward every native v0.9.0 constructor parameter
+    (``start_rank``, ``load_balancer_cls``) — callers pass them by keyword.
+    """
+    orig(
+        self,
+        config,
+        worker_group=worker_group,
+        rollout_resource_pool=rollout_resource_pool,
+        start_rank=start_rank,
+        load_balancer_cls=load_balancer_cls,
+    )
     self.run_id = f"{socket.gethostname()}_{os.getpid()}_{uuid4().hex[:8]}"
     self._progress_store = None
     self.max_model_len = self._resolve_max_model_len()
@@ -798,98 +926,38 @@ async def _init_global_load_balancer(self) -> None:
 
 
 @patch(LLMServerManager, "get_client")
-def get_client(self, fully_async: bool = False, retry: bool = False) -> LLMServerClient:
+def get_client(self, client_cls: type[LLMServerClient] | None = None, **kwargs) -> LLMServerClient:
     """Get the LLMServerClient to request LLM server replicas.
 
+    Mirrors the native v0.9.0 ``get_client(client_cls=None, **kwargs)`` factory:
+
+    - FT-off: delegate to the native factory with the caller's arguments
+      unchanged (native clients get the native LB returning
+      ``(server_id, handle)``).
+    - FT-on: instantiate the requested client with the recipe's fault-tolerance
+      context — the elastic-LB handle, the handle registry (``servers``), the
+      process ``run_id``, the progress store and ``max_model_len`` — merged
+      under any caller kwargs (e.g. ``only_hybrid``).
+
     Args:
-        fully_async (bool): Whether to return the FullyLLMServerClient.
-        retry (bool): Whether to retry on server unavailability when FT is enabled.
+        client_cls: The client class to instantiate. Defaults to
+            :class:`LLMServerClient`.
+        **kwargs: Forwarded to the client constructor.
     """
     if not self._ft_enabled():
-        return self._orig_get_client(fully_async=fully_async)
+        return self._orig_get_client(client_cls=client_cls, **kwargs)
 
-    servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
+    client_cls = client_cls or LLMServerClient
     common = dict(
         config=self.config,
-        servers=servers,
+        servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
         load_balancer_handle=self.global_load_balancer,
         run_id=self.run_id,
         progress_store=self._progress_store,
         max_model_len=self.max_model_len,
     )
-    if fully_async:
-        return FullyLLMServerClient(**common)
-    if retry:
-        from verl.workers.rollout.fault_tolerance.retry_client import RetryLLMServerClient
-
-        return RetryLLMServerClient(**common)
-    return LLMServerClient(config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer)
-
-
-@patch(LLMServerManager, "clear_kv_cache")
-@auto_await
-async def _manager_clear_kv_cache(self) -> None:
-    """FT-aware KV-cache clear: isolate transient rollout faults, keep survivors.
-
-    The native method gathers over every replica in ``rollout_replicas`` and
-    lets the first failure fail the whole call. The Manager deliberately keeps
-    dead replicas listed (``spawn_replacement`` needs the old object), so the
-    one-step trainer's post-sync clear would raise ActorDiedError and kill the
-    training loop while a replacement is still being spawned.
-
-    With FT on, transient rollout faults (``is_transient_fault``) are handed to
-    ``_ft_clear_kv_fault_callback`` — wired by the trainer's Supervisor wiring
-    (one-step only; fully-async never calls this control-plane clear). Ordinary
-    code bugs, cancellation signals, a missing callback, or a failed isolation
-    all propagate: a control-plane clear must never be silently "successful"
-    when nothing was cleared.
-    """
-    callback = getattr(self, "_ft_clear_kv_fault_callback", None)
-    if not self._ft_enabled() or callback is None:
-        return await self._orig_clear_kv_cache()
-
-    from verl.workers.rollout.fault_tolerance.exceptions import is_transient_fault
-
-    # Snapshot: CKE prunes its own member copy; the Manager list must stay
-    # untouched so spawn_replacement can still find the dead replica object.
-    replicas = list(self.rollout_replicas)
-    results = await asyncio.gather(*[replica.clear_kv_cache() for replica in replicas], return_exceptions=True)
-
-    transient: list[tuple[Any, BaseException]] = []
-    fatal: list[BaseException] = []
-    for replica, exc in zip(replicas, results, strict=True):
-        if not isinstance(exc, BaseException):
-            continue
-        if isinstance(exc, asyncio.CancelledError):
-            raise exc
-        if is_transient_fault(exc):
-            transient.append((replica, exc))
-        else:
-            fatal.append(exc)
-
-    if fatal:
-        # Not a rollout fault (ordinary exception inside a replica clear):
-        # isolating it would hide a real bug — propagate as-is.
-        raise fatal[0]
-
-    for replica, exc in transient:
-        replica_id = replica._server_address
-        try:
-            await callback(replica_id)
-        except Exception as cb_exc:
-            # Un-isolated (Supervisor not running / LB unreachable): surface the
-            # original fault chained with the isolation failure — never swallow.
-            raise exc from cb_exc
-        logger.warning(
-            "[FT] clear_kv_cache: replica %s failed (%r); isolated, surviving replicas continue",
-            replica_id,
-            exc,
-        )
-
-    if len(transient) == len(replicas):
-        # Every replica failed: the rollout tier is gone. Isolation has been
-        # attempted, but this must not masquerade as a successful clear.
-        raise transient[0][1]
+    common.update(kwargs)
+    return client_cls(**common)
 
 
 @add(LLMServerManager, "spawn_replacement")

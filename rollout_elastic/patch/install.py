@@ -49,7 +49,7 @@ _TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 # ``HEAD_POD_ENV_VAR`` is set to a truthy value.
 _HEAD_AREA_MODULES: tuple[str, ...] = (
     "replica",  # RolloutReplica.health / get_ray_class_with_init_args
-    "llm_server",  # LLMServerClient / LLMServerManager / load balancer / FullyLLMServerClient
+    "llm_server",  # LLMServerClient / LLMServerManager / load balancer / FullyAsyncLLMServerClient
     "checkpoint",  # CheckpointEngineManager / CheckpointEngineWorker / hccl / nccl
     "experimental",  # fully_async / one_step_off / separation / agent_loop
 )
@@ -61,7 +61,7 @@ _AREA_MODULES: tuple[str, ...] = (
     "attention",  # attention_utils._get_attention_functions fallback
     "backends",  # sglang / trtllm ServerAdapter
     "vllm",  # vllm_rollout / vllm_async_server / bucketed_weight_transfer / vllm_utils
-    "llm_server",  # LLMServerClient / LLMServerManager / load balancer / FullyLLMServerClient
+    "llm_server",  # LLMServerClient / LLMServerManager / load balancer / FullyAsyncLLMServerClient
     "checkpoint",  # CheckpointEngineManager / CheckpointEngineWorker / hccl / nccl
     "experimental",  # fully_async / one_step_off / separation / agent_loop
 )

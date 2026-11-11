@@ -10,11 +10,9 @@ import ast
 import asyncio
 import functools
 import importlib.util
-import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 
@@ -148,7 +146,7 @@ class TestNativeDispatch(unittest.TestCase):
 
         namespace = dict(
             LLMServerClient=BaseClient,
-            FullyLLMServerClient=FullyClient,
+            FullyAsyncLLMServerClient=FullyClient,
             functools=functools,
             patch=core.patch,
             rollout_trace_op=trace,
@@ -166,165 +164,54 @@ class TestNativeDispatch(unittest.TestCase):
         self.assertEqual(traces, [])
 
 
-_FT_EXCEPTIONS_MODULE = "verl.workers.rollout.fault_tolerance.exceptions"
-
-
-def _prime_ft_exceptions_module():
-    """Expose the recipe's ``is_transient_fault`` under its production import path.
-
-    ``_manager_clear_kv_cache`` lazily imports
-    ``verl.workers.rollout.fault_tolerance.exceptions``. Registering the recipe
-    module in ``sys.modules`` under that full dotted name short-circuits the
-    parent-package walk, so the test stays hermetic (no verl install needed).
-    """
-    if _FT_EXCEPTIONS_MODULE in sys.modules:
-        return
-    path = Path(__file__).parents[1] / "workers" / "rollout" / "fault_tolerance" / "exceptions.py"
-    spec = importlib.util.spec_from_file_location(_FT_EXCEPTIONS_MODULE, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[_FT_EXCEPTIONS_MODULE] = module
-    spec.loader.exec_module(module)
-
-
-def _make_replica(address, clear_result=None):
-    """Stub RolloutReplica; ``clear_result`` as an exception is raised on clear."""
-    calls = []
-
-    async def clear_kv_cache():
-        calls.append(address)
-        if isinstance(clear_result, BaseException):
-            raise clear_result
-        return clear_result
-
-    return SimpleNamespace(_server_address=address, clear_kv_cache=clear_kv_cache), calls
-
-
 class TestClearKvCacheIsolation(unittest.TestCase):
-    """LLMServerManager.clear_kv_cache: FT control-plane fault isolation matrix.
+    """Protect the target v0.9.0 API surface from the obsolete manager hook."""
 
-    The one-step trainer clears KV cache right after every weight sync while
-    the Manager still lists dead replicas for ``spawn_replacement``. Transient
-    rollout faults must be isolated through the trainer-wired callback so the
-    step survives on the N-1 tier; everything else must propagate.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        _prime_ft_exceptions_module()
-        namespace = {"asyncio": asyncio, "Any": Any, "logger": Mock()}
-        load_functions("llm_server.py", {"_manager_clear_kv_cache"}, namespace)
-        # staticmethod: a plain function class attribute would bind `self` and
-        # shift every call's arguments by one.
-        cls.clear_kv_cache = staticmethod(namespace["_manager_clear_kv_cache"])
-
-    @staticmethod
-    def _make_manager(replicas, *, ft_enabled=True, callback=None, native=None):
-        manager = SimpleNamespace(rollout_replicas=replicas, _ft_enabled=lambda: ft_enabled)
-        if native is not None:
-            manager._orig_clear_kv_cache = native
-        if callback is not None:
-            manager._ft_clear_kv_fault_callback = callback
-        return manager
-
-    def test_ft_disabled_delegates_to_native(self):
-        native = AsyncMock(return_value="native")
-        ok, ok_calls = _make_replica("80.0.0.1")
-        dead, dead_calls = _make_replica("80.0.0.2", ConnectionError("down"))
-        manager = self._make_manager([ok, dead], ft_enabled=False, native=native)
-        self.assertIs(asyncio.run(self.clear_kv_cache(manager)), "native")
-        # No args: on a real manager `_orig_clear_kv_cache` is the bound native
-        # method; SimpleNamespace doesn't bind, so the mock sees zero args.
-        native.assert_awaited_once_with()
-        self.assertEqual(ok_calls, [])
-        self.assertEqual(dead_calls, [])
-
-    def test_missing_callback_delegates_to_native(self):
-        # FT on but the trainer wiring never ran (e.g. fully-async manager):
-        # behavior must stay exactly native, not silently "succeed".
-        native = AsyncMock(return_value="native")
-        ok, ok_calls = _make_replica("80.0.0.1")
-        manager = self._make_manager([ok], ft_enabled=True, native=native)
-        self.assertIs(asyncio.run(self.clear_kv_cache(manager)), "native")
-        native.assert_awaited_once_with()
-        self.assertEqual(ok_calls, [])
-
-    def test_transient_fault_isolated_and_survivor_continues(self):
-        ok, ok_calls = _make_replica("80.0.0.1")
-        dead, dead_calls = _make_replica("80.0.0.2", ConnectionError("down"))
-        isolated = []
-
-        async def callback(replica_id):
-            isolated.append(replica_id)
-
-        manager = self._make_manager([ok, dead], ft_enabled=True, callback=callback)
-        self.assertIsNone(asyncio.run(self.clear_kv_cache(manager)))
-        self.assertEqual(isolated, ["80.0.0.2"])
-        self.assertEqual(ok_calls, ["80.0.0.1"])
-        self.assertEqual(dead_calls, ["80.0.0.2"])
-        # Snapshot semantics: the Manager list stays untouched —
-        # spawn_replacement must still find the dead replica object.
-        self.assertEqual(len(manager.rollout_replicas), 2)
-
-    def test_non_transient_propagates_without_isolation(self):
-        ok, ok_calls = _make_replica("80.0.0.1")
-        buggy, _ = _make_replica("80.0.0.2", ValueError("ordinary bug"))
-        isolated = []
-
-        async def callback(replica_id):
-            isolated.append(replica_id)
-
-        manager = self._make_manager([ok, buggy], ft_enabled=True, callback=callback)
-        with self.assertRaises(ValueError):
-            asyncio.run(self.clear_kv_cache(manager))
-        self.assertEqual(isolated, [])
-        # gather starts every clear concurrently, so the survivor was still
-        # attempted before the fatal error propagated — that's fine; the
-        # invariant under test is that isolation never ran for a non-fault.
-
-    def test_callback_failure_reraises_original_fault(self):
-        dead, _ = _make_replica("80.0.0.2", ConnectionError("down"))
-
-        async def callback(replica_id):
-            raise RuntimeError(f"supervisor not running: {replica_id}")
-
-        manager = self._make_manager([dead], ft_enabled=True, callback=callback)
-        with self.assertRaises(ConnectionError) as ctx:
-            asyncio.run(self.clear_kv_cache(manager))
-        self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
-
-    def test_all_failed_is_not_a_success(self):
-        dead1, calls1 = _make_replica("80.0.0.1", ConnectionError("down-1"))
-        dead2, calls2 = _make_replica("80.0.0.2", ConnectionError("down-2"))
-        isolated = []
-
-        async def callback(replica_id):
-            isolated.append(replica_id)
-
-        manager = self._make_manager([dead1, dead2], ft_enabled=True, callback=callback)
-        with self.assertRaises(ConnectionError):
-            asyncio.run(self.clear_kv_cache(manager))
-        self.assertEqual(isolated, ["80.0.0.1", "80.0.0.2"])
-        self.assertEqual(calls1, ["80.0.0.1"])
-        self.assertEqual(calls2, ["80.0.0.2"])
-
-    def test_cancelled_child_propagates(self):
-        dead, _ = _make_replica("80.0.0.1", asyncio.CancelledError())
-        manager = self._make_manager([dead], ft_enabled=True, callback=AsyncMock())
-        with self.assertRaises(asyncio.CancelledError):
-            asyncio.run(self.clear_kv_cache(manager))
-
-    def test_production_function_is_patched_with_auto_await(self):
+    def test_manager_clear_hook_is_not_bound(self):
         tree = ast.parse((Path(__file__).parents[1] / "patch" / "llm_server.py").read_text(encoding="utf-8"))
-        node = next(
-            n
-            for n in tree.body
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_manager_clear_kv_cache"
+        function_names = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.assertNotIn("_manager_clear_kv_cache", function_names)
+        clear_patch_targets = {
+            ast.unparse(node.decorator_list[0])
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.decorator_list
+            and ast.unparse(node.decorator_list[0]).startswith("patch(LLMServerManager")
+        }
+        self.assertNotIn("patch(LLMServerManager, 'clear_kv_cache')", clear_patch_targets)
+
+    def test_supervisor_keeps_checkpoint_wiring_without_clear_callback(self):
+        tree = ast.parse((Path(__file__).parents[1] / "patch" / "experimental.py").read_text(encoding="utf-8"))
+        source = ast.unparse(tree)
+        self.assertNotIn("_ft_clear_kv_fault_callback", source)
+        self.assertIn("set_sync_failure_reporter", source)
+        self.assertIn("set_replica_promotion_reporter", source)
+
+    def test_valid_server_clear_path_remains(self):
+        source = (Path(__file__).parents[1] / "patch" / "vllm.py").read_text(encoding="utf-8")
+        self.assertIn("server_handle.clear_kv_cache.remote()", source)
+
+    def test_vllm_generate_override_keeps_v09_request_surface(self):
+        """The recipe override must accept every native server request field."""
+        path = Path(__file__).parents[1] / "patch" / "vllm.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        generate = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "generate"
         )
-        # @patch must be outermost (class attr becomes the auto_await-wrapped
-        # coroutine, preserving the native sync/async dual call convention).
-        self.assertEqual(ast.unparse(node.decorator_list[0]), "patch(LLMServerManager, 'clear_kv_cache')")
-        self.assertEqual(ast.unparse(node.decorator_list[1]), "auto_await")
+        names = {arg.arg for arg in generate.args.args + generate.args.kwonlyargs}
+        self.assertTrue(
+            {
+                "image_data",
+                "video_data",
+                "audio_data",
+                "mm_processor_kwargs",
+                "priority",
+                "kv_transfer_params",
+                "progress_ctx",
+            }.issubset(names)
+        )
 
 
 if __name__ == "__main__":

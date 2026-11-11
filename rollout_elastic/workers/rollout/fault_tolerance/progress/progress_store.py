@@ -231,6 +231,14 @@ class RolloutProgressStore:
         if not policy.check(manifest.get("model_weight_version"), requested_model_version):
             return LoadResult(None, LoadFailure.MODEL_VERSION_BLOCKED, "model_version blocked", aid)
 
+        if policy.mode == "exact" and (
+            manifest.get("min_global_steps") is None
+            or manifest.get("max_global_steps") is None
+            or str(manifest["min_global_steps"]) != str(requested_model_version)
+            or str(manifest["max_global_steps"]) != str(requested_model_version)
+        ):
+            return LoadResult(None, LoadFailure.MODEL_VERSION_BLOCKED, "prefix version range blocked", aid)
+
         payload = self._assemble_payload(manifest, tokens, logprobs, routing)
         return LoadResult(payload, None, "ok", aid)
 
@@ -380,6 +388,8 @@ class RolloutProgressStore:
             "prompt_token_ids": payload.prompt_token_ids,
             "sampling_params": payload.sampling_params,
             "model_weight_version": payload.model_weight_version,
+            "min_global_steps": getattr(payload, "min_global_steps", None),
+            "max_global_steps": getattr(payload, "max_global_steps", None),
             "inherited_prefix_len": payload.inherited_prefix_len,
             "len_tokens": len(payload.cumulative_token_ids),
             "has_log_probs": lp is not None,
@@ -479,6 +489,8 @@ class RolloutProgressStore:
             prompt_token_ids=manifest.get("prompt_token_ids", []),
             sampling_params=manifest.get("sampling_params", {}),
             model_weight_version=manifest.get("model_weight_version"),
+            min_global_steps=manifest.get("min_global_steps"),
+            max_global_steps=manifest.get("max_global_steps"),
             inherited_prefix_len=int(manifest.get("inherited_prefix_len", 0)),
             cumulative_token_ids=self._to_list(tokens) or [],
             cumulative_log_probs=self._to_list(logprobs),

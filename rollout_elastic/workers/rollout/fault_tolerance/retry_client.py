@@ -51,19 +51,25 @@ class RetryLLMServerClient(LLMServerClient):
     def __init__(
         self,
         config: DictConfig,
-        servers: dict[str, Any],
-        load_balancer_handle: Any,
+        load_balancer_handle: Any = None,
         run_id: Optional[str] = None,
         progress_store: Optional[Any] = None,
         max_model_len: Optional[int] = None,
+        **kwargs: Any,
     ):
+        """Keyword-style construction matching the native v0.9.0 client signature.
+
+        The recipe's FT context (``run_id`` / ``progress_store`` / ``max_model_len``)
+        and the handle registry (``servers``, via ``**kwargs``) are accepted here
+        and consumed by the recipe-wrapped base ``__init__``.
+        """
         super().__init__(
-            config,
-            servers,
-            load_balancer_handle,
+            config=config,
+            load_balancer_handle=load_balancer_handle,
             run_id=run_id,
             progress_store=progress_store,
             max_model_len=max_model_len,
+            **kwargs,
         )
         self.max_retries = self._ft_max_request_retries()
         self.call_timeout_s = self._ft_call_timeout_s()
@@ -123,6 +129,8 @@ class RetryLLMServerClient(LLMServerClient):
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> TokenOutput:
         from verl.workers.rollout.fault_tolerance import (
@@ -181,7 +189,31 @@ class RetryLLMServerClient(LLMServerClient):
                     progress_ctx = ProgressContext(checkpoint=checkpoint)
                     prefix_for_call = checkpoint.resume_prefix_token_ids()
                     call_sampling = copy.deepcopy(original_sampling)
-                    call_sampling[self._generation_budget_key()] = checkpoint.remaining_max_tokens()
+                    remaining_max_tokens = checkpoint.remaining_max_tokens()
+                    if remaining_max_tokens <= 0:
+                        # The persisted continuation already consumed the
+                        # complete request budget.  Do not call the server
+                        # with zero and let a lower layer synthesize one more
+                        # token.
+                        return TokenOutput(
+                            token_ids=list(checkpoint.cumulative_token_ids),
+                            log_probs=(
+                                list(checkpoint.cumulative_log_probs)
+                                if checkpoint.cumulative_log_probs is not None
+                                else []
+                            ),
+                            routed_experts=checkpoint.cumulative_routed_experts,
+                            num_preempted=checkpoint.num_preempted,
+                            stop_reason="length",
+                            extra_fields={
+                                "global_steps": None,
+                                "min_global_steps": checkpoint.min_global_steps,
+                                "max_global_steps": checkpoint.max_global_steps,
+                                "llm_generate_attempts": retries,
+                                "llm_generate_retries": retries,
+                            },
+                        )
+                    call_sampling[self._generation_budget_key()] = remaining_max_tokens
                     if result.inherited_prefix_len > 0:
                         logger.warning(
                             "[FT] token continuation from checkpoint: resuming with %d inherited tokens "
@@ -200,6 +232,8 @@ class RetryLLMServerClient(LLMServerClient):
                     sampling_params=call_sampling,
                     image_data=image_data,
                     video_data=video_data,
+                    audio_data=audio_data,
+                    mm_processor_kwargs=mm_processor_kwargs,
                     kwargs=dict(kwargs),
                     call_timeout_s=self.call_timeout_s,
                     translate_fault=True,
@@ -263,6 +297,14 @@ class RetryLLMServerClient(LLMServerClient):
                 )
             else:
                 final = output
+            # Match the native v0.9.0 convention: a plain successful result reports
+            # its weight version as both min and max (never overwrite an existing range).
+            for key, reduce in (("min_global_steps", min), ("max_global_steps", max)):
+                values = [final.extra_fields.get(key, gs)]
+                if progress_on and progress_ctx is not None and inherited_ids:
+                    values.append(getattr(cp, key, None))
+                known = [v for v in values if v is not None]
+                final.extra_fields[key] = reduce(known) if known else None
             final.extra_fields["llm_generate_attempts"] = retries + 1
             final.extra_fields["llm_generate_retries"] = retries
             if retries > 0:

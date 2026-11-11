@@ -106,18 +106,16 @@ async def update_weights(
     attempt_id: int | None = None,
     target_version: int | None = None,
 ):
-    weights = self.checkpoint_engine.receive_weights()
-    if attempt_id is None:
-        # Preserve the pre-FT adapter call shape so legacy sync paths keep
-        # deriving the visible version from global_steps.
-        await self.server_adapter.update_weights(weights, global_steps=global_steps)
-    else:
-        await self.server_adapter.update_weights(
-            weights,
-            global_steps=global_steps,
-            attempt_id=attempt_id,
-            target_version=target_version,
-        )
+    weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
+    await self.server_adapter.update_weights(
+        weights,
+        global_steps=global_steps,
+        wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
+        # FT attempts use these fields for the IPC version fence.  Passing
+        # None keeps the normal path compatible with the same adapter API.
+        attempt_id=attempt_id,
+        target_version=target_version,
+    )
 
 
 @add(CheckpointEngineWorker, "destroy_nccl_group")
@@ -148,14 +146,18 @@ def manager_init(
     orig,
     self,
     config,
-    trainer: RayWorkerGroup,
+    actor_wg: RayWorkerGroup,
     replicas: list[RolloutReplica],
     fault_tolerance: Optional[Any] = None,
     load_balancer_handle: Optional[Any] = None,
     sync_failure_reporter: Optional[Any] = None,
     replica_promotion_reporter: Optional[Any] = None,
 ) -> None:
-    orig(self, config, trainer, replicas)
+    orig(self, config, actor_wg, replicas)
+    # verl v0.9.0 names the training-side worker group ``actor_wg``.  Keep
+    # the same name on the patched manager so every sync stage uses the
+    # native attribute and constructor contract.
+    self.actor_wg = actor_wg
     self.fault_tolerance = fault_tolerance
     self.load_balancer_handle = load_balancer_handle
     self.sync_failure_reporter = sync_failure_reporter
@@ -318,9 +320,9 @@ async def _force_reset_nccl_groups(self, attempt: WeightSyncAttempt) -> None:
     rollout = self._build_rollout_worker_group(attempt)
     self._reset_generation += 1
     gen = self._reset_generation
-    refs = self.trainer.execute_checkpoint_engine(
-        method=["force_destroy_nccl_group"] * self.trainer.world_size,
-        generation=[gen] * self.trainer.world_size,
+    refs = self.actor_wg.execute_checkpoint_engine(
+        method=["force_destroy_nccl_group"] * self.actor_wg.world_size,
+        generation=[gen] * self.actor_wg.world_size,
     ) + rollout.execute_checkpoint_engine(
         method=["force_destroy_nccl_group"] * rollout.world_size,
         generation=[gen] * rollout.world_size,
@@ -363,8 +365,10 @@ async def _force_reset_nccl_groups(self, attempt: WeightSyncAttempt) -> None:
 @add(CheckpointEngineManager, "_stage_refs")
 def _stage_refs(self, refs: list, attempt: WeightSyncAttempt) -> list[StageRef]:
     """Attach fixed replica IDs to the flattened Ray worker order."""
-    members = [StageRef(ref, SyncMember("trainer", index)) for index, ref in enumerate(refs[: self.trainer.world_size])]
-    rollout_refs = refs[self.trainer.world_size :]
+    members = [
+        StageRef(ref, SyncMember("trainer", index)) for index, ref in enumerate(refs[: self.actor_wg.world_size])
+    ]
+    rollout_refs = refs[self.actor_wg.world_size :]
     rollout_index = 0
     for snapshot in attempt.replicas:
         for worker_index in range(len(snapshot.workers)):
@@ -417,41 +421,35 @@ async def _wait_worker_stage(
     return result.values
 
 
-@patch(CheckpointEngineManager, "build_process_group")
-async def build_process_group(
+@wrap(CheckpointEngineManager, "build_process_group")
+def build_process_group(orig, self, rollout: RayWorkerGroup):
+    """Keep the native synchronous process-group construction contract.
+
+    The native manager calls this method synchronously from its weight-sync
+    transaction.  FT adds a separate asynchronous entry point below so the
+    native path keeps executing the prepare/topology/init RPCs immediately.
+    """
+    return orig(self, rollout)
+
+
+@add(CheckpointEngineManager, "_ft_build_process_group")
+async def _ft_build_process_group(
     self,
     rollout: RayWorkerGroup | None = None,
     attempt: WeightSyncAttempt | None = None,
 ):
-    """Build a process group, using member-aware bounded waits in FT mode."""
-    trainer = self.trainer
-    ft_on = self._ft_enabled()
+    """Build a process group with member-aware bounded waits for FT attempts."""
+    actor_wg = self.actor_wg
     if rollout is None:
         rollout = self._build_rollout_worker_group(attempt)
-    if not ft_on:
-        prepare_refs = trainer.execute_checkpoint_engine(
-            ["prepare"] * trainer.world_size
-        ) + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
-        metadata = ray.get(prepare_refs)
-        trainer_kwargs, rollout_kwargs = self.backend_cls.build_topology(
-            trainer.world_size, rollout.world_size, metadata
-        )
-        trainer_kwargs["method"] = ["init_process_group"] * trainer.world_size
-        rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
-        init_refs = trainer.execute_checkpoint_engine(**trainer_kwargs) + rollout.execute_checkpoint_engine(
-            **rollout_kwargs
-        )
-        ray.get(init_refs)
-        return
-
     if attempt is None:
         attempt = self._create_attempt(global_steps=None)
     timeout_s = self.fault_tolerance.weight_sync_member_timeout_s
 
     # Prepare and init are separate stages so a failure is attributed to
     # the exact remote member before the transaction is retried.
-    prepare_refs = trainer.execute_checkpoint_engine(
-        ["prepare"] * trainer.world_size
+    prepare_refs = actor_wg.execute_checkpoint_engine(
+        ["prepare"] * actor_wg.world_size
     ) + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
     metadata = await self._wait_worker_stage(
         prepare_refs,
@@ -460,17 +458,17 @@ async def build_process_group(
         timeout_s=timeout_s,
     )
 
-    trainer_kwargs, rollout_kwargs = self.backend_cls.build_topology(
-        trainer.world_size, rollout.world_size, list(metadata)
+    actor_wg_kwargs, rollout_kwargs = self.backend_cls.build_topology(
+        actor_wg.world_size, rollout.world_size, list(metadata)
     )
-    for key, values in trainer_kwargs.items():
-        assert len(values) == trainer.world_size, f"trainer_kwargs[{key}] must have length of {trainer.world_size}"
+    for key, values in actor_wg_kwargs.items():
+        assert len(values) == actor_wg.world_size, f"actor_wg_kwargs[{key}] must have length of {actor_wg.world_size}"
     for key, values in rollout_kwargs.items():
         assert len(values) == rollout.world_size, f"rollout_kwargs[{key}] must have length of {rollout.world_size}"
 
-    trainer_kwargs["method"] = ["init_process_group"] * trainer.world_size
+    actor_wg_kwargs["method"] = ["init_process_group"] * actor_wg.world_size
     rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
-    init_refs = trainer.execute_checkpoint_engine(**trainer_kwargs) + rollout.execute_checkpoint_engine(
+    init_refs = actor_wg.execute_checkpoint_engine(**actor_wg_kwargs) + rollout.execute_checkpoint_engine(
         **rollout_kwargs
     )
     await self._wait_worker_stage(
@@ -632,10 +630,10 @@ async def _execute_attempt(self, attempt: WeightSyncAttempt) -> None:
     )
 
     rollout = self._build_rollout_worker_group(attempt)
-    await self.build_process_group(rollout=rollout, attempt=attempt)
+    await self._ft_build_process_group(rollout=rollout, attempt=attempt)
     await self._begin_target_version(attempt)
 
-    trainer_refs = self.trainer.update_weights(global_steps=attempt.target_version)
+    trainer_refs = self.actor_wg.update_weights(global_steps=attempt.target_version)
     rollout_refs = rollout.update_weights(
         global_steps=attempt.target_version,
         attempt_id=attempt.attempt_id,
@@ -657,9 +655,9 @@ async def _execute_attempt(self, attempt: WeightSyncAttempt) -> None:
         # A late finalize from an older generation must not destroy the
         # communicator opened for the current retry.
         generation = self._reset_generation
-        finalize_kwargs = {"reset_generation": [generation] * self.trainer.world_size}
-        trainer_finalize_refs = self.trainer.execute_checkpoint_engine(
-            method=["finalize"] * self.trainer.world_size,
+        finalize_kwargs = {"reset_generation": [generation] * self.actor_wg.world_size}
+        trainer_finalize_refs = self.actor_wg.execute_checkpoint_engine(
+            method=["finalize"] * self.actor_wg.world_size,
             **finalize_kwargs,
         )
         rollout_finalize_kwargs = {"reset_generation": [generation] * rollout.world_size}
@@ -668,7 +666,7 @@ async def _execute_attempt(self, attempt: WeightSyncAttempt) -> None:
             **rollout_finalize_kwargs,
         )
     else:
-        trainer_finalize_refs = self.trainer.execute_checkpoint_engine(["finalize"] * self.trainer.world_size)
+        trainer_finalize_refs = self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
         rollout_finalize_refs = rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
     finalize_refs = trainer_finalize_refs + rollout_finalize_refs
     finalize_result = await wait_ray_stage(
@@ -1033,28 +1031,17 @@ async def _mgr_update_weights(self, global_steps: int = None):
         global_steps: The global steps of the trainer.
     """
 
-    # 0. update weights for sync training with colocated trainer and rollout
-    if self.backend == "naive":
-        ray.get(self.trainer.update_weights(global_steps=global_steps))
-        return
-
     if not self._ft_enabled():
-        # Keep the non-FT path unchanged: strict, unbounded gathers retain
-        # the original failure semantics when fault tolerance is disabled.
-        await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
-        rollout = self._build_rollout_worker_group()
-        await self.sleep_replicas()
-        await self.build_process_group(rollout)
-        rollout = self._build_rollout_worker_group()
-        ray.get(
-            self.trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps)
-        )
-        ray.get(
-            self.trainer.execute_checkpoint_engine(["finalize"] * self.trainer.world_size)
-            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
-        )
-        await self.wake_up_replicas()
-        await asyncio.gather(*[r.resume_generation() for r in self.replicas])
+        # Delegate the complete FT-off path to verl's native implementation.
+        # It owns the release/resume KV-cache lifecycle, synchronous process
+        # group construction, backend mode propagation, and sync metrics.
+        return await self._orig_update_weights(global_steps=global_steps)
+
+    # FT-on keeps the recipe's transactional recovery path.  The native
+    # implementation is intentionally used only when FT is disabled or not
+    # configured.
+    if self.backend == "naive":
+        ray.get(self.actor_wg.update_weights(global_steps=global_steps))
         return
 
     if not self._sync_lock.acquire(blocking=False):

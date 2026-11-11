@@ -67,7 +67,7 @@ def is_transient_fault(exc: BaseException) -> bool:
 class ServerUnavailable(Exception):
     """A single server is unavailable; client should switch and retry.
 
-    Raised by L2 (`LLMServerClient.generate`); caught by L3 (`FullyLLMServerClient`).
+    Raised by L2 (`LLMServerClient.generate`); caught by L3 (`FullyAsyncLLMServerClient`).
     """
 
     def __init__(self, server_id: str, cause: Optional[BaseException] = None) -> None:

@@ -1,13 +1,17 @@
-"""DAPO entrypoint with legacy predictor-driven reorder support."""
+"""DAPO entry point for EWS and response-length prediction."""
 
 import os
 import socket
 
 import hydra
 import ray
+from recipe.dapo.dapo_ray_trainer import RayDAPOTrainer
 from recipe.dapo.main_dapo import DAPOTaskRunner
+from recipe.dapo_predictor.config import configure_predictor
 from recipe.dapo_predictor.predictor_dapo_trainer import PredictorRayDAPOTrainer
 from recipe.dapo_predictor.predictor_worker import PredictorAsyncActorRolloutRefWorker
+from recipe.dapo_predictor.rollout_logging import RolloutJSONMixin
+from recipe.dapo_predictor.runtime import close_rollout_servers
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
@@ -16,8 +20,14 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 
 
+class LoggedRayDAPOTrainer(RolloutJSONMixin, RayDAPOTrainer):
+    """Upstream DAPO training with JSON-safe rollout metadata."""
+
+
 class PredictorDAPOTaskRunner(DAPOTaskRunner):
     def add_actor_rollout_worker(self, config):
+        if not config.trainer.get("predictor_reorder", {}).get("enable", False):
+            return super().add_actor_rollout_worker(config)
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             from verl.single_controller.ray import RayWorkerGroup
             from verl.trainer.ppo.ray_trainer import Role
@@ -32,7 +42,7 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
     def run(self, config):
         from pprint import pprint
 
-        from omegaconf import OmegaConf, open_dict
+        from omegaconf import OmegaConf
 
         from verl.utils import hf_processor, hf_tokenizer
         from verl.utils.dataset.rl_dataset import collate_fn
@@ -42,12 +52,7 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        trainer_predictor_cfg = OmegaConf.select(config, "trainer.predictor_reorder", default=None)
-        if trainer_predictor_cfg is not None:
-            with open_dict(config.actor_rollout_ref):
-                config.actor_rollout_ref.predictor_reorder = OmegaConf.create(
-                    OmegaConf.to_container(trainer_predictor_cfg, resolve=True)
-                )
+        configure_predictor(config)
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
         self.add_reward_model_resource_pool(config)
@@ -60,7 +65,8 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
         )
 
         local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+            config.actor_rollout_ref.model.path,
+            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
@@ -83,7 +89,12 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
             max_samples=config.data.get("val_max_samples", -1),
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
-        trainer = PredictorRayDAPOTrainer(
+        trainer_type = (
+            PredictorRayDAPOTrainer
+            if config.trainer.get("predictor_reorder", {}).get("enable", False)
+            else LoggedRayDAPOTrainer
+        )
+        trainer = trainer_type(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
@@ -95,8 +106,15 @@ class PredictorDAPOTaskRunner(DAPOTaskRunner):
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        trainer.init_workers()
-        trainer.fit()
+        try:
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            try:
+                if hasattr(trainer, "close_predictor"):
+                    trainer.close_predictor()
+            finally:
+                close_rollout_servers(trainer)
 
 
 @hydra.main(config_path="../dapo/config", config_name="dapo_trainer", version_base=None)

@@ -36,7 +36,7 @@ from verl.workers.rollout.fault_tolerance.exceptions import (
 # Prompt-level fault exceptions that L4 should absorb into the partial batch.
 # - AllServersFailed: L3 retry budget exhausted (L3 already wrapped L2 faults)
 # - ServerUnavailable: L2 fault when no L3 wrapper sits between L2 and L4
-#   (e.g. one_step_off_policy uses plain LLMServerClient, not FullyLLMServerClient).
+#   (e.g. one_step_off_policy uses plain LLMServerClient, not FullyAsyncLLMServerClient).
 _PROMPT_FAULT_TYPES: tuple = (AllServersFailed, ServerUnavailable)
 
 
