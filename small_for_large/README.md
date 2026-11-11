@@ -185,7 +185,7 @@ python stat_moe.py --top-k=64 --log-dir=""
 
 ```bash
 # --json-path points to the top64_experts.json generated in the previous step.
-python expert_pruned.py --top-k=64 --json-path=top64_experts.json --model-dir=/path/DeepSeek-V4-Flash-bf16
+python expert_pruned.py --top-k=64 --json-path=top64_experts.json --model-dir=/path/to/DeepSeek-V4-Flash-bf16
 ```
 
 **7. Validate the pruned model**
