@@ -185,7 +185,7 @@ python stat_moe.py --top-k=64 --log-dir=""
 
 ```bash
 # --json-path points to the top64_experts.json generated in the previous step.
-python expert_pruned.py --top-k=64 --json-path=top64_experts.json --model-dir=/path/to/DeepSeek-V4-Flash-bf16
+python expert_pruned.py --top-k=64 --json-path=top64_experts.json --model-dir=/path/DeepSeek-V4-Flash-bf16
 ```
 
 **7. Validate the pruned model**
@@ -295,4 +295,4 @@ The gate verifies, without loading the full model into memory:
 
 Results are written to `PROVENANCE.json` next to the pruned model (source fingerprint, keep-list hash, per-check stats, verdict). The tool exits non-zero on any failure, so it can be used as a hard gate in automated pipelines.
 
-## 3. Training-Side Patch Adaptation (TODO)
+## 3. Training-Side Patch Adaptation (TODO)
