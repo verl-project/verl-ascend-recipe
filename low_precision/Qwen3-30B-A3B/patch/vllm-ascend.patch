@@ -1,0 +1,92 @@
+diff --git a/tests/ut/attention/test_attention_v1.py b/tests/ut/attention/test_attention_v1.py
+index a83e52cfa..f23882ac0 100644
+--- a/tests/ut/attention/test_attention_v1.py
++++ b/tests/ut/attention/test_attention_v1.py
+@@ -66,6 +66,54 @@ class TestAttentionGraphHelpers(TestBase):
+         self.assertFalse(requires_contiguous_pa_kv_cache(SimpleNamespace(impl=impl), config, padded_spec))
+         mock_using_pa.assert_called_once()
+ 
++    @patch("vllm_ascend.attention.utils.using_paged_attention", return_value=False)
++    @patch(
++        "vllm_ascend.attention.utils.get_current_hardware_profile",
++        return_value=get_hardware_profile(AscendDeviceType.A3),
++    )
++    def test_ascend_quantization_requires_contiguous_non_mxfp8_kv_cache(
++        self, _mock_hardware_profile, _mock_using_pa
++    ):
++        impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
++        impl.sliding_window = None
++        spec = FullAttentionSpec(block_size=8, num_kv_heads=2, head_size=128, dtype=torch.float16)
++        for quantization, kv_cache_dtype, expected in (
++            ("ascend", "auto", True),
++            ("ascend", "mxfp8", False),
++            (None, "auto", False),
++        ):
++            with self.subTest(quantization=quantization, kv_cache_dtype=kv_cache_dtype):
++                config = SimpleNamespace(
++                    model_config=SimpleNamespace(runner_type="generate", quantization=quantization),
++                    cache_config=SimpleNamespace(kv_cache_dtype=kv_cache_dtype),
++                )
++                self.assertEqual(
++                    requires_contiguous_pa_kv_cache(SimpleNamespace(impl=impl), config, spec),
++                    expected,
++                )
++
++    @patch("vllm_ascend.attention.utils.using_paged_attention", return_value=False)
++    def test_unquantized_fia_contiguous_requirement_follows_hardware(self, _mock_using_pa):
++        impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
++        impl.sliding_window = None
++        spec = FullAttentionSpec(block_size=8, num_kv_heads=2, head_size=128, dtype=torch.bfloat16)
++        config = SimpleNamespace(
++            model_config=SimpleNamespace(runner_type="generate", quantization=None),
++            cache_config=SimpleNamespace(kv_cache_dtype="auto"),
++        )
++        for device_type, expected in ((AscendDeviceType.A5, True), (AscendDeviceType.A3, False)):
++            with (
++                self.subTest(device_type=device_type),
++                patch(
++                    "vllm_ascend.attention.utils.get_current_hardware_profile",
++                    return_value=get_hardware_profile(device_type),
++                ),
++            ):
++                self.assertEqual(
++                    requires_contiguous_pa_kv_cache(SimpleNamespace(impl=impl), config, spec),
++                    expected,
++                )
++
+     def test_paged_attention_allocation_checks_any_configured_shape(self):
+         config = SimpleNamespace(
+             speculative_config=None,
+diff --git a/vllm_ascend/attention/utils.py b/vllm_ascend/attention/utils.py
+index 775463ed9..a3c46e240 100644
+--- a/vllm_ascend/attention/utils.py
++++ b/vllm_ascend/attention/utils.py
+@@ -303,17 +303,26 @@ def using_paged_attention(runtime_shape: int | None, vllm_config: VllmConfig, he
+ 
+ 
+ def requires_contiguous_pa_kv_cache(layer, vllm_config: VllmConfig, spec: FullAttentionSpec) -> bool:
+-    """Require contiguous K/V only for unpadded ordinary Attention layers eligible for PA."""
++    """Require contiguous K/V for ordinary Attention layers with restricted kernels."""
+     # Import lazily to avoid a circular dependency with attention_v1.
+     from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+ 
++    cache_config = getattr(vllm_config, "cache_config", None)
++    uses_ascend_quantization = (
++        getattr(vllm_config.model_config, "quantization", None) == "ascend"
++        and getattr(cache_config, "kv_cache_dtype", "auto") != "mxfp8"
++    )
++    uses_unquantized_fia = (
++        getattr(vllm_config.model_config, "quantization", None) is None
++        and not get_current_hardware_profile().supports(HardwareCapability.PAGED_ATTENTION)
++    )
+     impl = getattr(layer, "impl", None)
+     return (
+         type(impl) is AscendAttentionBackendImpl
+         and impl.sliding_window is None
+         and getattr(vllm_config.model_config, "runner_type", None) != "pooling"
+         and spec.page_size_bytes == spec.real_page_size_bytes
+-        and using_paged_attention(None, vllm_config, spec.head_size)
++        and (using_paged_attention(None, vllm_config, spec.head_size) or uses_ascend_quantization or uses_unquantized_fia)
+     )
+ 
+ 
