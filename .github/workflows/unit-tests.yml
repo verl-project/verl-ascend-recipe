@@ -30,4 +30,4 @@ jobs:
         run: pip install pytest
 
       - name: Run unit tests
-        run: PYTHONPATH=adaptive_spec pytest tests/ adaptive_spec/tests/ -v --tb=short
+        run: PYTHONPATH=adaptive_spec python -m pytest tests/ adaptive_spec/tests/ -v --tb=short
