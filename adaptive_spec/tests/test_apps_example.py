@@ -136,11 +136,18 @@ def test_engine_shutdown_cancels_pending_output_reader_first(monkeypatch):
         reader = asyncio.create_task(asyncio.sleep(3600))
         await asyncio.sleep(0)
         module = ModuleType("vllm.utils.async_utils")
-        module.cancel_task_threadsafe = lambda task: task.cancel() if task and not task.done() else None
+        cancelled_tasks = []
+
+        def cancel_task_threadsafe(task):
+            if task and not task.done():
+                assert task.cancel()
+                cancelled_tasks.append(task)
+
+        module.cancel_task_threadsafe = cancel_task_threadsafe
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
         def shutdown(*, timeout):
-            assert reader.cancelling() == 1
+            assert cancelled_tasks == [reader]
             assert timeout == 60
 
         example.close_rollout_engine(SimpleNamespace(engine=SimpleNamespace(output_handler=reader, shutdown=shutdown)))
