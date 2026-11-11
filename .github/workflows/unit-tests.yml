@@ -30,7 +30,7 @@ jobs:
         run: pip install pytest numpy
 
       - name: Run unit tests
-        run: pytest tests/ dapo_predictor/tests/ -v --tb=short
+        run: python -m pytest tests/ dapo_predictor/tests/ -v --tb=short
 
   predictor-cpu:
     runs-on: ubuntu-latest
