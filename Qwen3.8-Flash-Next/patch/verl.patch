@@ -1,0 +1,745 @@
+diff --git a/examples/grpo_trainer/run_qwen3_8_flash_next_veomni.sh b/examples/grpo_trainer/run_qwen3_8_flash_next_veomni.sh
+new file mode 100755
+index 00000000000..45e72b06a7a
+--- /dev/null
++++ b/examples/grpo_trainer/run_qwen3_8_flash_next_veomni.sh
+@@ -0,0 +1,173 @@
++#!/usr/bin/env bash
++# GRPO training of Qwen3.8-Flash-Next with VeOmni and vLLM on Ascend NPUs.
++# Prepare CANN/ATB, the Python environment and compatible model implementations
++# on every node, then start a Ray cluster and run this script on its head node.
++# Deployment-specific memory workarounds must be configured in that environment.
++# Default topology: 4 x 16 NPUs; actor FSDP=64, EP=32, PLE=8, SP=1;
++# rollout TP=8, DP=8, EP=64. Additional Hydra overrides may be passed as arguments.
++set -euo pipefail
++
++# ===================================== Data / Model =====================================
++data_path=${data_path:-$HOME/data/geo3k}
++model_path=${model_path:-$HOME/model/Qwen3.8-Flash-Next}
++output_path=${output_path:-$HOME/output}
++project_name=${project_name:-verl_grpo_qwen3_8_flash_next_geo3k}
++exp_name=${exp_name:-qwen3_8_flash_next_veomni_$(date +%Y%m%d_%H%M%S)}
++run_dir=$output_path/$project_name/$exp_name
++max_prompt_length=${max_prompt_length:-1024}
++max_response_length=${max_response_length:-4096}
++max_model_len=$((max_prompt_length + max_response_length))
++train_batch_size=${train_batch_size:-32}
++rollout_n=${rollout_n:-4}
++actor_lr=${actor_lr:-1e-6}
++total_training_steps=${total_training_steps:-100}
++
++# ===================================== Parallelism =====================================
++nnodes=${nnodes:-4}
++npu_count=${npu_count:-16}
++fsdp_size=${fsdp_size:-64}
++expert_parallel_size=${expert_parallel_size:-32}
++ple_parallel_size=${ple_parallel_size:-8}
++infer_tp=${infer_tp:-8}
++infer_dp=${infer_dp:-8}
++infer_ep=${infer_ep:-64}
++# Use an existing cluster; set RAY_ADDRESS explicitly when multiple clusters exist.
++export RAY_ADDRESS=${RAY_ADDRESS:-auto}
++export VLLM_USE_V2_MODEL_RUNNER=1
++export VLLM_WORKER_MULTIPROC_METHOD=spawn
++export VERL_FILE_LOGGER_ROOT="$run_dir/logs"
++
++CONFIG=(
++  "--config-path=./config"
++  "--config-name=ppo_trainer"
++  "model_engine=veomni"
++)
++
++ALGORITHM=(
++  "algorithm.adv_estimator=grpo"
++  "algorithm.use_kl_in_reward=false"
++)
++
++DATA=(
++  "data.train_files=$data_path/train.parquet"
++  "data.val_files=$data_path/test.parquet"
++  "data.train_batch_size=$train_batch_size"
++  "data.max_prompt_length=$max_prompt_length"
++  "data.max_response_length=$max_response_length"
++  "data.filter_overlong_prompts=true"
++  "data.truncation=error"
++)
++
++ACTOR=(
++  "actor_rollout_ref.model.path=$model_path"
++  "actor_rollout_ref.model.trust_remote_code=true"
++  "actor_rollout_ref.model.enable_gradient_checkpointing=true"
++  "actor_rollout_ref.model.use_remove_padding=true"
++  "actor_rollout_ref.actor.optim.lr=$actor_lr"
++  "actor_rollout_ref.actor.ppo_mini_batch_size=$train_batch_size"
++  "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1"
++  "actor_rollout_ref.actor.use_dynamic_bsz=true"
++  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$max_model_len"
++  "actor_rollout_ref.actor.loss_agg_mode=token-mean"
++  "actor_rollout_ref.actor.use_kl_loss=false"
++  "actor_rollout_ref.actor.entropy_coeff=0"
++)
++
++ACTOR_VEOMNI=(
++  "actor_rollout_ref.actor.veomni.fsdp_size=$fsdp_size"
++  "actor_rollout_ref.actor.veomni.expert_parallel_size=$expert_parallel_size"
++  "actor_rollout_ref.actor.veomni.ple_parallel_size=$ple_parallel_size"
++  "actor_rollout_ref.actor.veomni.ulysses_parallel_size=1"
++  "actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2"
++  "actor_rollout_ref.actor.veomni.qsa_attention_implementation=torch_npu"
++  "actor_rollout_ref.actor.veomni.causal_conv1d_implementation=triton"
++  "actor_rollout_ref.actor.veomni.chunk_gated_delta_rule_implementation=triton"
++  "actor_rollout_ref.actor.veomni.broadcast_model_weights_from_rank0=false"
++  "actor_rollout_ref.actor.veomni.ep_sharded_stream_load=true"
++  "actor_rollout_ref.actor.veomni.mixed_precision=true"
++  "actor_rollout_ref.actor.veomni.enable_autocast=false"
++  "actor_rollout_ref.actor.veomni.param_offload=true"
++  "actor_rollout_ref.actor.veomni.optimizer_offload=true"
++  "actor_rollout_ref.actor.veomni.use_torch_compile=false"
++  "actor_rollout_ref.actor.veomni.forward_prefetch=false"
++  "actor_rollout_ref.actor.veomni.moe_implementation=fused_npu"
++  "actor_rollout_ref.actor.veomni.freeze_ple_embeddings=true"
++  "actor_rollout_ref.actor.veomni.enable_async_activation_offload=true"
++  "actor_rollout_ref.actor.veomni.activation_offload_modules=[model.language_model.layers.*]"
++)
++
++ROLLOUT=(
++  "actor_rollout_ref.rollout.name=vllm"
++  "actor_rollout_ref.rollout.load_format=safetensors"
++  "actor_rollout_ref.rollout.tensor_model_parallel_size=$infer_tp"
++  "actor_rollout_ref.rollout.data_parallel_size=$infer_dp"
++  "actor_rollout_ref.rollout.expert_parallel_size=$infer_ep"
++  "actor_rollout_ref.rollout.n=$rollout_n"
++  "actor_rollout_ref.rollout.temperature=1.0"
++  "actor_rollout_ref.rollout.top_p=1.0"
++  "actor_rollout_ref.rollout.top_k=-1"
++  "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true"
++  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$max_model_len"
++  "actor_rollout_ref.rollout.gpu_memory_utilization=0.70"
++  "actor_rollout_ref.rollout.free_cache_engine=true"
++  "+actor_rollout_ref.rollout.enable_sleep_mode=true"
++  "actor_rollout_ref.rollout.enforce_eager=false"
++  "actor_rollout_ref.rollout.enable_prefix_caching=true"
++  "actor_rollout_ref.rollout.enable_chunked_prefill=true"
++  "actor_rollout_ref.rollout.max_model_len=$max_model_len"
++  "actor_rollout_ref.rollout.max_num_batched_tokens=$max_model_len"
++  "actor_rollout_ref.rollout.max_num_seqs=32"
++  "actor_rollout_ref.rollout.ignore_eos=false"
++  # Ascend does not support the UVA lookup used by Engram CPU offload.
++  "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.cpu_offload=false"
++  "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.dp_shared_memory=false"
++  "+actor_rollout_ref.rollout.engine_kwargs.vllm.language_model_only=false"
++  "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.enable_cpu_binding=true"
++  "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode=0"
++  "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.compile_mm_encoder=false"
++  "++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=false"
++  "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY"
++)
++
++ROUTER_REPLAY=(
++  "actor_rollout_ref.actor.veomni.router_replay.mode=R3"
++  "actor_rollout_ref.rollout.enable_rollout_routing_replay=True"
++)
++
++TRAINER=(
++  "trainer.device=npu"
++  "trainer.n_gpus_per_node=$npu_count"
++  "trainer.nnodes=$nnodes"
++  "trainer.logger=[console,file]"
++  "trainer.project_name=$project_name"
++  "trainer.experiment_name=$exp_name"
++  "trainer.val_before_train=false"
++  "trainer.test_freq=-1"
++  "trainer.save_freq=10"
++  "trainer.max_actor_ckpt_to_keep=1"
++  "trainer.resume_mode=auto"
++  "trainer.total_training_steps=$total_training_steps"
++  "trainer.total_epochs=100"
++  "trainer.default_local_dir=$run_dir/checkpoints"
++  "trainer.rollout_data_dir=$run_dir/rollouts"
++)
++
++RAY=(
++  "++ray_kwargs.ray_init.address=$RAY_ADDRESS"
++  "++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_USE_V2_MODEL_RUNNER='1'"
++  "++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD=spawn"
++)
++
++# ===================================== Launch =====================================
++python -m verl.trainer.main_ppo \
++  "${CONFIG[@]}" \
++  "${ALGORITHM[@]}" \
++  "${DATA[@]}" \
++  "${ACTOR[@]}" \
++  "${ACTOR_VEOMNI[@]}" \
++  "${ROLLOUT[@]}" \
++  "${ROUTER_REPLAY[@]}" \
++  "${TRAINER[@]}" \
++  "${RAY[@]}" \
++  "hydra.run.dir=$run_dir/hydra" \
++  "$@"
+diff --git a/pyproject.toml b/pyproject.toml
+index b607cf46d0b..bdde42c5539 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -514,7 +514,7 @@ apex                 = { index = "verl-wheelhouse" }
+ flash-attn           = { index = "verl-wheelhouse" }
+ transformer-engine   = { index = "verl-wheelhouse" }
+ megatron-bridge      = { index = "verl-wheelhouse" }
+-veomni              = { git = "https://github.com/ByteDance-Seed/VeOmni.git", rev = "10a26aca258f91a7af3e698cc0db8c6c51705989" }
++veomni              = { git = "https://github.com/ByteDance-Seed/VeOmni.git", rev = "a8d357cec86643ab8fec12acc6c60a26bc7d1d29" }
+ 
+ # megatron-core isn't in the wheelhouse; git-sourced (built at sync
+ # time). The wheelhouse megatron-bridge 0.6.2 (v0.6.2 tag) pairs with
+diff --git a/uv.lock b/uv.lock
+index bee5100004b..7de11159363 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -5502,7 +5502,7 @@ wheels = [
+ [[package]]
+ name = "veomni"
+ version = "0.1.12"
+-source = { git = "https://github.com/ByteDance-Seed/VeOmni.git?rev=10a26aca258f91a7af3e698cc0db8c6c51705989#10a26aca258f91a7af3e698cc0db8c6c51705989" }
++source = { git = "https://github.com/ByteDance-Seed/VeOmni.git?rev=a8d357cec86643ab8fec12acc6c60a26bc7d1d29#a8d357cec86643ab8fec12acc6c60a26bc7d1d29" }
+ 
+ [[package]]
+ name = "verl"
+@@ -5974,8 +5974,8 @@ requires-dist = [
+     { name = "trl", marker = "extra == 'veomni'", specifier = "==0.27.0" },
+     { name = "tyro", marker = "extra == 'torchtitan'" },
+     { name = "uvicorn", marker = "extra == 'verl-core'" },
+-    { name = "veomni", marker = "extra == 'veomni'", git = "https://github.com/ByteDance-Seed/VeOmni.git?rev=10a26aca258f91a7af3e698cc0db8c6c51705989" },
+-    { name = "veomni", marker = "extra == 'veomni-sft'", git = "https://github.com/ByteDance-Seed/VeOmni.git?rev=10a26aca258f91a7af3e698cc0db8c6c51705989" },
++    { name = "veomni", marker = "extra == 'veomni'", git = "https://github.com/ByteDance-Seed/VeOmni.git?rev=a8d357cec86643ab8fec12acc6c60a26bc7d1d29" },
++    { name = "veomni", marker = "extra == 'veomni-sft'", git = "https://github.com/ByteDance-Seed/VeOmni.git?rev=a8d357cec86643ab8fec12acc6c60a26bc7d1d29" },
+     { name = "verl", extras = ["cupy-cu130"], marker = "extra == 'fsdp'" },
+     { name = "verl", extras = ["cupy-cu130"], marker = "extra == 'megatron'" },
+     { name = "verl", extras = ["cupy-cu130"], marker = "extra == 'veomni'" },
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index 040aebf9c47..c3a030e271d 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -29,7 +29,11 @@ actor_rollout_ref:
+       fsdp_size: -1
+       ulysses_parallel_size: 1
+       expert_parallel_size: 1
++      ple_parallel_size: 1
++      freeze_ple_embeddings: false
++      frozen_ple_dtype: null
+       mixed_precision: true
++      enable_autocast: true
+       low_precision_reduce_scatter_comm: false
+       seed: 42
+       full_determinism: false
+@@ -56,6 +60,7 @@ actor_rollout_ref:
+       rms_norm_gated_implementation: eager
+       causal_conv1d_implementation: eager
+       chunk_gated_delta_rule_implementation: eager
++      qsa_attention_implementation: eager
+       load_balancing_loss_implementation: eager
+       dsa_indexer_implementation: eager
+       dsa_attention_implementation: eager
+@@ -221,7 +226,11 @@ actor_rollout_ref:
+       fsdp_size: ${oc.select:actor_rollout_ref.actor.veomni.fsdp_size,-1}
+       ulysses_parallel_size: ${oc.select:actor_rollout_ref.actor.veomni.ulysses_parallel_size,1}
+       expert_parallel_size: ${oc.select:actor_rollout_ref.actor.veomni.expert_parallel_size,1}
++      ple_parallel_size: 1
++      freeze_ple_embeddings: false
++      frozen_ple_dtype: null
+       mixed_precision: true
++      enable_autocast: true
+       low_precision_reduce_scatter_comm: false
+       seed: ${oc.select:actor_rollout_ref.actor.veomni.seed,42}
+       full_determinism: false
+@@ -248,6 +257,7 @@ actor_rollout_ref:
+       rms_norm_gated_implementation: eager
+       causal_conv1d_implementation: eager
+       chunk_gated_delta_rule_implementation: eager
++      qsa_attention_implementation: eager
+       load_balancing_loss_implementation: ${oc.select:actor_rollout_ref.actor.veomni.load_balancing_loss_implementation,eager}
+       dsa_indexer_implementation: eager
+       dsa_attention_implementation: eager
+@@ -540,7 +550,11 @@ critic:
+     fsdp_size: -1
+     ulysses_parallel_size: 1
+     expert_parallel_size: 1
++    ple_parallel_size: 1
++    freeze_ple_embeddings: false
++    frozen_ple_dtype: null
+     mixed_precision: true
++    enable_autocast: true
+     low_precision_reduce_scatter_comm: false
+     seed: 42
+     full_determinism: false
+@@ -567,6 +581,7 @@ critic:
+     rms_norm_gated_implementation: eager
+     causal_conv1d_implementation: eager
+     chunk_gated_delta_rule_implementation: eager
++    qsa_attention_implementation: eager
+     load_balancing_loss_implementation: eager
+     dsa_indexer_implementation: eager
+     dsa_attention_implementation: eager
+diff --git a/verl/trainer/config/engine/veomni.yaml b/verl/trainer/config/engine/veomni.yaml
+index cab346a7d8f..4846e374cf4 100644
+--- a/verl/trainer/config/engine/veomni.yaml
++++ b/verl/trainer/config/engine/veomni.yaml
+@@ -13,8 +13,17 @@ fsdp_size: -1
+ ulysses_parallel_size: 1
+ 
+ expert_parallel_size: 1
++# Parallel degree for Qwen3.8 Flash Next PLE tables. Keep 1 for models without PLE.
++ple_parallel_size: 1
++# Freeze only Qwen4-Exp PLE lookup tables; both engines load the same fixed table.
++freeze_ple_embeddings: false
++# null preserves the model dtype; bfloat16 preserves the original Qwen3.8 table storage.
++frozen_ple_dtype: null
++
+ 
+ mixed_precision: true
++# Outer AMP only. Set false for Qwen4-Exp NPU checkpointing; FSDP stays BF16.
++enable_autocast: true
+ 
+ # Opt in to node-local BF16 gradient transport with FP32 accumulation and output.
+ # Requires CUDA FSDP2 with mixed_precision; affects backward gradient communication only.
+@@ -83,6 +92,7 @@ rotary_pos_emb_implementation: eager
+ rms_norm_gated_implementation: eager
+ causal_conv1d_implementation: eager
+ chunk_gated_delta_rule_implementation: eager
++qsa_attention_implementation: eager
+ load_balancing_loss_implementation: eager
+ dsa_indexer_implementation: eager
+ dsa_attention_implementation: eager
+diff --git a/verl/utils/transferqueue_utils.py b/verl/utils/transferqueue_utils.py
+index 6fe32ce973d..b5e40276cfa 100644
+--- a/verl/utils/transferqueue_utils.py
++++ b/verl/utils/transferqueue_utils.py
+@@ -157,6 +157,25 @@ def _find_meta(*args, **kwargs):
+     return None
+ 
+ 
++def _normalize_tq_position_ids(data: TensorDict) -> None:
++    """Preserve the sequence axis when TransferQueue rebuilds mRoPE tensors.
++
++    TQ's generic collation uses jagged dimension 1 for (rope, sequence)
++    samples. Verl expects dimension 2; changing only _ragged_idx corrupts
++    subsequent micro-batch slicing. Repack values before engine dispatch.
++    """
++    position_ids = data.get("position_ids")
++    if not isinstance(position_ids, torch.Tensor) or not position_ids.is_nested or position_ids.dim() != 3:
++        return
++    if position_ids.layout == torch.jagged and position_ids._ragged_idx == 2:
++        return
++    samples = list(position_ids.unbind(0))
++    values = torch.cat(samples, dim=-1)
++    lengths = torch.tensor([sample.shape[-1] for sample in samples], device=values.device, dtype=torch.long)
++    offsets = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
++    data["position_ids"] = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=2)
++
++
+ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
+     if isinstance(meta, KVBatchMeta):
+         meta = await async_kv_batch_meta2batch_meta(meta)
+@@ -168,6 +187,7 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
+ 
+     tq_client = tq.get_client()
+     tensordict = await tq_client.async_get_data(meta)
++    _normalize_tq_position_ids(tensordict)
+ 
+     for key, val in meta_info.items():
+         if isinstance(val, (NonTensorData | NonTensorStack)):
+diff --git a/verl/utils/veomni/frozen_ple.py b/verl/utils/veomni/frozen_ple.py
+new file mode 100644
+index 00000000000..a021536c05f
+--- /dev/null
++++ b/verl/utils/veomni/frozen_ple.py
+@@ -0,0 +1,74 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Freeze Qwen4-Exp PLE tables before optimizer construction."""
++
++import re
++
++import torch
++
++_PLE_TABLE = re.compile(r"(?:^|\.)ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
++
++
++def is_ple_table(name: str) -> bool:
++    return _PLE_TABLE.search(name) is not None
++
++
++def validate_frozen_ple_rollout(freeze_ple_embeddings: bool, rollout_name: str, load_format: str) -> None:
++    """Require real initial PLE weights when frozen tables are excluded from sync.
++
++    The NPU hybrid rollout preserves its weights across level-1 sleep. Frozen
++    tables can therefore be loaded once from the actor's model checkpoint.
++    Dummy initialization never reads those tables and subsequent actor updates
++    deliberately do not transmit them.
++    """
++    if freeze_ple_embeddings and rollout_name == "vllm" and load_format not in ("auto", "safetensors"):
++        raise ValueError(
++            "freeze_ple_embeddings excludes PLE tables from actor-to-rollout weight sync; "
++            f"rollout.load_format={load_format!r} does not guarantee checkpoint initialization. "
++            "Use actor_rollout_ref.rollout.load_format=safetensors (or auto) so rollout "
++            "loads the same immutable PLE tables from model.path before the first weight sync."
++        )
++
++
++def prepare_ple_storage(model: torch.nn.Module, dtype: str | None) -> None:
++    """Set table storage before freezing; leave all trainable weights unchanged."""
++    if dtype is None:
++        return
++    if dtype not in ("float32", "bfloat16"):
++        raise ValueError(f"Unsupported frozen PLE dtype: {dtype}")
++    for name, param in model.named_parameters():
++        if is_ple_table(name):
++            # DTensor .data assignment changes wrapper dtype but leaves its
++            # local shard unchanged. Swap the complete tensor implementation.
++            converted = torch.nn.Parameter(param.to(dtype=getattr(torch, dtype)), requires_grad=param.requires_grad)
++            torch.utils.swap_tensors(param, converted)
++
++
++def freeze_ple_tables(model: torch.nn.Module) -> tuple[int, int]:
++    """Exclude only PLE lookup tables from autograd and optimizer construction."""
++    if getattr(model.config, "model_type", None) != "qwen4_exp":
++        raise ValueError("freeze_ple_embeddings currently supports only qwen4_exp")
++    count = local_bytes = 0
++    for name, param in model.named_parameters():
++        if not is_ple_table(name):
++            continue
++        param.requires_grad_(False)
++        param.grad = None
++        local = param.to_local() if hasattr(param, "to_local") else param
++        count += 1
++        local_bytes += local.numel() * local.element_size()
++    if not count:
++        raise ValueError("freeze_ple_embeddings requested but no PLE table parameters were found")
++    return count, local_bytes
+diff --git a/verl/utils/veomni/ple_export.py b/verl/utils/veomni/ple_export.py
+new file mode 100644
+index 00000000000..93082c8b2c3
+--- /dev/null
++++ b/verl/utils/veomni/ple_export.py
+@@ -0,0 +1,48 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Restore checkpoint PLE shard shapes after gathering training partitions."""
++
++
++def ple_export_shapes(model):
++    """Use runtime checkpoint boundaries, excluding per-shard training padding."""
++    shapes = {}
++    for prefix, module in model.named_modules():
++        if not all(
++            hasattr(module, attr)
++            for attr in ("rows_per_checkpoint_shard", "padded_rows_per_shard", "split_ngram_parts", "ngram_embedding")
++        ):
++            continue
++        for index in range(module.split_ngram_parts):
++            embedding = module.ngram_embedding[f"shard_{index}"]
++            name = f"{prefix}.ngram_embedding.shard_{index}.weight".lstrip(".")
++            shapes[name] = (
++                module.rows_per_checkpoint_shard,
++                module.padded_rows_per_shard,
++                embedding.embedding_dim,
++            )
++    return shapes
++
++
++def trim_ple_export(name, tensor, shapes):
++    """Trim only known trailing padding; reject unexpected training layouts."""
++    if name not in shapes:
++        raise ValueError(f"Missing PLE export metadata for {name}")
++    rows, padded_rows, columns = shapes[name]
++    if rows <= 0 or padded_rows < rows or tuple(tensor.shape) != (padded_rows, columns):
++        raise ValueError(
++            f"Invalid PLE export shape for {name}: expected {(padded_rows, columns)}, "
++            f"got {tuple(tensor.shape)}, checkpoint rows={rows}"
++        )
++    return tensor[:rows]
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index 3d00f2627ea..a4eb04a0534 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -426,10 +426,15 @@ class VeOmniEngineConfig(EngineConfig):
+     fsdp_size: int = -1
+     ulysses_parallel_size: int = 1
+     expert_parallel_size: int = 1
++    ple_parallel_size: int = 1
++    freeze_ple_embeddings: bool = False
++    frozen_ple_dtype: Optional[str] = None
+     seed: int = 42
+     full_determinism: bool = False
+     mixed_precision: bool = False
+     low_precision_reduce_scatter_comm: bool = False
++    # Outer AMP is separate from FSDP parameter mixed precision.
++    enable_autocast: bool = True
+     init_device: str = "meta"
+     enable_full_shard: bool = False
+     ckpt_manager: Literal["dcp"] = "dcp"
+@@ -452,6 +457,7 @@ class VeOmniEngineConfig(EngineConfig):
+     rms_norm_gated_implementation: str = "eager"
+     causal_conv1d_implementation: str = "eager"
+     chunk_gated_delta_rule_implementation: str = "eager"
++    qsa_attention_implementation: str = "eager"
+     dsa_indexer_implementation: str = "eager"
+     dsa_attention_implementation: str = "eager"
+     mhc_implementation: str = "eager"
+@@ -467,6 +473,22 @@ class VeOmniEngineConfig(EngineConfig):
+     def __post_init__(self):
+         super().__post_init__()
+         assert self.strategy in ["veomni"], f"strategy {self.strategy} not supported"
++        if self.frozen_ple_dtype is not None:
++            if not self.freeze_ple_embeddings or self.frozen_ple_dtype not in ("float32", "bfloat16"):
++                raise ValueError("frozen_ple_dtype requires frozen PLE and must be float32 or bfloat16")
++        for name, size in {
++            "expert_parallel_size": self.expert_parallel_size,
++            "ple_parallel_size": self.ple_parallel_size,
++        }.items():
++            if size < 1:
++                raise ValueError(f"{name} must be positive, got {size}")
++        if self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0:
++            raise ValueError(
++                "ep_sharded_stream_load requires broadcast_model_weights_from_rank0=False "
++                "so each rank can read its own ExtraParallel checkpoint slice."
++            )
++        if self.ple_parallel_size > 1 and not self.ep_sharded_stream_load:
++            raise ValueError("ple_parallel_size > 1 requires ep_sharded_stream_load=True")
+ 
+         if not math.isfinite(self.activation_offload_host_cache_limit_gb) or (
+             self.activation_offload_host_cache_limit_gb < 0
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 3f0f145576e..3b322d92cf0 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -1478,23 +1478,21 @@ def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, lo
+ 
+         return model_output
+ 
++    def _get_forward_autocast_context(self) -> ContextManager:
++        """Use the autocast dtype resolved during FSDP setup."""
++        # Some subclasses bypass FSDPEngine's mixed-precision initialization.
++        autocast_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
++        if autocast_dtype == torch.float32:
++            return nullcontext()
++        return torch.autocast(device_type=get_device_name(), dtype=autocast_dtype)
++
+     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+         device_name = get_device_name()
+         # actually, we should avoid assigning like this...
+         micro_batch = micro_batch.to(get_device_id())
+         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+ 
+-        # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
+-        # autocast is a no-op at best and a footgun at worst, so skip it entirely.
+-        # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__
+-        # and _build_fsdp_module, so self._autocast_dtype may not be set.
+-        autocast_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
+-        autocast_ctx: ContextManager = (
+-            nullcontext()
+-            if autocast_dtype == torch.float32
+-            else torch.autocast(device_type=device_name, dtype=autocast_dtype)
+-        )
+-        with autocast_ctx:
++        with self._get_forward_autocast_context():
+             raw_output = self.module(
+                 **model_inputs,
+                 use_cache=False,
+diff --git a/verl/workers/engine/veomni/transformer_impl.py b/verl/workers/engine/veomni/transformer_impl.py
+index b2da4e82a72..65ddddc1647 100644
+--- a/verl/workers/engine/veomni/transformer_impl.py
++++ b/verl/workers/engine/veomni/transformer_impl.py
+@@ -26,7 +26,7 @@
+ from veomni.distributed import parallel_state
+ from veomni.distributed.torch_parallelize import build_parallelize_model
+ from veomni.models.auto import build_foundation_model
+-from veomni.models.checkpoint_tensor_loading import get_checkpoint_tensor_converter
++from veomni.models.checkpoint import get_checkpoint_tensor_converter
+ from veomni.optim import build_lr_scheduler, build_optimizer
+ from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
+ 
+@@ -43,6 +43,8 @@
+     set_ulysses_sequence_parallel_group,
+     slice_input_tensor,
+ )
++from verl.utils.veomni.frozen_ple import freeze_ple_tables, is_ple_table, prepare_ple_storage
++from verl.utils.veomni.ple_export import ple_export_shapes, trim_ple_export
+ from verl.utils.veomni.router_replay import RouterReplayAction, VeOmniRouterReplay
+ from verl.workers.config import HFModelConfig, VeOmniEngineConfig, VeOmniOptimizerConfig
+ 
+@@ -164,10 +166,25 @@ def __init__(
+             data_parallel_replicate_size = dp_size // fsdp_size
+             data_parallel_shard_size = fsdp_size
+ 
++        # EP/PLE partitions span dp_shard_sp, including SP ranks but excluding HSDP replicas.
++        param_shard_size = data_parallel_shard_size * self.engine_config.ulysses_parallel_size
++        for name, size in {
++            "expert_parallel_size": self.engine_config.expert_parallel_size,
++            "ple_parallel_size": self.engine_config.ple_parallel_size,
++        }.items():
++            if param_shard_size % size:
++                raise ValueError(
++                    f"Parameter shard size (dp_shard_size * ulysses_parallel_size = {param_shard_size}) "
++                    f"must be divisible by {name} ({size})."
++                )
++
+         accelerator = AcceleratorConfig(
+             dp_replicate_size=data_parallel_replicate_size,
+             dp_shard_size=data_parallel_shard_size,
+             ep_size=self.engine_config.expert_parallel_size,
++            extra_parallel_sizes=[self.engine_config.ple_parallel_size],
++            extra_parallel_placement_innermost=[False],
++            extra_parallel_names=["ple"],
+             ulysses_size=self.engine_config.ulysses_parallel_size,
+             init_device=self.engine_config.init_device,
+             fsdp_config=FSDPConfig(fsdp_mode=self.data_parallel_mode),
+@@ -396,7 +413,14 @@ def _build_model_optimizer(self):
+             ep_sharded_stream_load=self.engine_config.ep_sharded_stream_load,
+             fqn_to_index_mapping=load_safetensors_index(self.model_config.local_path),
+         )
++        # VeOmni upcasts the model to FP32 during parallelization. Restore only
++        # the ignored, persistently sharded frozen tables before optimizer setup.
++        if self.engine_config.freeze_ple_embeddings:
++            prepare_ple_storage(module, self.engine_config.frozen_ple_dtype)
+         log_gpu_memory_usage("After parallelize model", logger=logger)
++        if self.engine_config.freeze_ple_embeddings:
++            count, local_bytes = freeze_ple_tables(module)
++            logger.info("Frozen PLE: %d tables, %.3f GiB local on rank %d", count, local_bytes / 2**30, self.rank)
+ 
+         if not self.engine_config.forward_only:
+             # Initialize optimizer with model parameters and config settings
+@@ -662,7 +686,10 @@ def _get_hf_export_per_tensor_param(self):
+         # here leaves the module half-moved and crashes state_dict() below (#5995). The
+         # per-DTensor .to(device).full_tensor() in param_generator() below stages each
+         # shard instead, so the manual whole-model move is unnecessary under CPU offload.
+-        if not getattr(self, "_uses_fsdp2_cpu_offload_policy", False):
++        # Under manual offload, state_dict must also be taken on CPU: otherwise
++        # its tensor references retain every device shard even after module offload.
++        # The generator stages just the current parameter for its collective.
++        if not self._is_offload_param and not getattr(self, "_uses_fsdp2_cpu_offload_policy", False):
+             load_veomni_model_to_gpu(self.module)
+ 
+         # TODO: currently only for DeepseekV4, unify all models to export weights by converter.
+@@ -671,7 +698,13 @@ def _get_hf_export_per_tensor_param(self):
+             return converter.export_weights(self.module), None
+ 
+         params = self.module.state_dict()
+-        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
++        key_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
++        params = convert_weight_keys(params, key_model)
++        ple_shapes = (
++            convert_weight_keys(ple_export_shapes(self.module), key_model)
++            if not self.engine_config.freeze_ple_embeddings
++            else {}
++        )
+ 
+         if self._is_offload_param:
+             offload_veomni_model_to_cpu(self.module)
+@@ -684,10 +717,21 @@ def _get_hf_export_per_tensor_param(self):
+ 
+         def param_generator():
+             for name, param in params.items():
++                # Rollout loaded the identical immutable table from model.path.
++                # Do not all-gather or retransmit it on every policy update.
++                if self.engine_config.freeze_ple_embeddings and is_ple_table(name):
++                    continue
+                 unsharded_tensor = (
+-                    param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
++                    param.to(device, non_blocking=True).full_tensor()
++                    if isinstance(param, DTensor)
++                    else param.to(device, non_blocking=True)
+                 )
+ 
++                # Gather first: slicing a local PLE partition would remove real rows.
++                # Rollout expects checkpoint boundaries, not ExtraParallel padding.
++                if is_ple_table(name):
++                    unsharded_tensor = trim_ple_export(name, unsharded_tensor, ple_shapes)
++
+                 is_expert_layer = "mlp.experts." in name
+                 is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
+ 
+@@ -698,12 +742,14 @@ def param_generator():
+                         tensor = unsharded_tensor if src_ep_rank == ep_rank else buffer
+                         torch.distributed.broadcast(tensor, group_src=src_ep_rank, group=ps.ep_group)
+                         yield from process_func(name, tensor, expert_id_base=src_ep_rank * tensor.size(0))
++                    del tensor, buffer
+ 
+                 else:
+                     if is_expert_layer:
+                         yield from process_func(name, unsharded_tensor, expert_id_base=0)
+                     else:
+                         yield name, unsharded_tensor
++                del unsharded_tensor
+ 
+         # TODO: support VeOmni LoRA
+         return param_generator(), None
+@@ -879,6 +925,13 @@ def _prepare_veomni_flash_attention_kwargs(position_ids: torch.Tensor) -> dict[s
+ 
+ @EngineRegistry.register(model_type="language_model", backend=["veomni"], device=["cuda", "npu"])
+ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
++    def _get_forward_autocast_context(self):
++        # Disable inherited AMP too; Qwen4-Exp checkpoint recomputation must
++        # use the same activation dtype as its original forward pass.
++        if not self.engine_config.enable_autocast:
++            return torch.autocast(device_type=get_device_name(), enabled=False)
++        return super()._get_forward_autocast_context()
++
+     def prepare_model_inputs(self, micro_batch: TensorDict):
+         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+         self._apply_veomni_input_transforms(model_inputs, micro_batch)
+diff --git a/verl/workers/engine/veomni/utils.py b/verl/workers/engine/veomni/utils.py
+index 3926ae989b5..c6ce852e950 100644
+--- a/verl/workers/engine/veomni/utils.py
++++ b/verl/workers/engine/veomni/utils.py
+@@ -40,6 +40,10 @@
+         "IMAGE_INPUT_INDEX": 248056,
+         "VIDEO_INPUT_INDEX": 248057,
+     },
++    "qwen4_exp": {
++        "IMAGE_INPUT_INDEX": 248056,
++        "VIDEO_INPUT_INDEX": 248057,
++    },
+ }
+ 
+ 
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index 767f2def81c..c72353fd165 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -634,6 +634,13 @@ def init_model(self):
+         if "actor" in self.role:
+             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
+             actor_config.model_config = model_config
++            from verl.utils.veomni.frozen_ple import validate_frozen_ple_rollout
++
++            validate_frozen_ple_rollout(
++                getattr(actor_config.engine, "freeze_ple_embeddings", False),
++                self.config.rollout.name,
++                self.config.rollout.load_format,
++            )
+             distillation_config: Optional[DistillationConfig] = (
+                 omega_conf_to_dataclass(self.distillation_config) if self.distillation_enabled else None
+             )

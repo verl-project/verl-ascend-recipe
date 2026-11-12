@@ -1,0 +1,15 @@
+# Apply VERL_PATCH to COMMIT before installing or running this recipe.
+# The root install_verl.sh installs the base only; use this recipe's install.sh.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=592cba13531a32b69eccd490a04b795a89587854
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@592cba13531a32b69eccd490a04b795a89587854
+RECIPE_FOLDER=Qwen3.8-Flash-Next
+VERL_PATCH=patch/verl.patch
+SOURCE_PR=https://github.com/verl-project/verl/pull/8583
+SOURCE_HEAD=34bf6219a86a87e9224d584de072adcecaf0850c
+VEOMNI_COMMIT=a8d357cec86643ab8fec12acc6c60a26bc7d1d29
+TRANSFORMERS_VERSION=5.16.1
+# Rollout versions reported in the source PR; provision these before install.sh.
+VLLM_VERSION=0.32.0.empty
+VLLM_ASCEND_COMMIT=fd4be4dbcf751fcff0dd99d18389caf40680e9e7
