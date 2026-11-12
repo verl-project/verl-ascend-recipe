@@ -36,7 +36,6 @@ SP_SIZE=${SP_SIZE:-2}                 # Ulysses sequence parallel size, 1 disabl
 USE_PEFT=${USE_PEFT:-1}               # 1 enables LoRA, 0 for full-parameter SFT
 LORA_RANK=${LORA_RANK:-32}
 LORA_ALPHA=${LORA_ALPHA:-16}
-LORA_DROPOUT=${LORA_DROPOUT:-0.05}
 LORA_TARGETS=${LORA_TARGETS:-all-linear}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
 MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-2}
@@ -53,7 +52,6 @@ if [ "${USE_PEFT}" = "1" ]; then
     extra_args+=(
         "model.lora_rank=${LORA_RANK}"
         "model.lora_alpha=${LORA_ALPHA}"
-        "model.lora_dropout=${LORA_DROPOUT}"
         "model.target_modules=${LORA_TARGETS}"
     )
 fi
@@ -79,4 +77,4 @@ torchrun --nnodes=${NNODES} --nproc_per_node=${NPROC_PER_NODE} --master_port=${M
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.total_epochs=${TOTAL_EPOCHS} \
-  trainer.logger='["console","wandb"]'
+  trainer.logger='["console","wandb"]' "$@"
