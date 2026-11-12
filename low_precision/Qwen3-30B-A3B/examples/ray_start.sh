@@ -12,7 +12,6 @@ unset HTTPS_PROXY
 ulimit -n 32768
 umask 0027
 
-export HCCL_OP_EXPANSION_MODE="AIV" 
 export RAY_DEDUP_LOGS=0
 export HYDRA_FULL_ERROR=1
 export VLLM_ASCEND_ENABLE_NZ=0
@@ -30,16 +29,44 @@ export MULTI_STREAM_MEMORY_REUSE=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 
 
-NNODES=2
-NPUS_PER_NODE=8
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# 机器配置：A5=4机x8卡，A3=2机x16卡
+CLUSTER_PROFILE=${CLUSTER_PROFILE:-A5}
 
-#修改为对应主节点IP
+# 是否启用 MXFP8 低精度：True 或 False
+export ENABLE_MXFP8="${ENABLE_MXFP8:-True}"
+
+# 是否忽略 EOS：性能测试 True，精度测试 False
+export IGNORE_EOS="${IGNORE_EOS:-True}"
+
+case "${CLUSTER_PROFILE}" in
+  A5)
+    export NNODES=4
+    export NPUS_PER_NODE=8
+    ;;
+  A3)
+    export NNODES=2
+    export NPUS_PER_NODE=16
+    ;;
+  *)
+    echo "Unsupported CLUSTER_PROFILE: ${CLUSTER_PROFILE}. Expected A5 or A3." >&2
+    exit 1
+    ;;
+esac
+
+if [ "${CLUSTER_PROFILE}" = "A3" ] && [ "${ENABLE_MXFP8}" = "True" ]; then
+  echo "MXFP8 is not supported on A3. Set ENABLE_MXFP8=False or use CLUSTER_PROFILE=A5." >&2
+  exit 1
+fi
+
+export ASCEND_RT_VISIBLE_DEVICES="$(seq -s, 0 "$((NPUS_PER_NODE - 1))")"
+echo "Cluster profile: ${CLUSTER_PROFILE}, nodes: ${NNODES}, NPUs per node: ${NPUS_PER_NODE}"
+
+# 修改为对应主节点IP
 MASTER_ADDR="IP FOR MASTER NODE"
-
-#修改为当前节点的通信网卡
 export HCCL_HOST_SOCKET_PORT_RANGE=auto
 export HCCL_NPU_SOCKET_PORT_RANGE=auto
+
+# 修改为当前节点的通信网卡
 SOCKET_IFNAME="Your SOCKET IFNAME"
 export HCCL_SOCKET_IFNAME=$SOCKET_IFNAME
 export GLOO_SOCKET_IFNAME=$SOCKET_IFNAME
@@ -52,7 +79,8 @@ export CURRENT_IP=$(ifconfig $SOCKET_IFNAME | grep -Eo 'inet (addr:)?([0-9]{1,3}
 echo $MASTER_ADDR
 echo $CURRENT_IP
 
-DEFAULT_SH="run_grpo_qwen3_moe_30b_megatron.sh"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DEFAULT_SH="${SCRIPT_DIR}/run_grpo_qwen3_moe_30b_megatron_32k.sh"
 echo "Use $DEFAULT_SH"
 
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
