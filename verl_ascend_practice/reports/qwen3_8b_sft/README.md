@@ -1,20 +1,20 @@
 # Qwen3-8B 在昇腾 A2 上的 FSDP 监督微调
 
-单机 8 张 Ascend 910B4 上，Qwen3-8B 开启 LoRA 和两路 Ulysses 序列并行，从初始模型连续训练 100 步。首末各 10 步的平均训练 loss 从 **1.0664 降至 0.3276**；第 11–90 步八卡合计吞吐约 **1,318 tokens/s**，折合 **164.7 tokens/s/卡**。另一次关闭 LoRA 和序列并行的全参数作业完成了两步更新、验证和保存。两次成功运行的原始日志均随报告提交。[社区任务 #74](https://github.com/verl-project/verl-ascend-recipe/issues/74)
+单机 8 张 Ascend 910B4 上，Qwen3-8B 开启 LoRA 和两路 Ulysses 序列并行，从初始模型连续训练 100 步。首末各 10 步的平均训练 loss 从 **1.0664 降至 0.3276**；第 11–90 步八卡合计吞吐约 **1,318 tokens/s**，折合 **164.7 tokens/s/卡**。在相同的 SP=2 和全局 batch 32 下，全参数作业也完成了 100 步，第 11–90 步八卡合计 **483.2 tokens/s**。两次长跑均通过最终验证，保存检查点并以状态码 0 退出。[社区任务 #74](https://github.com/verl-project/verl-ascend-recipe/issues/74)
 
 ## 算法与适配
 
 训练入口调用 `verl.trainer.sft_trainer`，由 FSDP 在 8 个进程间分片模型。GSM8K 问题构成用户消息，参考解答构成助手消息，训练目标是在问题上下文中预测解答 token。LoRA 作业在基座模型的线性层上训练适配器，并以 `SP_SIZE=2` 将序列分到两路计算。全参数作业关闭适配器，对基座参数执行更新。
 
-| 实测参数 | LoRA 长跑 | 全参数功能验证 |
+| 实测参数 | LoRA 长跑 | 全参数长跑 |
 | --- | ---: | ---: |
-| 训练步数 / 全局 batch | 100 / 32 | 2 / 8 |
-| 序列并行大小 | 2 | 1 |
+| 训练步数 / 全局 batch | 100 / 32 | 100 / 32 |
+| 序列并行大小 | 2 | 2 |
 | LoRA rank / alpha / 目标层 | 32 / 16 / `all-linear` | 关闭 |
 | 每卡 micro batch / 最大序列长度 | 1 / 1,024 | 1 / 1,024 |
-| 每卡动态 batch token 预算 | 2,048 | 1,024 |
+| 每卡动态 batch token 预算 | 2,048 | 2,048 |
 | 学习率 | 1e-4 | 1e-4 |
-| 最终验证样本数 | 128 | 8 |
+| 最终验证样本数 | 128 | 128 |
 
 启动脚本通过 `USE_PEFT` 和 `SP_SIZE` 分别控制两个开关，允许在命令末尾追加 Hydra 参数。适配 verl 0.9.1 时移除了模型配置中未声明的 `model.lora_dropout` 覆盖项。[训练入口](../../../sft/run_qwen3_8b_fsdp_sft_npu.sh)
 
@@ -28,14 +28,15 @@
 | verl / Transformers / PEFT | 0.9.1 / 5.5.4 / 0.21.2 |
 | TensorDict / NumPy | 0.10.0 / 1.26.4 |
 
-首次运行完成训练、评估与保存，但进程退出时收到 `SIGABRT`。仅导入训练器也能复现异常。该镜像预加载系统 `libjemalloc.so.2` 后，导入检查、全参数两步验证及重新从初始权重训练的 100 步作业均以状态码 0 退出。下表与曲线只使用后两次成功作业。
+首次运行完成训练、评估与保存，但进程退出时收到 `SIGABRT`。仅导入训练器也能复现异常。该镜像预加载系统 `libjemalloc.so.2` 后，导入检查、全参数两步验证及重新从初始权重训练的 100 步作业均以状态码 0 退出。全参数 100 步作业沿用相同的分配器设置。下表列出两次长跑，曲线取自 LoRA 作业。
 
 ```bash
 set -eo pipefail
 export RECIPE_DIR="$PWD"
 export PATH=/usr/local/python3.12.13/bin:$PATH
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /workspace/issue74-validation/env/bin/activate
+# 按训练环境的实际位置设置；全参数长跑使用 /workspace/val_sft/env。
+source "${VERL_ENV:-/workspace/issue74-validation/env}/bin/activate"
 export LD_PRELOAD=/lib/aarch64-linux-gnu/libjemalloc.so.2
 export OMP_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false WANDB_MODE=disabled
 npu-smi info
@@ -93,21 +94,21 @@ USE_PEFT=1 SP_SIZE=2 TRAIN_BATCH_SIZE=32 LORA_RANK=32 LORA_ALPHA=16 LORA_TARGETS
   trainer.total_training_steps=100 data.val_max_samples=128 data.max_token_len_per_gpu=2048 \
   2>&1 | tee lora_sp2_100steps.log
 
-# 全参数，两步功能验证
-USE_PEFT=0 SP_SIZE=1 TRAIN_BATCH_SIZE=8 SAVE_PATH="$PWD/checkpoints_full_2" \
-  bash "$entry" "${common[@]}" trainer.total_training_steps=2 data.val_max_samples=8 \
-  data.max_token_len_per_gpu=1024 'checkpoint.save_contents=[model]' \
-  2>&1 | tee full_sp1_2steps.log
+# 全参数，连续 100 步
+USE_PEFT=0 SP_SIZE=2 TRAIN_BATCH_SIZE=32 SAVE_PATH="$PWD/checkpoints_full_100" \
+  bash "$entry" "${common[@]}" trainer.total_training_steps=100 data.val_max_samples=128 \
+  data.max_token_len_per_gpu=2048 'checkpoint.save_contents=[model]' \
+  2>&1 | tee full.log
 ```
 
 ## 实测结果与证据
 
-| 观测项 | [LoRA 完整训练日志](logs/lora_sp2_100steps.log) | [全参数完整训练日志](logs/full_sp1_2steps.log) |
+| 观测项 | [LoRA 完整训练日志](logs/lora_sp2_100steps.log) | [全参数完整训练日志](logs/full.log) |
 | --- | ---: | ---: |
-| 连续更新步数 | 100 | 2 |
-| 第一步 → 最后一步训练 loss | 1.4982 → 0.2753 | 1.4145 → 0.8970 |
-| 最终验证 loss | 0.3928（128 条） | 1.0729（8 条） |
-| 峰值已分配 / 保留显存，GiB | 13.13 / 18.81 | 22.22 / 28.48 |
+| 连续更新步数 | 100 | 100 |
+| 第一步 → 最后一步训练 loss | 1.4982 → 0.2753 | 1.4982 → 0.4211 |
+| 最终验证 loss | 0.3928（128 条） | 0.4737（128 条） |
+| 峰值已分配 / 保留显存，GiB | 13.13 / 18.81 | 22.22 / 27.53 |
 
 ![LoRA 100 步逐步训练 loss 及最近 10 步移动平均](lora_training_loss.png)
 
@@ -118,11 +119,12 @@ USE_PEFT=0 SP_SIZE=1 TRAIN_BATCH_SIZE=8 SAVE_PATH="$PWD/checkpoints_full_2" \
 | 配置 | 计时窗口 | 全局训练 token | 耗时（秒） | 八卡合计（tokens/s） | 折合每卡（tokens/s） |
 | --- | --- | ---: | ---: | ---: | ---: |
 | LoRA 开启，SP=2，batch 32 | 第 1 步，含预热 | 5,859 | 11.21 | 522.7 | 65.3 |
-| LoRA 关闭，SP=1，batch 8 | 第 1 步，含预热 | 1,574 | 14.10 | 111.6 | 14.0 |
+| LoRA 关闭，SP=2，batch 32 | 第 1 步，含预热 | 5,859 | 14.32 | 409.1 | 51.1 |
 | LoRA 开启，SP=2，batch 32 | 第 11–90 步 | 487,529 | 370 | 1,317.6 | 164.7 |
+| LoRA 关闭，SP=2，batch 32 | 第 11–90 步 | 487,529 | 1,009 | 483.2 | 60.4 |
 
-八卡 TPS 为窗口内 `train/global_tokens` 总和除以耗时，每卡值再除以 8。首步耗时取各自进度条第一次完成迭代时的 `s/it`。LoRA 长跑使用第 10 步与第 90 步进度时间之差（精度为秒），避开了预热、最终评估和保存。全参数作业的第 2 步随后执行验证和保存，日志没有单独记录该步的训练耗时，因此只报告可独立计时的首步。两组的全局 batch 和序列并行配置也不同，这些数值不能用于估算单独切换 LoRA 的加速比。
+八卡 TPS 为窗口内 `train/global_tokens` 总和除以耗时，每卡值再除以 8。首步耗时取各自进度条第一次完成迭代时的 `s/it`。两次长跑均使用第 10 步与第 90 步进度时间之差（精度为秒），避开了预热、最终评估和保存。较早的 [SP=1、batch 8 全参数两步功能验证](logs/full_sp1_2steps.log) 使用不同配置，单独保留。
 
 ## 验收范围
 
-按 [issue #74](https://github.com/verl-project/verl-ascend-recipe/issues/74) 的无 GPU 标杆条件，LoRA 作业提供了 100 步 loss 下降和训练 TPS 超过 100 的证据。全参数作业验证了权重更新和保存；两次运行的 batch、验证样本数和步数不同，不能据此比较两种训练方法的精度。GSM8K 生成准确率、A100 相对性能和检查点恢复尚未实测。
+按 [issue #74](https://github.com/verl-project/verl-ascend-recipe/issues/74) 的无 GPU 标杆条件，LoRA 作业提供了 100 步 loss 下降和训练 TPS 超过 100 的证据。全参数作业首末各 10 步平均训练 loss 从 0.7583 降至 0.4682，第 100 步的模型检查点包含全部 8 个 rank 分片。GSM8K 生成准确率、A100 相对性能和检查点恢复尚未实测。

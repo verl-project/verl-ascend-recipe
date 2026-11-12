@@ -70,11 +70,12 @@ an assistant answer. The validation loss used a subset of the GSM8K test split.
 | Mode | Steps | Global batch | Validation samples | Final training loss | Validation loss | Exit code |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | LoRA rank 32, SP=2 | 100 | 32 | 128 | 0.2753 | 0.3928 | 0 |
-| Full parameters, SP=1 | 2 | 8 | 8 | 0.8970 | 1.0729 | 0 |
+| Full parameters, SP=2 | 100 | 32 | 128 | 0.4211 | 0.4737 | 0 |
 
 For the LoRA run, average training loss fell from 1.0664 over steps 1–10 to
 0.3276 over steps 91–100. Steps 11–90 processed 487,529 global training tokens
-in approximately 370 seconds (1,318 tokens/s across eight cards). This uses
+in approximately 370 seconds (1,318 tokens/s across eight cards). The full-parameter run processed the same token count in 1,009 seconds
+(483.2 tokens/s across eight cards). Both measurements use
 elapsed times from the training progress log. Peak allocated NPU memory
 reported by the trainer was 13.13 GiB for LoRA and 22.22 GiB for full training.
 GSM8K generation accuracy and A100-relative throughput remain unmeasured.
