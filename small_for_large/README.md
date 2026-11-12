@@ -270,4 +270,29 @@ Pruned model scores:
 | gsm8k   | 64       | 6       | 500        | 39.58                 |
 
 
+**8. Verify the pruned checkpoint (recommended)**
+
+`expert_pruned.py` rewrites shards, renumbers experts and rewrites `config.json` in one pass. We recommend verifying the pruned output before serving it, with the companion gate `verify_pruned.py`:
+
+```bash
+# 8.1 BEFORE pruning: snapshot the source directory fingerprint
+python verify_pruned.py --source /path/DeepSeek-V4-Flash-bf16 --snapshot source_fp.json --fingerprint-only
+
+# 8.2 prune as usual (step 6), then verify:
+python verify_pruned.py --source /path/DeepSeek-V4-Flash-bf16 --pruned /path/DeepSeek-V4-Flash-bf16-top64-pruned --json-path top64_experts.json --top-k 64 --snapshot source_fp.json
+```
+
+The gate verifies, without loading the full model into memory:
+
+| Check | What it proves |
+|---|---|
+| source integrity | the source directory is unchanged since the pre-prune snapshot (the prune provably never touched the original weights) |
+| kept-expert fidelity | every kept expert tensor in the pruned model is byte-equal to the mapped slice of the source, using the same remapping `expert_pruned.py` applies |
+| router fidelity | `gate.weight` / `gate.bias` rows of kept experts are byte-equal to the source rows |
+| coverage | every prunable layer is present in the topk JSON — a missing layer would otherwise silently keep experts `0..N-1` |
+| config diff | only `n_routed_experts` changed |
+| stale expert dims | passthrough tensors in pruned layers that still carry a dimension of the old expert count are reported for review |
+
+Results are written to `PROVENANCE.json` next to the pruned model (source fingerprint, keep-list hash, per-check stats, verdict). The tool exits non-zero on any failure, so it can be used as a hard gate in automated pipelines.
+
 ## 3. Training-Side Patch Adaptation (TODO)
