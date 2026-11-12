@@ -108,7 +108,6 @@ USE_PEFT=0 SP_SIZE=1 TRAIN_BATCH_SIZE=8 SAVE_PATH="$PWD/checkpoints_full_2" \
 | 第一步 → 最后一步训练 loss | 1.4982 → 0.2753 | 1.4145 → 0.8970 |
 | 最终验证 loss | 0.3928（128 条） | 1.0729（8 条） |
 | 峰值已分配 / 保留显存，GiB | 13.13 / 18.81 | 22.22 / 28.48 |
-| 检查点 | 第 100 步，模型、优化器、额外状态各 8 个分片 | 第 2 步，8 个模型分片 |
 
 ![LoRA 100 步逐步训练 loss 及最近 10 步移动平均](lora_training_loss.png)
 
