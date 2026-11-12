@@ -22,15 +22,13 @@
 
 | 组件 | 实测配置 |
 | --- | --- |
-| 硬件 | 单机 8 × Ascend 910B4，每卡 32 GiB |
+| 硬件 |  8 × Ascend 910B4，每卡 32 GiB |
 | 系统 / Python | Ubuntu 22.04 / Python 3.12.13 |
 | CANN / PyTorch / torch_npu | 9.1.0 / 2.10.0+cpu / 2.10.0.post4 |
 | verl / Transformers / PEFT | 0.9.1 / 5.5.4 / 0.21.2 |
 | TensorDict / NumPy | 0.10.0 / 1.26.4 |
 
 首次运行完成训练、评估与保存，但进程退出时收到 `SIGABRT`。仅导入训练器也能复现异常。该镜像预加载系统 `libjemalloc.so.2` 后，导入检查、全参数两步验证及重新从初始权重训练的 100 步作业均以状态码 0 退出。下表与曲线只使用后两次成功作业。
-
-在已安装上述依赖的验证环境中，从 recipe 仓库根目录执行。更换机器时按实际位置设置虚拟环境与模型路径，确保 `torchrun` 使用安装了 verl 的同一 Python 环境。
 
 ```bash
 set -eo pipefail
@@ -46,7 +44,7 @@ python -m pip show verl torch torch-npu transformers peft tensordict
 
 ## 模型与数据
 
-实测模型目录为 `/workspace/Qwen3_8b`，含配置、tokenizer 和 5 个 safetensors 权重分片。使用 GSM8K 原始 train/test 划分（7,473 / 1,319 条），按原始行序保留题目、推导和最终答案。以下转换得到训练器读取的 `messages` 列。[模型](https://huggingface.co/Qwen/Qwen3-8B) · [GSM8K 原始数据](https://github.com/openai/grade-school-math/tree/master/grade_school_math/data)
+实测模型目录为 `/workspace/Qwen3_8b`，含配置、tokenizer 和 5 个 safetensors 权重分片。使用 GSM8K 原始 train/test 划分，按原始行序保留题目、推导和最终答案。以下转换得到训练器读取的 `messages` 列。[模型](https://huggingface.co/Qwen/Qwen3-8B) · [GSM8K 原始数据](https://github.com/openai/grade-school-math/tree/master/grade_school_math/data)
 
 ```bash
 export MODEL_PATH=/workspace/Qwen3_8b
@@ -111,13 +109,11 @@ USE_PEFT=0 SP_SIZE=1 TRAIN_BATCH_SIZE=8 SAVE_PATH="$PWD/checkpoints_full_2" \
 | 最终验证 loss | 0.3928（128 条） | 1.0729（8 条） |
 | 峰值已分配 / 保留显存，GiB | 13.13 / 18.81 | 22.22 / 28.48 |
 | 检查点 | 第 100 步，模型、优化器、额外状态各 8 个分片 | 第 2 步，8 个模型分片 |
-| 作业退出码 | 0 | 0 |
 
 ![LoRA 100 步逐步训练 loss 及最近 10 步移动平均](lora_training_loss.png)
 
 曲线取自 LoRA 日志中全部 100 条 `train/loss`。下降主要发生在前 30 步；第 21–30 步均值为 0.3886，第 91–100 步均值为 0.3276。逐步核对两份日志，所有训练 loss 和梯度范数均为有限值，梯度范数均大于零。
 
-**吞吐计算**采用 LoRA 作业第 11–90 步的 `train/global_tokens` 总和，除以进度日志第 10 步至第 90 步之间的累计时间差。487,529 ÷ 370 ≈ **1,317.6 tokens/s**；再除以全部 8 张卡，约为 **164.7 tokens/s/卡**。该值统计训练输入序列中的全局 token，计时精度为秒，窗口避开了启动、最终评估和保存。显存取各步 `perf/max_memory_allocated_gb` 和 `perf/max_memory_reserved_gb` 的最大记录值。
 
 ## 验收范围
 
