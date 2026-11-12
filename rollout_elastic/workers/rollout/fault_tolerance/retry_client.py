@@ -205,13 +205,7 @@ class RetryLLMServerClient(LLMServerClient):
                             routed_experts=checkpoint.cumulative_routed_experts,
                             num_preempted=checkpoint.num_preempted,
                             stop_reason="length",
-                            extra_fields={
-                                "global_steps": None,
-                                "min_global_steps": checkpoint.min_global_steps,
-                                "max_global_steps": checkpoint.max_global_steps,
-                                "llm_generate_attempts": retries,
-                                "llm_generate_retries": retries,
-                            },
+                            extra_fields={"global_steps": self._last_global_step},
                         )
                     call_sampling[self._generation_budget_key()] = remaining_max_tokens
                     if result.inherited_prefix_len > 0:
@@ -299,12 +293,8 @@ class RetryLLMServerClient(LLMServerClient):
                 final = output
             # Match the native v0.9.0 convention: a plain successful result reports
             # its weight version as both min and max (never overwrite an existing range).
-            for key, reduce in (("min_global_steps", min), ("max_global_steps", max)):
-                values = [final.extra_fields.get(key, gs)]
-                if progress_on and progress_ctx is not None and inherited_ids:
-                    values.append(getattr(cp, key, None))
-                known = [v for v in values if v is not None]
-                final.extra_fields[key] = reduce(known) if known else None
+            final.extra_fields.setdefault("min_global_steps", gs)
+            final.extra_fields.setdefault("max_global_steps", gs)
             final.extra_fields["llm_generate_attempts"] = retries + 1
             final.extra_fields["llm_generate_retries"] = retries
             if retries > 0:
