@@ -1,0 +1,43 @@
+diff --git a/verl/checkpoint_engine/mooncake_checkpoint_engine.py b/verl/checkpoint_engine/mooncake_checkpoint_engine.py
+index ed9f0c59..48aaf8c4 100644
+--- a/verl/checkpoint_engine/mooncake_checkpoint_engine.py
++++ b/verl/checkpoint_engine/mooncake_checkpoint_engine.py
+@@ -20,7 +20,6 @@ from typing import Any, AsyncGenerator, Generator
+ 
+ import ray
+ import torch
+-from mooncake.engine import TransferEngine
+ 
+ try:
+     from vllm.distributed.utils import StatelessProcessGroup
+@@ -55,6 +54,9 @@ class MooncakeCheckpointEngine(CheckpointEngine):
+         is_master: bool = False,
+         rebuild_group: bool = False,
+     ):
++        # Load this optional native backend only when selected.
++        from mooncake.engine import TransferEngine
++
+         self.bucket_size = bucket_size
+         self.device = device
+         self.rollout_dtype = rollout_dtype
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index 9bc01244..2da704a0 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -761,10 +761,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         aggressive_empty_cache(force_sync=True)
+         log_gpu_memory_usage("Before resume weights", logger=logger)
+ 
+-        # 1. resume rollout memory (weights were released during sleep)
+-        # sleep_level=1 (adapter mode) never released weights, so do not resume them.
+-        # Backends other than sglang carry no sleep_level, hence the default.
+-        if self.config.rollout.free_cache_engine and getattr(self.rollout, "sleep_level", 2) != 1:
++        # 1. Resume rollout memory before writing updated weights. vLLM-Ascend
++        # uses level 1 while still unmapping weight allocations, so it must
++        # restore them before the weight transfer.
++        if self.config.rollout.free_cache_engine and (
++            self.config.rollout.name != "sglang" or getattr(self.rollout, "sleep_level", 2) != 1
++        ):
+             await self.rollout.resume(tags=["weights"])
+         log_gpu_memory_usage("After resume weights", logger=logger)
+ 
