@@ -2,7 +2,7 @@
 
 基于 VeOmni 训练后端和 vLLM rollout 后端，在 Ascend NPU 上对 Qwen3.8 Flash Next（`model_type=qwen4_exp`）进行 GRPO 后训练。
 
-目录沿用 [DeepSeek-V4-Flash](../DeepSeek-V4-Flash) 的 `install.sh`、`examples/`、`patch/verl.patch` 和 `readme.md` 组织方式。补丁来自 [verl PR #8583](https://github.com/verl-project/verl/pull/8583)，固定到 head `34bf6219a86a87e9224d584de072adcecaf0850c`，仅移除 CI workflow 和测试文件的改动，其余 13 个文件的改动保持一致。
+目录沿用 [DeepSeek-V4-Flash](../DeepSeek-V4-Flash) 的 `install.sh`、`examples/`、`patch/verl.patch` 和 `readme.md` 组织方式。补丁来自 [verl PR #8583](https://github.com/verl-project/verl/pull/8583)，固定到 head `34bf6219a86a87e9224d584de072adcecaf0850c`，移除 CI workflow 和测试文件的改动，并将训练示例的 `async_scheduling` 设为 `true`、`max_num_seqs` 设为 `128`；其余功能改动保持一致。
 
 ## Required `verl` version
 
@@ -88,7 +88,7 @@ output_path="$HOME/output" \
 bash "$RECIPE_DIR/examples/run_qwen3_8_flash_next_veomni.sh"
 ```
 
-[启动脚本](examples/run_qwen3_8_flash_next_veomni.sh) 与源 PR 中的示例保持一致，支持环境变量和追加 Hydra 参数，例如：
+[启动脚本](examples/run_qwen3_8_flash_next_veomni.sh) 基于源 PR 示例，将 `++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=true` 和 `actor_rollout_ref.rollout.max_num_seqs=128` 作为默认值；支持环境变量和追加 Hydra 参数，例如：
 
 ```bash
 bash "$RECIPE_DIR/examples/run_qwen3_8_flash_next_veomni.sh" \
@@ -110,4 +110,4 @@ bash "$RECIPE_DIR/examples/run_qwen3_8_flash_next_veomni.sh" \
 
 源 PR 报告：在 4 台 Ascend 910C 上训练 Geo3K，reward 上升，`rollout_probs_diff_mean < 0.01`。曲线见 [源 PR](https://github.com/verl-project/verl/pull/8583)。
 
-本次 recipe 移植验证补丁可应用，并核对应用后文件与指定 PR head 一致；不代表在当前环境重新完成了 NPU 多机训练。CI workflow 和测试代码不包含在本 recipe 的补丁中。
+本次 recipe 移植验证补丁可应用，并核对除上述两项启动参数调整外，应用后文件与指定 PR head 一致；不代表在当前环境重新完成了 NPU 多机训练。CI workflow 和测试代码不包含在本 recipe 的补丁中。
