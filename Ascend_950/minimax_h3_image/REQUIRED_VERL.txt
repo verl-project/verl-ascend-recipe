@@ -1,0 +1,9 @@
+# MiniMax H3 Image DiffusionNFT LoRA, Ascend 950.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=fefb080262e1c015a0ea05f958822a6a512dc795
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@fefb080262e1c015a0ea05f958822a6a512dc795
+# H3 Image implementation submitted in verl-project/verl-omni#897.
+# Install the pinned checkout with --no-deps in the prepared Ascend environment.
+VERL_OMNI_UPSTREAM=https://github.com/Li-Jicheng/verl-omni.git
+VERL_OMNI_COMMIT=92a3ff23ad7c5ea1724fca1fb025a2d3c3cf35bf
