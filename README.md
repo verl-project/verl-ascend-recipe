@@ -51,6 +51,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 
 | Recipe | `REQUIRED_VERL.txt` |
 | --- | --- |
+| [Qwen3.8 Flash Next](Qwen3.8-Flash-Next/readme.md) | [`Qwen3.8-Flash-Next/REQUIRED_VERL.txt`](Qwen3.8-Flash-Next/REQUIRED_VERL.txt) |
 | opd | [`opd/REQUIRED_VERL.txt`](opd/REQUIRED_VERL.txt) |
 | dapo | [`recipe/dapo/REQUIRED_VERL.txt`](dapo/REQUIRED_VERL.txt) |
 | [DAPO predictor + EWS](dapo_predictor/README.md) | [`recipe/dapo_predictor/REQUIRED_VERL.txt`](dapo_predictor/REQUIRED_VERL.txt) |
