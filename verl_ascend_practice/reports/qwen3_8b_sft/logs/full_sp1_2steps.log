@@ -1,0 +1,437 @@
++ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
++ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
++ NNODES=1
++ NPROC_PER_NODE=8
+++ shuf -i 20000-65535 -n 1
++ MASTER_PORT=52640
++ TRAIN_DATA=/workspace/issue74-validation/data/train.parquet
++ TEST_DATA=/workspace/issue74-validation/data/test.parquet
++ MODEL_PATH=/workspace/Qwen3_8b
++ SAVE_PATH=/workspace/issue74-validation/full-smoke
++ SP_SIZE=1
++ USE_PEFT=0
++ LORA_RANK=32
++ LORA_ALPHA=16
++ LORA_TARGETS=all-linear
++ TRAIN_BATCH_SIZE=8
++ MICRO_BATCH_SIZE_PER_GPU=1
++ LR=1e-4
++ TOTAL_EPOCHS=2
++ MAX_LENGTH=1024
++ PROJECT_NAME=sft-gsm8k
++ EXPERIMENT_NAME=qwen3_8b_fsdp_sft
++ extra_args=()
++ '[' 0 = 1 ']'
++ torchrun --nnodes=1 --nproc_per_node=8 --master_port=52640 -m verl.trainer.sft_trainer data.train_files=/workspace/issue74-validation/data/train.parquet data.val_files=/workspace/issue74-validation/data/test.parquet data.train_batch_size=8 data.truncation=right data.max_length=1024 data.micro_batch_size_per_gpu=1 data.ignore_input_ids_mismatch=True optim.lr=1e-4 engine=fsdp engine.ulysses_sequence_parallel_size=1 model.path=/workspace/Qwen3_8b model.trust_remote_code=True model.use_remove_padding=True trainer.default_local_dir=/workspace/issue74-validation/full-smoke trainer.project_name=sft-gsm8k trainer.experiment_name=qwen3_8b_fsdp_sft trainer.total_epochs=2 'trainer.logger=["console","wandb"]' trainer.total_training_steps=2 'trainer.logger=[console]' trainer.resume_mode=disable trainer.n_gpus_per_node=8 data.num_workers=2 data.val_max_samples=8 data.max_token_len_per_gpu=1024 'checkpoint.save_contents=[model]'
+[W1112 00:57:40.485915770 FunctionLoader.cpp:48] Warning: LD_PRELOAD detected, FunctionLoader prefers RTLD_DEFAULT for symbol resolution. (function operator())
+<frozen runpy>:128: RuntimeWarning: 'torch.distributed.run' found in sys.modules after import of package 'torch.distributed', but prior to execution of 'torch.distributed.run'; this may result in unpredictable behaviour
+[W1112 00:57:49.128661170 FunctionLoader.cpp:48] Warning: LD_PRELOAD detected, FunctionLoader prefers RTLD_DEFAULT for symbol resolution. (function operator())
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+INFO 11-12 00:58:02 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:02 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:02 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:02 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:02 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:02 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:02 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:02 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:02 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 11-12 00:58:02 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+  warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+  warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+  warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+  warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+INFO 11-12 00:58:03 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:03 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:03 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:03 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:03 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:03 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:03 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:03 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:03 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 11-12 00:58:03 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 11-12 00:58:03 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:03 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:03 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:03 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:03 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 11-12 00:58:03 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:03 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:03 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:03 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:03 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+[2026-11-12 00:58:03,622][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:03,622][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:03,622][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:03,622][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:03,623][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:03,623][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:03,623][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:03,623][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:03,623][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+[2026-11-12 00:58:03,623][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+INFO 11-12 00:58:03 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:03 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:03 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:03 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:03 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 11-12 00:58:03 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-12 00:58:03 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 11-12 00:58:03 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 11-12 00:58:03 [__init__.py:238] Platform plugin ascend is activated
+INFO 11-12 00:58:03 [platform.py:62] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+[2026-11-12 00:58:04,022][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:04,022][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:04,023][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+[2026-11-12 00:58:04,312][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:04,313][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:04,313][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:04,313][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:04,313][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+[2026-11-12 00:58:04,395][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:04,396][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:04,396][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:04,396][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:04,396][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+[2026-11-12 00:58:04,570][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:04,571][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:04,571][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:04,572][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:04,572][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+[2026-11-12 00:58:04,627][verl.utils.device][WARNING] - Detect setting config.trainer.device to cuda for npu, automatically set to `npu` instead.
+[2026-11-12 00:58:04,628][torch_npu.env][INFO] - get env WORLD_SIZE = 8
+[2026-11-12 00:58:04,628][torch_npu.env][INFO] - get env MASTER_ADDR = 127.0.0.1
+[2026-11-12 00:58:04,628][torch_npu.env][INFO] - get env MASTER_PORT = 52640
+[2026-11-12 00:58:04,628][torch_npu.env][INFO] - get env TORCHELASTIC_USE_AGENT_STORE = True
+[Gloo] Rank [Gloo] Rank 4 is connected to 07 is connected to  peer ranks. 7Expected number of connected peer ranks is :  peer ranks. 7[Gloo] Rank [Gloo] Rank Expected number of connected peer ranks is : 
+757 is connected to  is connected to 7
+7 peer ranks.  peer ranks. Expected number of connected peer ranks is : Expected number of connected peer ranks is : 77
+
+[Gloo] Rank 1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 6 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+dataset len: 7473
+dataset len: 7473
+dataset len: 7473
+dataset len: 7473
+dataset len: 7473
+dataset len: 7473
+dataset len: 7473
+dataset len: 1319
+selected 8 random samples out of 1319
+[2026-11-12 00:58:07,600][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,600][torch_npu.env][INFO] - get env LOCAL_RANK = 2
+dataset len: 1319
+selected 8 random samples out of 1319
+dataset len: 1319
+[2026-11-12 00:58:07,608][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,608][torch_npu.env][INFO] - get env LOCAL_RANK = 6
+selected 8 random samples out of 1319
+dataset len: 1319
+[2026-11-12 00:58:07,611][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,611][torch_npu.env][INFO] - get env LOCAL_RANK = 4
+selected 8 random samples out of 1319
+[2026-11-12 00:58:07,614][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,614][torch_npu.env][INFO] - get env LOCAL_RANK = 3
+dataset len: 1319
+selected 8 random samples out of 1319
+[2026-11-12 00:58:07,646][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,647][torch_npu.env][INFO] - get env LOCAL_RANK = 1
+dataset len: 1319
+dataset len: 7473
+selected 8 random samples out of 1319
+[2026-11-12 00:58:07,669][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,669][torch_npu.env][INFO] - get env LOCAL_RANK = 7
+dataset len: 1319
+selected 8 random samples out of 1319
+[2026-11-12 00:58:07,705][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,705][torch_npu.env][INFO] - get env LOCAL_RANK = 0
+[2026-11-12 00:58:07,721][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen2
+[2026-11-12 00:58:07,753][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen2_5_vl
+[2026-11-12 00:58:07,762][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen3
+[2026-11-12 00:58:07,780][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen3_moe
+[2026-11-12 00:58:07,810][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen3_vl
+[2026-11-12 00:58:07,817][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+[2026-11-12 00:58:07,823][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+dataset len: 1319
+selected 8 random samples out of 1319
+[2026-11-12 00:58:07,829][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+[2026-11-12 00:58:07,830][torch_npu.env][INFO] - get env LOCAL_WORLD_SIZE = 8
+[2026-11-12 00:58:07,830][torch_npu.env][INFO] - get env LOCAL_RANK = 5
+[2026-11-12 00:58:07,835][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+[2026-11-12 00:58:07,841][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen3_vl_moe
+[2026-11-12 00:58:07,856][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen3_next
+[2026-11-12 00:58:07,861][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+[2026-11-12 00:58:07,883][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+[2026-11-12 00:58:07,887][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen3_5
+[2026-11-12 00:58:07,920][verl.models.transformers.npu_patch][INFO] - Applied NPU patches for qwen3_5_moe
+[2026-11-12 00:58:07,920][verl.models.transformers.npu_patch][INFO] - Successfully applied patches for 9 model(s)
+[2026-11-12 00:58:07,927][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+[2026-11-12 00:58:08,057][torch_npu.env][INFO] - get env TORCHINDUCTOR_CACHE_DIR = /tmp/torchinductor_root
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3ForCausalLM is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3Model is torch.float32. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   0%|          | 1/399 [00:00<03:28,  1.91it/s]Loading weights:   0%|          | 1/399 [00:00<03:41,  1.80it/s]Loading weights:   0%|          | 1/399 [00:00<03:27,  1.91it/s]Loading weights:   1%|          | 2/399 [00:00<02:04,  3.18it/s]Loading weights:   1%|          | 2/399 [00:00<01:58,  3.35it/s]Loading weights:   0%|          | 1/399 [00:00<04:08,  1.60it/s]Loading weights:   0%|          | 1/399 [00:00<04:11,  1.58it/s]Loading weights:   1%|          | 2/399 [00:00<01:49,  3.62it/s]Loading weights:   0%|          | 1/399 [00:00<04:27,  1.49it/s]Loading weights:  21%|██        | 84/399 [00:00<00:01, 175.02it/s]Loading weights:  21%|██        | 83/399 [00:00<00:01, 180.00it/s]Loading weights:   1%|          | 3/399 [00:00<01:20,  4.93it/s]Loading weights:   1%|          | 3/399 [00:00<01:21,  4.87it/s]Loading weights:  13%|█▎        | 50/399 [00:00<00:04, 86.99it/s]Loading weights:  23%|██▎       | 92/399 [00:00<00:01, 200.87it/s]Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:  20%|██        | 81/399 [00:00<00:01, 161.06it/s]Loading weights:  23%|██▎       | 92/399 [00:00<00:01, 179.09it/s]Loading weights:  22%|██▏       | 88/399 [00:00<00:02, 145.52it/s]Loading weights:  31%|███       | 122/399 [00:00<00:01, 196.23it/s]Loading weights:  30%|███       | 120/399 [00:00<00:01, 193.13it/s]Loading weights:  32%|███▏      | 126/399 [00:00<00:01, 205.75it/s]Loading weights:  32%|███▏      | 127/399 [00:01<00:01, 186.56it/s]Loading weights:  39%|███▉      | 155/399 [00:01<00:01, 221.17it/s]Loading weights:  29%|██▊       | 114/399 [00:01<00:01, 163.11it/s]Loading weights:  39%|███▉      | 155/399 [00:01<00:01, 194.91it/s]Loading weights:  30%|███       | 121/399 [00:01<00:01, 154.40it/s]Loading weights:  38%|███▊      | 151/399 [00:01<00:01, 181.18it/s]Loading weights:  39%|███▉      | 156/399 [00:01<00:01, 202.20it/s]Loading weights:  35%|███▌      | 141/399 [00:01<00:01, 172.48it/s]Loading weights:  46%|████▌     | 184/399 [00:01<00:01, 211.98it/s]Loading weights:  46%|████▌     | 183/399 [00:01<00:01, 188.03it/s]Loading weights:  44%|████▍     | 177/399 [00:01<00:01, 182.16it/s]Loading weights:  37%|███▋      | 148/399 [00:01<00:01, 150.63it/s]Loading weights:   0%|          | 1/399 [00:00<03:18,  2.00it/s]Loading weights:  53%|█████▎    | 210/399 [00:01<00:00, 220.52it/s]Loading weights:  46%|████▌     | 184/399 [00:01<00:01, 195.73it/s]Loading weights:  41%|████▏     | 165/399 [00:01<00:01, 175.62it/s]Loading weights:  52%|█████▏    | 207/399 [00:01<00:00, 195.92it/s]Loading weights:  50%|█████     | 201/399 [00:01<00:01, 186.63it/s]Loading weights:  43%|████▎     | 171/399 [00:01<00:01, 158.46it/s]Loading weights:  17%|█▋        | 67/399 [00:00<00:02, 147.32it/s]Loading weights:   0%|          | 1/399 [00:00<03:47,  1.75it/s]Loading weights:  52%|█████▏    | 209/399 [00:01<00:00, 204.98it/s]Loading weights:  58%|█████▊    | 231/399 [00:01<00:00, 200.56it/s]Loading weights:  47%|████▋     | 188/399 [00:01<00:01, 178.35it/s]Loading weights:  59%|█████▉    | 235/399 [00:01<00:00, 204.59it/s]Loading weights:  56%|█████▌    | 224/399 [00:01<00:00, 178.55it/s]Loading weights:  48%|████▊     | 192/399 [00:01<00:01, 163.46it/s]Loading weights:   8%|▊         | 32/399 [00:00<00:05, 63.37it/s]Loading weights:  59%|█████▊    | 234/399 [00:01<00:00, 213.72it/s]Loading weights:  64%|██████▎   | 254/399 [00:01<00:00, 201.95it/s]Loading weights:  65%|██████▍   | 258/399 [00:01<00:00, 204.74it/s]Loading weights:  52%|█████▏    | 209/399 [00:01<00:01, 174.87it/s]Loading weights:  53%|█████▎    | 213/399 [00:01<00:01, 170.69it/s]Loading weights:  23%|██▎       | 92/399 [00:00<00:01, 177.84it/s]Loading weights:  26%|██▋       | 105/399 [00:00<00:01, 156.72it/s]Loading weights:  62%|██████▏   | 246/399 [00:01<00:00, 174.75it/s]Loading weights:  65%|██████▍   | 259/399 [00:01<00:00, 199.19it/s]Loading weights:  70%|███████   | 280/399 [00:01<00:00, 202.24it/s]Loading weights:  69%|██████▉   | 277/399 [00:01<00:00, 197.15it/s]Loading weights:  57%|█████▋    | 229/399 [00:01<00:01, 168.77it/s]Loading weights:  67%|██████▋   | 266/399 [00:01<00:00, 175.46it/s]Loading weights:  59%|█████▉    | 235/399 [00:01<00:00, 165.65it/s]Loading weights:  34%|███▎      | 134/399 [00:00<00:01, 170.33it/s]Loading weights:  70%|███████   | 281/399 [00:01<00:00, 201.34it/s]Loading weights:  32%|███▏      | 127/399 [00:00<00:01, 191.97it/s]Loading weights:  76%|███████▌  | 302/399 [00:01<00:00, 199.30it/s]Loading weights:  75%|███████▍  | 299/399 [00:01<00:00, 190.78it/s]Loading weights:  62%|██████▏   | 248/399 [00:01<00:00, 163.33it/s]Loading weights:  71%|███████▏  | 285/399 [00:01<00:00, 169.14it/s]Loading weights:  64%|██████▍   | 257/399 [00:01<00:00, 166.61it/s]Loading weights:  76%|███████▌  | 303/399 [00:01<00:00, 202.55it/s]Loading weights:  39%|███▉      | 157/399 [00:01<00:01, 211.77it/s]Loading weights:  40%|████      | 160/399 [00:01<00:01, 176.79it/s]Loading weights:  81%|████████  | 323/399 [00:01<00:00, 193.27it/s]Loading weights:  80%|███████▉  | 319/399 [00:01<00:00, 185.28it/s]Loading weights:  67%|██████▋   | 268/399 [00:01<00:00, 163.84it/s]Loading weights:  81%|████████▏ | 325/399 [00:01<00:00, 207.09it/s]Loading weights:  76%|███████▌  | 303/399 [00:02<00:00, 159.29it/s]Loading weights:  70%|██████▉   | 279/399 [00:02<00:00, 168.43it/s]Loading weights:  46%|████▌     | 184/399 [00:01<00:01, 185.95it/s]Loading weights:  86%|████████▋ | 345/399 [00:01<00:00, 190.03it/s]Loading weights:  47%|████▋     | 186/399 [00:01<00:01, 203.93it/s]Loading weights:  85%|████████▍ | 339/399 [00:02<00:00, 176.32it/s]Loading weights:  73%|███████▎  | 290/399 [00:02<00:00, 165.23it/s]Loading weights:  87%|████████▋ | 347/399 [00:02<00:00, 209.05it/s]Loading weights:  81%|████████  | 323/399 [00:02<00:00, 164.65it/s]Loading weights:  52%|█████▏    | 207/399 [00:01<00:00, 192.38it/s]Loading weights:  75%|███████▌  | 301/399 [00:02<00:00, 166.67it/s]Loading weights:  92%|█████████▏| 367/399 [00:02<00:00, 186.51it/s]Loading weights:  53%|█████▎    | 212/399 [00:01<00:00, 208.07it/s]Loading weights:  90%|████████▉ | 358/399 [00:02<00:00, 172.37it/s]Loading weights:  92%|█████████▏| 369/399 [00:02<00:00, 210.87it/s]Loading weights:  78%|███████▊  | 312/399 [00:02<00:00, 168.35it/s]Loading weights:  58%|█████▊    | 230/399 [00:01<00:00, 189.55it/s]Loading weights:  81%|████████  | 323/399 [00:02<00:00, 174.59it/s]Loading weights:  86%|████████▋ | 345/399 [00:02<00:00, 159.54it/s]Loading weights:  95%|█████████▌| 380/399 [00:02<00:00, 184.52it/s]Loading weights:  97%|█████████▋| 389/399 [00:02<00:00, 185.59it/s]Loading weights: 100%|██████████| 399/399 [00:02<00:00, 177.59it/s]
+Loading weights:  98%|█████████▊| 391/399 [00:02<00:00, 211.41it/s]Loading weights: 100%|██████████| 399/399 [00:02<00:00, 174.32it/s]
+Loading weights:  84%|████████▎ | 334/399 [00:02<00:00, 180.23it/s]Loading weights:  59%|█████▉    | 237/399 [00:01<00:00, 188.93it/s]Loading weights: 100%|██████████| 399/399 [00:02<00:00, 167.09it/s]
+Loading weights:  92%|█████████▏| 367/399 [00:02<00:00, 171.79it/s]Loading weights:  86%|████████▋ | 345/399 [00:02<00:00, 181.35it/s]Loading weights:  64%|██████▍   | 257/399 [00:01<00:00, 191.76it/s]Loading weights:  89%|████████▉ | 357/399 [00:02<00:00, 190.91it/s]Loading weights:  65%|██████▍   | 259/399 [00:01<00:00, 194.25it/s]Loading weights:  92%|█████████▏| 369/399 [00:02<00:00, 193.46it/s]Loading weights:  70%|███████   | 281/399 [00:01<00:00, 203.64it/s]Loading weights:  97%|█████████▋| 389/399 [00:02<00:00, 174.37it/s]Loading weights: 100%|██████████| 399/399 [00:02<00:00, 156.49it/s]
+Loading weights:  70%|███████   | 281/399 [00:01<00:00, 200.19it/s]Loading weights:  97%|█████████▋| 389/399 [00:02<00:00, 216.93it/s]Loading weights: 100%|██████████| 399/399 [00:02<00:00, 156.83it/s]
+Loading weights: 100%|██████████| 399/399 [00:02<00:00, 155.65it/s]
+Loading weights:  78%|███████▊  | 312/399 [00:01<00:00, 223.68it/s]Loading weights:  78%|███████▊  | 312/399 [00:01<00:00, 213.69it/s]Loading weights:  84%|████████▍ | 336/399 [00:01<00:00, 223.49it/s]Loading weights:  84%|████████▍ | 337/399 [00:01<00:00, 222.86it/s]Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Loading weights:  92%|█████████▏| 368/399 [00:02<00:00, 234.87it/s]Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Loading weights:  92%|█████████▏| 367/399 [00:02<00:00, 233.14it/s]Loading weights: 100%|██████████| 399/399 [00:02<00:00, 189.62it/s]
+Loading weights: 100%|██████████| 399/399 [00:02<00:00, 187.65it/s]
+Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Monkey patch _flash_attention_forward in transformers.integrations.flash_attention
+Skipping monkey patch for Qwen3ForCausalLM as use_fused_kernels is False or fused_kernels_backend is torch
+Qwen3ForCausalLM contains 8.19B parameters
+Before FSDP, memory allocated (GB): 0.00, memory reserved (GB): 0.00, device memory used/total (GB): 0.35/29.49
+[rank0]:[W1112 00:58:12.318084410 NPUCachingAllocator.cpp:202] Warning: The current CANN and HDK(driver) versions require processing for 32 padding size, with memory allocation. (function operator())
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+/workspace/issue74-validation/verl-0.9.1/verl/workers/engine/fsdp/transformer_impl.py:488: FutureWarning: FSDP.state_dict_type() and FSDP.set_state_dict_type() are being deprecated. Please use APIs, get_state_dict() and set_state_dict(), which can support different parallelisms, FSDP1, FSDP2, DDP. API doc: https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict .Tutorial: https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html .
+  FSDP.set_state_dict_type(
+After FSDP, memory allocated (GB): 3.81, memory reserved (GB): 18.76, device memory used/total (GB): 19.52/29.49
+Total steps: 2, num_warmup_steps: 0
+{'model': {'_target_': 'verl.workers.config.HFModelConfig', 'path': '/workspace/Qwen3_8b', 'hf_config_path': None, 'tokenizer_path': None, 'use_shm': False, 'trust_remote_code': True, 'custom_chat_template': None, 'external_lib': None, 'override_config': {}, 'enable_gradient_checkpointing': True, 'enable_activation_offload': False, 'use_remove_padding': True, 'lora_rank': 0, 'lora_alpha': 16, 'target_modules': 'all-linear', 'exclude_modules': None, 'lora_adapter_path': None, 'use_liger': False, 'use_fused_kernels': False, 'fused_kernel_options': {'impl_backend': 'torch'}, 'tiled_mlp': {'enabled': False, 'num_shards': 4}, 'mtp': {'_target_': 'verl.workers.config.MtpConfig', 'enable': False, 'enable_train': False, 'enable_rollout': False, 'detach_encoder': False, 'mtp_loss_scaling_factor': 0.1, 'speculative_algorithm': 'EAGLE', 'speculative_num_steps': 3, 'speculative_eagle_topk': 1, 'speculative_num_draft_tokens': 4, 'method': 'mtp', 'num_speculative_tokens': 1}, 'lora': {'type': 'lora', 'merge': False, 'rank': 0, 'alpha': 32, 'dropout': 0.0, 'target_modules': ['linear_qkv', 'linear_proj', 'linear_fc1', 'linear_fc2'], 'exclude_modules': [], 'dropout_position': 'pre', 'lora_A_init_method': 'xavier', 'lora_B_init_method': 'zero', 'a2a_experimental': False, 'dtype': None, 'adapter_path': None, 'freeze_vision_model': True, 'freeze_vision_projection': True, 'freeze_language_model': True}}, 'engine': {'_target_': 'verl.workers.config.FSDPEngineConfig', 'wrap_policy': {'min_num_params': 0}, 'param_offload': False, 'optimizer_offload': False, 'offload_policy': False, 'reshard_after_forward': True, 'fsdp_size': -1, 'forward_prefetch': False, 'model_dtype': 'fp32', 'use_orig_params': False, 'seed': 42, 'full_determinism': False, 'ulysses_sequence_parallel_size': 1, 'entropy_from_logits_with_chunking': False, 'entropy_from_logits_chunk_size': 2048, 'use_torch_compile': True, 'entropy_checkpointing': False, 'use_no_sync_for_gradient_accumulation': False, 'pad_to_length': False, 'pad_to_length_bucket': 1024, 'forward_only': False, 'strategy': 'fsdp', 'dtype': 'bfloat16', 'qat': {'_target_': 'verl.workers.config.QATEngineConfig', 'enable': False, 'mode': 'w4a16', 'group_size': 16, 'ignore_patterns': ['lm_head', 'embed_tokens', 're:.*mlp.gate$'], 'activation_observer': 'static_minmax', 'quantization_config_path': None}, 'turbo_config': {'distributed': {'fully_shard_parallel_size': 16, 'tensor_parallel_size': 1, 'expert_parallel_size': 1, 'expert_fully_shard_parallel_size': 1, 'ulysses_parallel_size': 1, 'fsdp_plan': {'param_dtype': 'bf16', 'reduce_dtype': 'fp32', 'output_dtype': 'bf16', 'fsdp_implementation': 'native', 'num_to_forward_prefetch': 1, 'num_to_backward_prefetch': 1}}}}, 'optim': {'_target_': 'verl.workers.config.FSDPOptimizerConfig', 'optimizer': 'AdamW', 'optimizer_impl': 'torch.optim', 'lr': 0.0001, 'lr_warmup_steps_ratio': 0.0, 'total_training_steps': -1, 'weight_decay': 0.01, 'lr_warmup_steps': -1, 'betas': [0.9, 0.999], 'clip_grad': 1.0, 'min_lr_ratio': 0.0, 'num_cycles': 0.5, 'lr_scheduler_type': 'constant', 'zero_indexed_step': True, 'warmup_style': None, 'override_optimizer_config': None}, 'profiler': {'_target_': 'verl.utils.profiler.ProfilerConfig', 'tool': 'torch', 'enable': False, 'all_ranks': False, 'ranks': [], 'save_path': 'outputs/profile', 'relocate_results': False, 'finish_hook_cmd': None, 'finish_hook_all_ranks': False, 'finish_hook_ranks': [], 'tool_config': {'npu': {'_target_': 'verl.utils.profiler.config.NPUToolConfig', 'contents': [], 'level': 'level0', 'analysis': True, 'discrete': False, 'profile_token_start': None, 'profile_token_end': None, 'name': 'npu'}, 'nsys': {'_target_': 'verl.utils.profiler.config.NsightToolConfig', 'discrete': '${oc.select:global_profiler.global_tool_config.nsys.discrete}', 'name': 'nsight'}, 'torch': {'_target_': 'verl.utils.profiler.config.TorchProfilerToolConfig', 'contents': [], 'discrete': False, 'profile_token_start': None, 'profile_token_end': None, 'schedule': {'_target_': 'verl.utils.profiler.config.TorchProfilerScheduleConfig', 'skip_first': 0, 'wait': 0, 'warmup': 0, 'active': 0, 'repeat': 0}, 'name': 'torch'}, 'torch_memory': {'_target_': 'verl.utils.profiler.config.TorchMemoryToolConfig', 'trace_alloc_max_entries': '${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}', 'stack_depth': '${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}', 'memory_snapshot_num_steps': '${oc.select:global_profiler.global_tool_config.torch_memory.memory_snapshot_num_steps,1}', 'name': 'torch_memory'}, 'precision_debugger': {'_target_': 'verl.utils.profiler.config.PrecisionDebuggerToolConfig', 'config_path': '${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}', 'steps': None, 'stages': '${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}', 'name': 'precision_debugger'}}}, 'data': {'train_batch_size': 8, 'micro_batch_size_per_gpu': 1, 'max_token_len_per_gpu': 1024, 'use_dynamic_bsz': True, 'train_files': '/workspace/issue74-validation/data/train.parquet', 'val_files': '/workspace/issue74-validation/data/test.parquet', 'train_max_samples': -1, 'val_max_samples': 8, 'messages_key': 'messages', 'tools_key': 'tools', 'enable_thinking_key': 'enable_thinking', 'enable_thinking_default': 'none', 'pad_mode': 'no_padding', 'max_length': 1024, 'truncation': 'right', 'balance_dp_token': False, 'custom_cls': {'path': None, 'name': None}, 'use_shm': False, 'apply_chat_template_kwargs': {}, 'num_workers': 2, 'ignore_input_ids_mismatch': True}, 'checkpoint': {'_target_': 'verl.trainer.config.CheckpointConfig', 'save_contents': ['model'], 'load_contents': '${checkpoint.save_contents}'}, 'trainer': {'default_local_dir': '/workspace/issue74-validation/full-smoke', 'default_hdfs_dir': None, 'project_name': 'sft-gsm8k', 'experiment_name': 'qwen3_8b_fsdp_sft', 'total_epochs': 2, 'total_training_steps': 2, 'logger': ['console'], 'seed': 1, 'save_freq': -1, 'test_freq': -1, 'max_ckpt_to_keep': None, 'balance_batch': True, 'resume_mode': 'disable', 'resume_from_path': None, 'device': 'npu', 'nnodes': 1, 'n_gpus_per_node': 8, 'profile_interval': [-1, -1]}}
+[2026-11-12 00:58:19,836][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:19,838][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:19,860][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:19,861][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:19,999][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,001][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,020][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,020][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,033][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,034][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,217][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,218][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,384][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,384][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+Epoch 1/2:   0%|          | 0/934 [00:00<?, ?it/s][2026-11-12 00:58:20,930][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:20,930][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[rank6]:W1112 00:58:24.085000 11622 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank7]:W1112 00:58:24.087000 11623 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank5]:W1112 00:58:24.100000 11621 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank1]:W1112 00:58:24.110000 11617 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank0]:W1112 00:58:24.110000 11616 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank3]:W1112 00:58:24.114000 11619 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank4]:W1112 00:58:24.114000 11620 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank2]:W1112 00:58:24.116000 11618 site-packages/torch/fx/_symbolic_trace.py:53] is_fx_tracing will return true for both fx.symbolic_trace and torch.export. Please use is_fx_tracing_symbolic_tracing() for specifically fx.symbolic_trace or torch.compiler.is_compiling() for specifically torch.export/compile.
+[rank6]:[W1112 00:58:24.032987050 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+[rank7]:[W1112 00:58:24.033028480 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+[rank2]:[W1112 00:58:24.037559070 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+[rank5]:[W1112 00:58:24.038228810 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+[rank3]:[W1112 00:58:24.039351220 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+[rank1]:[W1112 00:58:24.039467780 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+[rank4]:[W1112 00:58:24.039467840 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+[rank0]:[W1112 00:58:24.060512680 TensorFactories.cpp:423] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+step:1 - perf/max_memory_allocated_gb:19.07500410079956 - perf/max_memory_reserved_gb:28.48046875 - perf/cpu_memory_used_gb:235.50323486328125 - train/loss:1.4144985675811768 - train/grad_norm:33.27996826171875 - train/lr:0.0001 - train/mfu:0.002526138361665456 - train/global_tokens:1574 - train/total_tokens(B):1.574e-06
+Epoch 1/2:   0%|          | 1/934 [00:14<3:39:16, 14.10s/it]step:2 - perf/max_memory_allocated_gb:22.21598529815674 - perf/max_memory_reserved_gb:28.48046875 - perf/cpu_memory_used_gb:235.60239028930664 - train/loss:0.8970099687576294 - train/grad_norm:13.496702194213867 - train/lr:0.0001 - train/mfu:0.0024993936663474437 - train/global_tokens:1499 - train/total_tokens(B):3.073e-06
+[2026-11-12 00:58:47,709][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:47,754][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:47,787][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:47,798][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:47,807][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:47,830][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:47,831][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+[2026-11-12 00:58:47,835][/workspace/issue74-validation/verl-0.9.1/verl/utils/dataset/multiturn_sft_dataset.py][WARNING] - MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids` as a whole sequence, which may not equal to apply_chat_template to whole messages at once.
+For example, Qwen Thinking series models add <think></think> tags to last turn, please check your tokenizer chat template settings.
+Set `ignore_input_ids_mismatch=True` to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids. 
+step:2 - val/loss:1.0728729963302612
+Saving checkpoint to: /workspace/issue74-validation/full-smoke/global_step_2
+[2026-11-12 00:58:56,193][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 0] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_0.pt
+[2026-11-12 00:58:56,351][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 0] Saved model config and tokenizer class to /workspace/issue74-validation/full-smoke/global_step_2/huggingface
+[2026-11-12 00:58:56,515][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 1] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_1.pt
+[2026-11-12 00:58:56,954][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 7] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_7.pt
+[2026-11-12 00:58:57,280][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 6] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_6.pt
+[2026-11-12 00:58:57,757][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 5] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_5.pt
+[2026-11-12 00:58:58,504][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 2] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_2.pt
+[2026-11-12 00:58:58,537][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 3] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_3.pt
+[2026-11-12 00:58:59,213][/workspace/issue74-validation/verl-0.9.1/verl/utils/checkpoint/fsdp_checkpoint_manager.py][INFO] - [Rank 4] Saved model to /workspace/issue74-validation/full-smoke/global_step_2/model_world_size_8_rank_4.pt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_4.pt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_7.pt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_0.pt
+Updated checkpoint tracker: /workspace/issue74-validation/full-smoke/latest_checkpointed_iteration.txt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_6.pt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_5.pt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_3.pt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_2.pt
+Saved dataloader state to: /workspace/issue74-validation/full-smoke/global_step_2/data_1.pt
+Total time for train steps: 0.00s
+Final validation metrics: {'val/loss': 1.0728729963302612}
+[rank4]:[W1112 00:58:59.784363380 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
+Epoch 1/2:   0%|          | 1/934 [00:38<9:58:55, 38.52s/it]
+[rank6]:[W1112 00:58:59.784444530 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
+[rank7]:[W1112 00:58:59.784974420 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
+[rank5]:[W1112 00:58:59.785127070 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
+[rank3]:[W1112 00:58:59.786423980 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
+[rank2]:[W1112 00:58:59.786991440 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
+[rank1]:[W1112 00:58:59.787849820 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
+[rank0]:[W1112 00:58:59.788952900 ProcessGroup.hpp:940] Warning: No backend of type 0 found for Process Group with name undefined. Assuming no hooks are registered. (function hasHooks)
