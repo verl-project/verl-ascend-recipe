@@ -1,9 +1,9 @@
 diff --git a/examples/grpo_trainer/run_qwen3_8_flash_next_veomni.sh b/examples/grpo_trainer/run_qwen3_8_flash_next_veomni.sh
 new file mode 100755
-index 00000000000..64c6583f0a8
+index 00000000000..349ed856b30
 --- /dev/null
 +++ b/examples/grpo_trainer/run_qwen3_8_flash_next_veomni.sh
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,168 @@
 +#!/usr/bin/env bash
 +# GRPO training of Qwen3.8-Flash-Next with VeOmni and vLLM on Ascend NPUs.
 +# Prepare CANN/ATB, the Python environment and compatible model implementations
@@ -123,14 +123,9 @@ index 00000000000..64c6583f0a8
 +  "actor_rollout_ref.rollout.max_model_len=$max_model_len"
 +  "actor_rollout_ref.rollout.max_num_batched_tokens=$max_model_len"
 +  "actor_rollout_ref.rollout.max_num_seqs=128"
-+  "actor_rollout_ref.rollout.ignore_eos=false"
-+  # Ascend does not support the UVA lookup used by Engram CPU offload.
-+  "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.cpu_offload=false"
-+  "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.dp_shared_memory=false"
 +  "+actor_rollout_ref.rollout.engine_kwargs.vllm.language_model_only=false"
 +  "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.enable_cpu_binding=true"
 +  "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode=0"
-+  "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.compile_mm_encoder=false"
 +  "++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=true"
 +  "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY"
 +)

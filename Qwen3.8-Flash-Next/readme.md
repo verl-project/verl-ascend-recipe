@@ -2,7 +2,7 @@
 
 基于 VeOmni 训练后端和 vLLM rollout 后端，在 Ascend NPU 上对 Qwen3.8 Flash Next（`model_type=qwen4_exp`）进行 GRPO 后训练。
 
-目录沿用 [DeepSeek-V4-Flash](../DeepSeek-V4-Flash) 的 `install.sh`、`examples/`、`patch/verl.patch` 和 `readme.md` 组织方式。补丁来自 [verl PR #8583](https://github.com/verl-project/verl/pull/8583)，固定到 head `34bf6219a86a87e9224d584de072adcecaf0850c`，移除 CI workflow 和测试文件的改动，并将训练示例的 `async_scheduling` 设为 `true`、`max_num_seqs` 设为 `128`；其余功能改动保持一致。
+补丁来自 [verl PR #8583](https://github.com/verl-project/verl/pull/8583)，固定到 head `34bf6219a86a87e9224d584de072adcecaf0850c`，移除 CI workflow 和测试文件的改动；其余功能改动保持一致。
 
 ## Required `verl` version
 
@@ -18,10 +18,9 @@
 | VeOmni | `a8d357cec86643ab8fec12acc6c60a26bc7d1d29` |
 | Transformers | `5.16.1` |
 | vLLM | 源 PR 记录为 `0.32.0.empty` |
-| vLLM-Ascend | `fd4be4dbcf751fcff0dd99d18389caf40680e9e7` |
+| vLLM-Ascend | `v0.32.0rc1` |
 | CANN / ATB / PyTorch / torch_npu | 使用与上述 rollout 后端匹配、已配置好的 Ascend 环境 |
 
-源 PR 未给出完整基础镜像摘要和 CANN / PyTorch 版本，本文不额外指定未经验证的组合。训练记录中的 VeOmni 为当时的 `main`；此 recipe 使用源 PR 代码明确固定的 VeOmni commit。多机必须使用相同依赖、模型权重和数据。
 
 ### 环境部署
 
@@ -88,14 +87,6 @@ output_path="$HOME/output" \
 bash "$RECIPE_DIR/examples/run_qwen3_8_flash_next_veomni.sh"
 ```
 
-[启动脚本](examples/run_qwen3_8_flash_next_veomni.sh) 基于源 PR 示例，将 `++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=true` 和 `actor_rollout_ref.rollout.max_num_seqs=128` 作为默认值；支持环境变量和追加 Hydra 参数，例如：
-
-```bash
-bash "$RECIPE_DIR/examples/run_qwen3_8_flash_next_veomni.sh" \
-  actor_rollout_ref.actor.veomni.frozen_ple_dtype=bfloat16 \
-  trainer.total_training_steps=250
-```
-
 ### 关键配置
 
 - `ple_parallel_size=8`，`ep_sharded_stream_load=true`，`broadcast_model_weights_from_rank0=false`：按 PLE 分片加载权重。
@@ -110,4 +101,4 @@ bash "$RECIPE_DIR/examples/run_qwen3_8_flash_next_veomni.sh" \
 
 源 PR 报告：在 4 台 Ascend 910C 上训练 Geo3K，reward 上升，`rollout_probs_diff_mean < 0.01`。曲线见 [源 PR](https://github.com/verl-project/verl/pull/8583)。
 
-本次 recipe 移植验证补丁可应用，并核对除上述两项启动参数调整外，应用后文件与指定 PR head 一致；不代表在当前环境重新完成了 NPU 多机训练。CI workflow 和测试代码不包含在本 recipe 的补丁中。
+本次 recipe 移植验证补丁可应用，并核对除本 recipe 的启动脚本参数调整外，应用后文件与指定 PR head 一致；不代表在当前环境重新完成了 NPU 多机训练。CI workflow 和测试代码不包含在本 recipe 的补丁中。

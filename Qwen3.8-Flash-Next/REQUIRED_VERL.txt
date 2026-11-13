@@ -12,4 +12,4 @@ VEOMNI_COMMIT=a8d357cec86643ab8fec12acc6c60a26bc7d1d29
 TRANSFORMERS_VERSION=5.16.1
 # Rollout versions reported in the source PR; provision these before install.sh.
 VLLM_VERSION=0.32.0.empty
-VLLM_ASCEND_COMMIT=fd4be4dbcf751fcff0dd99d18389caf40680e9e7
+VLLM_ASCEND_COMMIT=v0.32.0rc1

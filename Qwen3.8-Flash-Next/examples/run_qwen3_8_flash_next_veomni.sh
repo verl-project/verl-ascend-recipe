@@ -117,14 +117,9 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.max_model_len=$max_model_len"
   "actor_rollout_ref.rollout.max_num_batched_tokens=$max_model_len"
   "actor_rollout_ref.rollout.max_num_seqs=128"
-  "actor_rollout_ref.rollout.ignore_eos=false"
-  # Ascend does not support the UVA lookup used by Engram CPU offload.
-  "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.cpu_offload=false"
-  "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.dp_shared_memory=false"
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.language_model_only=false"
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.enable_cpu_binding=true"
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode=0"
-  "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.compile_mm_encoder=false"
   "++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=true"
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY"
 )
