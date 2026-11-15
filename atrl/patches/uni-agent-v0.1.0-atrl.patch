@@ -1,0 +1,1455 @@
+﻿diff --git a/examples/triton_react/task_config.yaml b/examples/triton_react/task_config.yaml
+new file mode 100644
+index 0000000..c320bd6
+--- /dev/null
++++ b/examples/triton_react/task_config.yaml
+@@ -0,0 +1,22 @@
++# ATRL recipe on the stock KernelBench task.
++# Set algorithm.adv_estimator=grpo_segment and actor.loss_agg_mode=seg-mean-token-mean.
++- name: npu_triton_kernel
++  sandbox:
++    provider: triton_remote_docker
++    image: triton-claude-code-env:latest
++    runtime_timeout: 14400
++    sandbox_kwargs:
++      cwd: /workspace
++      pull_policy: never
++      run_args:
++        - --privileged
++        - --ipc=host
++        - --network=host
++  agent:
++    name: triton_react
++    max_steps: 100
++    action_timeout: 900
++    workspace_dir: /workspace
++  workspace_dir: /workspace
++  template_dir: /opt/triton-agent-template
++  npu_lease_required: true
+diff --git a/tests/uni_agent/atrl/test_segment_reward.py b/tests/uni_agent/atrl/test_segment_reward.py
+new file mode 100644
+index 0000000..cc35ad0
+--- /dev/null
++++ b/tests/uni_agent/atrl/test_segment_reward.py
+@@ -0,0 +1,10 @@
++from uni_agent.atrl.segment_reward import combined_segment_rewards
++
++
++def test_no_compaction_keeps_the_final_reward():
++    assert combined_segment_rewards([], 1.3, alpha=0.5) == [1.3]
++
++
++def test_mixed_reward_uses_boundary_delta():
++    # boundaries: 0 -> 0.2 -> 1.0, alpha 0.5
++    assert combined_segment_rewards([0.2], 1.0, alpha=0.5) == [0.6, 0.9]
+diff --git a/uni_agent/agents/registry.py b/uni_agent/agents/registry.py
+index 8fc5f06..9323c35 100644
+--- a/uni_agent/agents/registry.py
++++ b/uni_agent/agents/registry.py
+@@ -20,6 +20,7 @@ AGENT_REGISTRY: dict[str, type[Agent]] = {}
+ #: agent name -> module that defines (and registers) it, for lazy loading.
+ AGENT_MODULES: dict[str, str] = {
+     "react": "uni_agent.agents.react.agent",
++    "triton_react": "uni_agent.agents.triton_react.agent",
+     "claude_code": "uni_agent.agents.claude_code.agent",
+     "mini_swe_agent": "uni_agent.agents.mini_swe_agent.agent",
+     "mem_agent": "uni_agent.agents.mem_agent.agent",
+diff --git a/uni_agent/agents/triton_react/__init__.py b/uni_agent/agents/triton_react/__init__.py
+new file mode 100644
+index 0000000..70dfafa
+--- /dev/null
++++ b/uni_agent/agents/triton_react/__init__.py
+@@ -0,0 +1,5 @@
++"""ATRL Triton ReAct agent."""
++
++from .agent import TritonReactAgent, TritonReactConfig
++
++__all__ = ["TritonReactAgent", "TritonReactConfig"]
+diff --git a/uni_agent/agents/triton_react/agent.py b/uni_agent/agents/triton_react/agent.py
+new file mode 100644
+index 0000000..791cc7d
+--- /dev/null
++++ b/uni_agent/agents/triton_react/agent.py
+@@ -0,0 +1,244 @@
++"""Five-tool Triton ReAct loop with compaction and segment-boundary rewards.
++
++The loop is the stock ReAct step. ATRL adds three behaviors on top:
++
++* nudge the policy to create an implementation, then to call ``run_verify``
++* compact the transcript after a verify call once the context crosses the threshold
++* record the workspace reward at each compaction boundary
++
++The KernelBench task turns those boundary rewards plus the final reward into
++the mixed segment rewards consumed by ``grpo_segment``.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++from typing import Any
++
++from pydantic import Field
++
++from uni_agent.atrl.reward_formula import reward_breakdown
++from uni_agent.compaction import CompactionConfig, ConversationCompactor
++from uni_agent.tools import Toolbox
++
++from ..base import AgentResult
++from ..react.agent import ReActAgent, ReActConfig
++from ..react.model import OpenAICompatibleChatModel
++from ..registry import register_agent
++
++logger = logging.getLogger(__name__)
++
++_RESUME_NOTE = (
++    "[Context was compacted. The checkpoint above is your own record of all "
++    "work so far on this task. Do NOT restart the task or rewrite the "
++    "implementation from scratch. Continue from the checkpoint's Current State "
++    "and execute the Next Step now.\n\nNext Step from checkpoint:\n{next_step}"
++)
++
++
++class TritonReactConfig(ReActConfig):
++    name: str = "triton_react"
++    tools: list[dict] = Field(
++        default_factory=lambda: [
++            {"name": "str_replace_editor"},
++            {"name": "list_skills"},
++            {"name": "read_skill"},
++            {"name": "run_verify"},
++            {"name": "submit"},
++        ]
++    )
++    workspace_dir: str = "/workspace"
++    impl_nudge_margin: int = 12
++    verify_nudge_margin: int = 8
++
++
++def _next_step_section(checkpoint_text: str) -> str:
++    marker = "## Next Step"
++    index = checkpoint_text.find(marker)
++    if index < 0:
++        return ""
++    rest = checkpoint_text[index + len(marker) :]
++    nxt = rest.find("\n## ")
++    return (rest if nxt < 0 else rest[:nxt]).strip()
++
++
++@register_agent("triton_react")
++class TritonReactAgent(ReActAgent):
++    """ReAct agent for ATRL: five tools, nudges, and structured compaction."""
++
++    config_model = TritonReactConfig
++
++    async def run(
++        self,
++        *,
++        sandbox,
++        messages: list[dict[str, Any]],
++        workdir: str | None = None,
++    ) -> AgentResult:
++        cfg: TritonReactConfig = self.config  # type: ignore[assignment]
++        if cfg.model.base_url is None:
++            raise ValueError("triton_react: config.model.base_url is not set")
++
++        toolbox = Toolbox.from_specs(cfg.tools, sandbox=sandbox)
++        model = OpenAICompatibleChatModel(
++            base_url=cfg.model.base_url,
++            api_key=cfg.model.api_key,
++            model_name=cfg.model.model_name,
++            sampling_params=cfg.sampling_params_override.sampling_params(),
++            tools_schemas=toolbox.schemas(),
++        )
++        compactor = ConversationCompactor(CompactionConfig.from_env())
++        min_remaining_turns = int(os.environ.get("TRITON_COMPACTION_MIN_REMAINING_TURNS", "3"))
++        transcript: list[dict[str, Any]] = list(messages)
++        info: dict[str, Any] = {
++            "steps": 0,
++            "num_tool_calls": 0,
++            "timeouts": 0,
++            "errors": 0,
++            "total_tokens": 0,
++            "segment_boundary_rewards": [],
++        }
++        has_impl = False
++        has_verified = False
++        termination_reason = "unknown"
++        workspace = workdir or cfg.workspace_dir
++        try:
++            async with toolbox.entered(retry=3, timeout=60):
++                for step_idx in range(1, cfg.max_steps + 1):
++                    info["steps"] = step_idx
++                    turns_left = cfg.max_steps - step_idx + 1
++                    self._maybe_nudge(cfg, transcript, turns_left, has_impl, has_verified, workspace)
++                    stop_reason = await self.step(cfg, model, toolbox, transcript, info)
++                    has_impl, has_verified, ran_verify = self._observe_last_turn(transcript, has_impl, has_verified)
++                    if stop_reason != "completed":
++                        termination_reason = stop_reason
++                        break
++                    if ran_verify:
++                        await self._maybe_compact(
++                            cfg,
++                            compactor,
++                            model,
++                            sandbox,
++                            transcript,
++                            info,
++                            step_idx,
++                            turns_left,
++                            min_remaining_turns,
++                            workspace,
++                        )
++                else:
++                    termination_reason = "max_steps"
++        except Exception as exc:
++            logger.exception("triton_react failed at step %s", info["steps"])
++            termination_reason = "unknown_error"
++            info["error"] = f"{type(exc).__name__}: {exc}"
++        finally:
++            await model.aclose()
++
++        info["termination_reason"] = termination_reason
++        info["has_impl"] = has_impl
++        info["has_verified"] = has_verified
++        return AgentResult(transcript=transcript, info=info, finished=termination_reason == "finished")
++
++    @staticmethod
++    def _maybe_nudge(
++        cfg: TritonReactConfig,
++        transcript: list[dict[str, Any]],
++        turns_left: int,
++        has_impl: bool,
++        has_verified: bool,
++        workspace: str,
++    ) -> None:
++        if not has_impl and turns_left <= cfg.impl_nudge_margin:
++            transcript.append(
++                {
++                    "role": "user",
++                    "content": (
++                        f"IMPORTANT: {turns_left} turns left. Create the implementation with "
++                        f"str_replace_editor at {workspace}/src/<op>_triton_ascend_impl.py, then call run_verify."
++                    ),
++                }
++            )
++        elif has_impl and not has_verified and turns_left <= cfg.verify_nudge_margin:
++            transcript.append(
++                {
++                    "role": "user",
++                    "content": (
++                        f"IMPORTANT: code is written but not verified. Call run_verify now. "
++                        f"({turns_left} turns left.)"
++                    ),
++                }
++            )
++
++    @staticmethod
++    def _observe_last_turn(
++        transcript: list[dict[str, Any]],
++        has_impl: bool,
++        has_verified: bool,
++    ) -> tuple[bool, bool, bool]:
++        ran_verify = False
++        for message in reversed(transcript):
++            if message.get("role") == "assistant":
++                break
++            if message.get("role") == "tool" and message.get("name") == "run_verify":
++                has_verified = True
++                ran_verify = True
++            elif message.get("role") == "tool" and message.get("name") == "str_replace_editor":
++                has_impl = True
++        return has_impl, has_verified, ran_verify
++
++    async def _maybe_compact(
++        self,
++        cfg: TritonReactConfig,
++        compactor: ConversationCompactor,
++        model: OpenAICompatibleChatModel,
++        sandbox,
++        transcript: list[dict[str, Any]],
++        info: dict[str, Any],
++        step_idx: int,
++        turns_left: int,
++        min_remaining_turns: int,
++        workspace: str,
++    ) -> None:
++        compactor.notify_step()
++        usage = (info.get("total_tokens"), None)
++        if not compactor.should_compact(transcript, usage):
++            return
++        if turns_left < min_remaining_turns:
++            logger.info("skip compaction at step %s: turns_left=%s", step_idx, turns_left)
++            return
++        rewritten = await compactor.compact(transcript, model, step=step_idx, last_usage=usage)
++        if rewritten is None:
++            return
++        transcript[:] = rewritten
++        checkpoint = rewritten[-1]["content"] if rewritten else ""
++        transcript.append(
++            {
++                "role": "user",
++                "content": _RESUME_NOTE.format(next_step=_next_step_section(checkpoint) or "(see Next Step)"),
++            }
++        )
++        info["segment_boundary_rewards"].append(await _boundary_reward(sandbox, workspace))
++
++
++async def _boundary_reward(sandbox, workspace: str) -> float:
++    """Score the workspace at a compaction boundary. Missing artifacts score 0."""
++    try:
++        verify_raw = await sandbox.read_file(f"{workspace}/output/verify/verify_result.json")
++        perf_raw = await sandbox.read_file(f"{workspace}/output/perf_result.json")
++    except Exception:
++        logger.info("segment boundary has no verify artifacts yet")
++        return 0.0
++    try:
++        verify = json.loads(verify_raw.decode() if isinstance(verify_raw, bytes) else verify_raw)
++        perf = json.loads(perf_raw.decode() if isinstance(perf_raw, bytes) else perf_raw)
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return 0.0
++    if not isinstance(verify, dict):
++        return 0.0
++    metrics = dict(verify)
++    if isinstance(perf, dict):
++        metrics["perf_data"] = perf
++    return float(reward_breakdown(metrics)["total"])
+diff --git a/uni_agent/atrl/__init__.py b/uni_agent/atrl/__init__.py
+new file mode 100644
+index 0000000..813c228
+--- /dev/null
++++ b/uni_agent/atrl/__init__.py
+@@ -0,0 +1,6 @@
++"""ATRL helpers: partial-credit reward and mixed segment rewards."""
++
++from uni_agent.atrl.reward_formula import reward_breakdown
++from uni_agent.atrl.segment_reward import combined_segment_rewards
++
++__all__ = ["combined_segment_rewards", "reward_breakdown"]
+diff --git a/uni_agent/atrl/reward_formula.py b/uni_agent/atrl/reward_formula.py
+new file mode 100644
+index 0000000..7e3bfd9
+--- /dev/null
++++ b/uni_agent/atrl/reward_formula.py
+@@ -0,0 +1,264 @@
++#!/usr/bin/env python3
++"""Shared reward formula for Triton/Ascend KernelBench rollouts.
++
++Single source of truth for the partial-credit reward computation, imported by
++both:
++
++- ``snapshot_verify_best.py`` -- inside the sandbox, after each ``run_verify``
++  call, to snapshot the best implementation and precompute its reward.
++- ``reward.py`` -- on the trainer side, during RL reward evaluation.
++
++Both sides MUST derive identical reward values from the same metrics, so the
++formula lives here once. Weights come from the ``TRITON_REWARD_*`` environment
++variables; their sum is the natural reward upper bound (1.30 with the weights
++shipped in ``train_claude_code_megatron_async_lyl.sh``: AST 0.02 + compile
++0.15 + correctness 0.60 + bonus 0.13 + speedup 0.40).
++
++The total is clamped to ``>= 0`` only -- it is NOT clamped to 1.0. Clamping to
++1.0 collapsed GRPO's within-group speedup discrimination: every correct
++rollout with ``speedup >= 0.5 * target`` saturated at 1.0, zeroing the
++within-group variance on the speedup axis. Leaving the upper bound at the
++weight sum keeps correct rollouts spread across ``[0.90, 1.30]`` by speedup.
++
++This module is pure-stdlib (``os`` only) so it runs unchanged in the sandbox
++Python environment and on the trainer.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++
++
++# --------------------------------------------------------------------------- #
++# Numeric / environment helpers
++# --------------------------------------------------------------------------- #
++
++def safe_int(value: Any, default: int = 0) -> int:
++    try:
++        return int(value if value is not None else default)
++    except (TypeError, ValueError):
++        return default
++
++
++def safe_float(value: Any, default: float = 0.0) -> float:
++    try:
++        return float(value if value is not None else default)
++    except (TypeError, ValueError):
++        return default
++
++
++def float_env(name: str, default: float, *fallback_names: str) -> float:
++    for key in (name, *fallback_names):
++        value = os.environ.get(key)
++        if value not in (None, ""):
++            return float(value)
++    return default
++
++
++def int_env(name: str, default: int) -> int:
++    value = os.environ.get(name)
++    if value in (None, ""):
++        return default
++    return safe_int(value, default)
++
++
++def truthy_env(name: str, default: str = "0") -> bool:
++    return os.environ.get(name, default) not in ("0", "false", "False", "no", "")
++
++
++# --------------------------------------------------------------------------- #
++# Metric extraction
++# --------------------------------------------------------------------------- #
++
++def pass_rate(metrics: dict[str, Any]) -> float:
++    total = safe_int(metrics.get("total_cases"), 0)
++    passed = safe_int(metrics.get("passed_cases"), 0)
++    if total <= 0:
++        return 1.0 if bool(metrics.get("correctness_ok") or metrics.get("success")) else 0.0
++    return max(0.0, min(passed / max(total, 1), 1.0))
++
++
++def compile_ok(metrics: dict[str, Any]) -> bool:
++    """3-condition compile check used inside the reward formula.
++
++    Mirrors the inline check historically embedded in ``reward_breakdown`` on
++    both sides. The looser 5-condition variant (also accepting
++    ``passed_cases > 0`` / non-empty ``perf_data``) is NOT used here so that
++    reward scores stay byte-identical to the pre-refactor ``reward_breakdown``.
++    """
++    return bool(
++        metrics.get("compile_ok")
++        or metrics.get("output_observed")
++        or metrics.get("correctness_ok")
++    )
++
++
++def speedup_from_metrics(metrics: dict[str, Any]) -> float:
++    """Speedup-vs-torch read from ``metrics['perf_data']`` (0.0 if missing).
++
++    This supersedes the undefined ``_speedup`` helper that previously made
++    ``snapshot_verify_best.py`` raise ``NameError`` inside ``_reward_breakdown``.
++    """
++    perf_data = metrics.get("perf_data")
++    if not isinstance(perf_data, dict):
++        return 0.0
++    for key in ("speedup_vs_torch", "speedup", "geomean_speedup"):
++        if key in perf_data:
++            return max(0.0, safe_float(perf_data.get(key), 0.0))
++    return 0.0
++
++
++def has_verify_signal(metrics: dict[str, Any] | None) -> bool:
++    if not isinstance(metrics, dict):
++        return False
++    return any(
++        key in metrics
++        for key in (
++            "verified_success",
++            "verify_exit",
++            "total_cases",
++            "passed_cases",
++            "failed_cases",
++            "pass_rate",
++            "compile_ok",
++            "correctness_ok",
++        )
++    )
++
++
++def verify_artifacts_confirm_success(
++    verify: dict[str, Any] | None,
++    summary: dict[str, Any] | None,
++) -> bool:
++    """Require matching raw counts and a successful current-run summary."""
++    if not isinstance(verify, dict) or not isinstance(summary, dict):
++        return False
++    count_keys = ("passed_cases", "total_cases", "failed_cases")
++    if not all(key in verify and key in summary for key in count_keys):
++        return False
++    try:
++        verify_counts = tuple(int(verify[key]) for key in count_keys)
++        summary_counts = tuple(int(summary[key]) for key in count_keys)
++        verify_exit = summary["verify_exit"]
++    except (KeyError, TypeError, ValueError):
++        return False
++    if type(verify_exit) is not int:
++        return False
++    passed, total, failed = verify_counts
++    return bool(
++        summary.get("verified_success") is True
++        and verify_exit == 0
++        and verify_counts == summary_counts
++        and total > 0
++        and passed == total
++        and failed == 0
++    )
++
++
++# --------------------------------------------------------------------------- #
++# Reward formula (single source of truth)
++# --------------------------------------------------------------------------- #
++
++def reward_breakdown(metrics: dict[str, Any]) -> dict[str, Any]:
++    """Stable partial-credit reward components from a metrics dict.
++
++    Weights are read from ``TRITON_REWARD_*`` env vars. ``total`` is the raw
++    weighted sum clamped to ``>= 0`` only (no 1.0 upper clamp): with the
++    shipped weights a fully-correct + on-target rollout scores 1.30, preserving
++    speedup discrimination across ``[0.90, 1.30]`` for GRPO.
++    """
++    ast_reward = float_env("TRITON_REWARD_AST_OK", 0.0)
++    compile_reward = float_env("TRITON_REWARD_COMPILE_OK", 0.10)
++    correctness_reward = float_env("TRITON_REWARD_CORRECTNESS_OK", 0.55)
++    all_correct_bonus = float_env("TRITON_REWARD_ALL_CORRECT_BONUS", 0.10)
++    speedup_reward = float_env("TRITON_REWARD_SPEEDUP_MAX", 0.40)
++
++    ast_ok = bool(metrics.get("ast_check_ok", False))
++    c_ok = compile_ok(metrics)
++    p_rate = pass_rate(metrics)
++    success = bool(metrics.get("success", False))
++    corr_ok = bool(metrics.get("correctness_ok", False))
++
++    ast_score = ast_reward if ast_ok else 0.0
++    compile_score = compile_reward if c_ok else 0.0
++    correctness_score = correctness_reward * p_rate
++    all_correct_score = all_correct_bonus if corr_ok else 0.0
++
++    speedup = speedup_from_metrics(metrics)
++    speedup_score = 0.0
++    if speedup > 0.0 and (success or corr_ok or p_rate > 0.0):
++        target = max(float_env("TRITON_REWARD_TARGET_SPEEDUP", 2.0), 1e-6)
++        speedup_score = speedup_reward * max(0.0, min(speedup / target, 1.0)) * max(p_rate, 0.0)
++
++    total = round(
++        max(0.0, ast_score + compile_score + correctness_score + all_correct_score + speedup_score),
++        4,
++    )
++    return {
++        "ast": round(ast_score, 4),
++        "compile": round(compile_score, 4),
++        "correctness": round(correctness_score, 4),
++        "all_correct_bonus": round(all_correct_score, 4),
++        "speedup": round(speedup_score, 4),
++        "pass_rate": round(p_rate, 6),
++        "raw_speedup": round(speedup, 6),
++        "total": total,
++    }
++
++
++def metric_reward(metrics: dict[str, Any] | None) -> float:
++    """Reward for a metrics dict, preferring a precomputed ``reward`` field.
++
++    Used by the sandbox snapshot path, which writes the reward back into the
++    metrics dict via ``attach_reward_fields`` and then reads it back here.
++    """
++    if not isinstance(metrics, dict):
++        return 0.0
++    if "reward" in metrics:
++        return safe_float(metrics.get("reward"), 0.0)
++    return reward_breakdown(metrics)["total"]
++
++
++def attach_reward_fields(metrics: dict[str, Any]) -> dict[str, Any]:
++    """Add flat reward fields to a metrics dict in place (and return it)."""
++    components = reward_breakdown(metrics)
++    for key in ("reward_components", "benchmark_ok", "output_observed"):
++        metrics.pop(key, None)
++    metrics["reward"] = components["total"]
++    metrics["reward_ast"] = components["ast"]
++    metrics["reward_compile"] = components["compile"]
++    metrics["reward_correctness"] = components["correctness"]
++    metrics["reward_all_correct_bonus"] = components["all_correct_bonus"]
++    metrics["reward_speedup"] = components["speedup"]
++    metrics["raw_speedup"] = components["raw_speedup"]
++    # Same-impl speedup for metrics_best consumers; do not read a sibling
++    # perf_result_best.json that may belong to a faster different impl.
++    metrics["speedup_vs_torch"] = components["raw_speedup"]
++    return metrics
++
++
++# --------------------------------------------------------------------------- #
++# Best-version ranking (which snapshot is "best" across the agent loop)
++# --------------------------------------------------------------------------- #
++
++def rank(metrics: dict[str, Any]) -> tuple[float, ...]:
++    """Sort key for choosing the best version across the agent loop.
++
++    Higher tuple = strictly better. Components: correctness > pass_rate >
++    compile_ok > raw_speedup > total_reward > passed_cases > -failed_cases.
++    ``raw_speedup`` and ``total`` give speedup-aware discrimination so a faster
++    correct version outranks a slower correct one (aligns with
++    ``TRITON_TRAIN_BEST_FIRST``).
++    """
++    correctness_ok = bool(metrics.get("correctness_ok") or metrics.get("success"))
++    components = reward_breakdown(metrics)
++    return (
++        1.0 if correctness_ok else 0.0,
++        components["pass_rate"],
++        1.0 if compile_ok(metrics) else 0.0,
++        components["raw_speedup"],
++        components["total"],
++        float(safe_int(metrics.get("passed_cases"), 0)),
++        -float(safe_int(metrics.get("failed_cases"), 0)),
++    )
+diff --git a/uni_agent/atrl/segment_reward.py b/uni_agent/atrl/segment_reward.py
+new file mode 100644
+index 0000000..2d49aae
+--- /dev/null
++++ b/uni_agent/atrl/segment_reward.py
+@@ -0,0 +1,24 @@
++"""Mixed segment reward R̃_i = α R + (1-α) (reward_end - reward_start)."""
++
++from __future__ import annotations
++
++
++def combined_segment_rewards(
++    boundary_rewards: list[float],
++    final_reward: float,
++    *,
++    alpha: float = 0.5,
++) -> list[float]:
++    """Return one combined reward per segment.
++
++    ``boundary_rewards`` are scores at the end of each compacted segment, in
++    order. The final segment ends at ``final_reward``. The trajectory starts
++    at reward 0, so with no compaction the only segment scores ``final_reward``.
++    """
++    ends = [float(reward) for reward in boundary_rewards]
++    boundaries = [0.0, *ends, float(final_reward)]
++    combined: list[float] = []
++    for index in range(len(boundaries) - 1):
++        delta = boundaries[index + 1] - boundaries[index]
++        combined.append(round(alpha * float(final_reward) + (1.0 - alpha) * delta, 6))
++    return combined
+diff --git a/uni_agent/compaction/__init__.py b/uni_agent/compaction/__init__.py
+new file mode 100644
+index 0000000..cda495f
+--- /dev/null
++++ b/uni_agent/compaction/__init__.py
+@@ -0,0 +1,27 @@
++"""Conversation compaction service (token meter + checkpoint compactor)."""
++
++from uni_agent.compaction.compactor import (
++    CHECKPOINT_PREAMBLE,
++    COMPACTION_INSTRUCTION,
++    CompactionConfig,
++    CompactionEvent,
++    ConversationCompactor,
++    frame_summary,
++)
++from uni_agent.compaction.token_meter import (
++    TokenMeter,
++    estimate_message,
++    estimate_text,
++)
++
++__all__ = [
++    "CHECKPOINT_PREAMBLE",
++    "COMPACTION_INSTRUCTION",
++    "CompactionConfig",
++    "CompactionEvent",
++    "ConversationCompactor",
++    "TokenMeter",
++    "estimate_message",
++    "estimate_text",
++    "frame_summary",
++]
+diff --git a/uni_agent/compaction/compactor.py b/uni_agent/compaction/compactor.py
+new file mode 100644
+index 0000000..91cb66b
+--- /dev/null
++++ b/uni_agent/compaction/compactor.py
+@@ -0,0 +1,454 @@
++"""Automatic conversation-trajectory compaction for agent loops.
++
++Implements the checkpoint-style compaction used to keep long agentic
++trajectories inside the model context window:
++
++* **Trigger**: after each agent round, measure token usage (provider usage
++  when available, heuristic estimate otherwise). Above
++  ``threshold_ratio * max_context_tokens`` -> compact.
++* **LLM checkpoint summary**: append a summary instruction *after* the
++  full conversation (prefix reuse -> provider KV cache stays valid), let
++  the model emit one structured checkpoint, then rebuild the conversation
++  as ``[system, original user task, assistant(summary)]``.
++
++  The system prompt and the original user task are kept VERBATIM in the
++  rebuilt conversation, so the summary does NOT restate the task - it
++  only carries process state (attempts / constraints / current code /
++  last verify output / next step).
++
++* **Multi-compaction**: the instruction merges any prior checkpoint into
++  the new one (single consolidated summary, never stacked).
++* **Safety**: the framed summary must be strictly smaller than the
++  shadowed content, otherwise the compaction is rejected and the original
++  conversation is kept (fallback). All events are logged and returned as
++  stats for observability.
++
++Designed for the inference path (``OpenAICompatibleChatModel``), where
++``messages`` is passed wholesale to the API each call and the rollout
++cache is stateless. Not wired into the verl token-id training path.
++"""
++
++from __future__ import annotations
++
++import time
++from dataclasses import dataclass, field
++from typing import Any
++
++from uni_agent.compaction.token_meter import TokenMeter, estimate_message
++
++# ---------------------------------------------------------------------------
++# Prompt
++# ---------------------------------------------------------------------------
++
++# Summary instruction appended as the LAST user message of the
++# conversation being compacted. Written for the Triton Ascend operator
++# generation task; follows deepseek-harness's checkpoint structure with
++# the retention priorities of docs/对话轨迹压缩方案.md. The task itself is
++# NOT restated here - system prompt + original user task survive
++# compaction verbatim.
++COMPACTION_INSTRUCTION = """\
++You are now acting as a compaction engine for this AI coding assistant.
++Condense the conversation ABOVE into a structured checkpoint that lets you
++resume the operator implementation work with no loss of essential context.
++The system prompt and the original task message remain available after
++compaction - do NOT restate them; capture only the work state.
++
++Output EXACTLY the Markdown structure below: keep every section, in order.
++Use terse bullets, not prose paragraphs. Write "(none)" for an empty
++section - never drop a section. Do not wrap the output in code fences.
++
++## Attempts History
++- Each line: `尝试N-M: [方案] -> [结果]` (or `Attempt N-M: [approach] -> [outcome]`).
++- Only record approach-level changes, not micro fixes. Merge repeated
++  failures of the same kind into one line.
++
++## Constraints Learned
++- Rules discovered while working: AST-check bans, API limits, hardware
++  constraints, verifier interface contracts (e.g. ModelNew signature).
++- Deduplicate; these must survive every future compaction.
++
++## Design Decisions
++- Why the current implementation approach was chosen (one line each).
++
++## Errors and Fixes
++- error -> how it was resolved (or why it is still unresolved).
++
++## Files and Code
++- Exact file paths, and the CURRENT full content of the implementation
++  file (final version only; drop intermediate snapshots). If the file is
++  very long, keep the kernel signatures, class/forward structure, and the
++  parts most relevant to the next fix.
++
++## Current State
++- Verification progress: ast_passed / compile_passed / correctness passed,
++  pass_rate, speedup_vs_torch so far, number of verify runs.
++- The COMPLETE output of the LAST run_verify (or "(none)" if never run).
++
++## Next Step
++- The single next action to continue the task.
++
++Rules:
++- Write concise engineering prose. Preserve exact file paths, commands,
++  error strings, identifiers, numeric values, and function signatures.
++- Completely DROP: skill/reference document contents read via tools (they
++  live on disk and can be re-read), intermediate code snapshots, repeated
++  skill listings, and verbose tool outputs not listed above.
++- If the conversation already contains a prior checkpoint summary, it is a
++  PRIOR compaction: do not copy it forward verbatim - preserve still-true
++  facts, drop stale ones, and merge newer information into this single
++  consolidated summary.
++- Do NOT mention this summarization request or that the context was
++  compacted.
++- Wrap the ENTIRE checkpoint output in <compact_result>...</compact_result>
++  tags. The content between these tags will be extracted as the compacted
++  checkpoint; anything outside the tags (including any thinking, reasoning,
++  or analysis) will be discarded and NOT passed to the next conversation turn.
++  Output only the tags and the checkpoint, do not call any tool.
++"""
++
++# Framing wrapped around the LLM-generated summary when it replaces the
++# conversation (kept minimal - the summary is stored as the model's own
++# assistant message, so it must read as established background).
++CHECKPOINT_PREAMBLE = (
++    "[Compacted checkpoint of the earlier conversation. Treat it as "
++    "established background and continue the task from here.]"
++)
++
++
++def _extract_compact_result(text: str) -> str:
++    """Extract checkpoint content between ``<compact_result>...</compact_result>`` tags.
++
++    The compaction instruction asks the model to wrap its checkpoint inside
++    these tags. Anything outside (thinking, reasoning, analysis) is discarded
++    and never reaches the next conversation turn. The raw response (including
++    the stripped content) is preserved separately via
++    ``last_summary_call["raw_response"]`` for the pre-compaction segment.
++
++    Falls back to the original text when the tags are missing or malformed.
++    """
++    import re
++
++    m = re.search(r"<compact_result>(.*?)</compact_result>", text, re.DOTALL)
++    if m:
++        return m.group(1).strip()
++    return text
++
++
++def frame_summary(summary_text: str) -> str:
++    """Wrap the raw summary in the checkpoint preamble (and strip stray
++    code fences some models add around the checkpoint)."""
++    # Extract the tagged checkpoint content first (discards thinking /
++    # reasoning outside <compact_result>...</compact_result>).
++    summary_text = _extract_compact_result(summary_text)
++    summary_text = summary_text.strip()
++    if summary_text.startswith("```"):
++        lines = summary_text.splitlines()
++        if lines and lines[0].startswith("```"):
++            lines = lines[1:]
++        if lines and lines[-1].strip().startswith("```"):
++            lines = lines[:-1]
++        summary_text = "\n".join(lines).strip()
++    return f"{CHECKPOINT_PREAMBLE}\n\n{summary_text}"
++
++
++# ---------------------------------------------------------------------------
++# Config
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class CompactionConfig:
++    """All knobs for the compaction service (env-overridable)."""
++
++    enabled: bool = True
++    # Compact when current tokens > threshold_ratio * max_context_tokens.
++    threshold_ratio: float = 0.8
++    # Model context window used to derive the trigger threshold.
++    max_context_tokens: int = 40960
++    # Minimum messages (beyond system + task) before compaction may run.
++    min_messages: int = 6
++    # After a failed/rejected compaction, wait this many steps to retry.
++    failure_backoff_steps: int = 3
++    # Extra calls to the summarizer allowed per compaction (retries when
++    # the first summary is not smaller than the shadowed content).
++    max_retries: int = 1
++
++    @property
++    def threshold_tokens(self) -> int:
++        return int(self.max_context_tokens * self.threshold_ratio)
++
++    @classmethod
++    def from_env(cls, env: dict[str, str] | None = None, max_model_len: int | None = None) -> "CompactionConfig":
++        import os
++
++        env = env if env is not None else dict(os.environ)
++
++        def _bool(key: str, default: bool) -> bool:
++            raw = env.get(key)
++            if raw is None or raw == "":
++                return default
++            return raw.strip().lower() in ("1", "true", "yes", "on")
++
++        def _int(key: str, default: int) -> int:
++            try:
++                return int(env.get(key, default))
++            except (TypeError, ValueError):
++                return default
++
++        def _float(key: str, default: float) -> float:
++            try:
++                return float(env.get(key, default))
++            except (TypeError, ValueError):
++                return default
++
++        # max_context_tokens comes from the model's real inference length.
++        max_context_tokens = max_model_len if max_model_len is not None else 40960
++
++        return cls(
++            enabled=_bool("TRITON_COMPACTION_ENABLED", True),
++            threshold_ratio=_float("TRITON_COMPACTION_THRESHOLD", 0.8),
++            max_context_tokens=max_context_tokens,
++            failure_backoff_steps=_int("TRITON_COMPACTION_BACKOFF", 3),
++        )
++
++
++# ---------------------------------------------------------------------------
++# Compaction service
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class CompactionEvent:
++    """Observability record for one compaction attempt."""
++
++    step: int
++    triggered: bool = False
++    stage: str = ""  # "summary" | "rejected" | "error"
++    tokens_before: int = 0
++    tokens_after: int = 0
++    messages_before: int = 0
++    messages_after: int = 0
++    summary_chars: int = 0
++    duration_s: float = 0.0
++    error: str = ""
++
++    def as_dict(self) -> dict[str, Any]:
++        return {
++            "step": self.step,
++            "triggered": self.triggered,
++            "stage": self.stage,
++            "tokens_before": self.tokens_before,
++            "tokens_after": self.tokens_after,
++            "messages_before": self.messages_before,
++            "messages_after": self.messages_after,
++            "summary_chars": self.summary_chars,
++            "duration_s": round(self.duration_s, 3),
++            "error": self.error,
++        }
++
++
++@dataclass
++class _RunState:
++    """Book-keeping across compaction attempts within one agent run."""
++
++    events: list[CompactionEvent] = field(default_factory=list)
++    steps_since_failure: int = 0
++    disabled_reason: str = ""
++
++
++class ConversationCompactor:
++    """Trigger + compaction over a live ``messages`` list.
++
++    Usage in an agent loop, after each round::
++
++        compactor.notify_step()
++        if compactor.should_compact(interaction.messages, usage, step):
++            new_messages = await compactor.compact(
++                interaction.messages, chat_model, step_idx
++            )
++            if new_messages is not None:
++                interaction.messages[:] = new_messages
++    """
++
++    def __init__(
++        self,
++        config: CompactionConfig,
++        meter: TokenMeter | None = None,
++        logger: Any = None,
++    ):
++        self.config = config
++        self.meter = meter or TokenMeter()
++        self.logger = logger
++        self.state = _RunState()
++        #: Populated after each successful summary compaction:
++        #: ``{"prompt_messages": [...], "summary": str, "raw_response": str}``
++        #: where ``prompt_messages`` is the EXACT input of the summarizer call
++        #: (conversation + instruction as the last user message), ``summary``
++        #: is the framed checkpoint text (thinking stripped), and
++        #: ``raw_response`` is the model's original response including any
++        #: thinking prefix (preserved for the pre-compaction segment).
++        #: ``None`` after failed attempts.
++        self.last_summary_call: dict[str, Any] | None = None
++
++    # -- logging helper ---------------------------------------------------
++
++    def _log(self, level: str, msg: str) -> None:
++        if self.logger is not None:
++            getattr(self.logger, level)(msg)
++
++    # -- trigger -----------------------------------------------------------
++
++    def should_compact(
++        self,
++        messages: list[dict[str, Any]],
++        last_usage: tuple[int | None, int | None] | None = None,
++    ) -> bool:
++        if not self.config.enabled:
++            return False
++        if self.state.disabled_reason:
++            return False
++        if 0 < self.state.steps_since_failure <= self.config.failure_backoff_steps:
++            return False
++        if len(messages) < 2 + self.config.min_messages:
++            return False
++        current = self.meter.current_tokens(messages, last_usage)
++        return current > self.config.threshold_tokens
++
++    # -- LLM summary ---------------------------------------------------------
++
++    async def _generate_summary(
++        self,
++        messages: list[dict[str, Any]],
++        model: Any,
++    ) -> str:
++        """Call the model with the instruction appended after the full
++        conversation (prefix reuse -> KV cache friendly). Returns the raw
++        summary text.
++        """
++        instruction_msg = {"role": "user", "content": COMPACTION_INSTRUCTION}
++        # Prefix is unchanged so the serving stack can reuse KV cache.
++        # uni-agent's OpenAI client returns (text, tool_calls, generation_info).
++        queried = await model.query([*messages, instruction_msg])
++        if isinstance(queried, tuple):
++            return str(queried[0] or "")
++        return str(queried or "")
++
++    # -- main entry ----------------------------------------------------------
++
++    async def compact(
++        self,
++        messages: list[dict[str, Any]],
++        model: Any,
++        step: int = 0,
++        last_usage: tuple[int | None, int | None] | None = None,
++    ) -> list[dict[str, Any]] | None:
++        """Run one compaction attempt.
++
++        Returns the new message list on success, ``None`` on failure (the
++        caller keeps the original conversation - graceful fallback).
++        """
++        assert len(messages) >= 2, "need at least [system, user task]"
++        cfg = self.config
++        event = CompactionEvent(
++            step=step,
++            triggered=True,
++            tokens_before=self.meter.current_tokens(messages, last_usage),
++            messages_before=len(messages),
++        )
++        self.state.events.append(event)
++        t0 = time.perf_counter()
++        self.last_summary_call = None
++
++        system_msg = messages[0]
++        task_msg = messages[1]
++        shadowed = messages[2:]
++        shadowed_tokens = self.meter.estimate_messages(shadowed)
++
++        try:
++            # ---- LLM checkpoint summary ----
++            summary_text = ""
++            raw_response = ""  # preserved for segment_0 (includes thinking)
++            attempts_allowed = 1 + cfg.max_retries
++            for attempt in range(attempts_allowed):
++                raw_summary = await self._generate_summary(messages, model)
++                if not raw_summary or not raw_summary.strip():
++                    event.stage = "rejected"
++                    event.error = "empty summary"
++                    self.state.steps_since_failure = 1
++                    self._log("error", f"[compaction] step={step} rejected: empty summary")
++                    return None
++                summary_text = frame_summary(raw_summary)
++                if estimate_message({"role": "assistant", "content": summary_text}) < shadowed_tokens:
++                    raw_response = raw_summary
++                    break
++                self._log(
++                    "warning",
++                    f"[compaction] step={step} summary not smaller than shadowed "
++                    f"content (attempt {attempt + 1}/{attempts_allowed})",
++                )
++            else:
++                event.stage = "rejected"
++                event.duration_s = time.perf_counter() - t0
++                self.state.steps_since_failure = 1
++                self._log(
++                    "error",
++                    f"[compaction] step={step} rejected: summary not smaller than "
++                    f"shadowed content ({shadowed_tokens} est tokens); keeping original",
++                )
++                return None
++
++            new_messages = [
++                system_msg,
++                task_msg,
++                {"role": "assistant", "content": summary_text},
++            ]
++            self.last_summary_call = {
++                # exact input of the summarizer call: full conversation +
++                # instruction as the LAST user message
++                "prompt_messages": [
++                    *messages,
++                    {"role": "user", "content": COMPACTION_INSTRUCTION},
++                ],
++                "summary": summary_text,
++                "raw_response": raw_response,
++            }
++            event.stage = "summary"
++            event.messages_after = len(new_messages)
++            event.tokens_after = self.meter.estimate_messages(new_messages)
++            event.summary_chars = len(summary_text)
++            event.duration_s = time.perf_counter() - t0
++            self.state.steps_since_failure = 0
++            self._log(
++                "info",
++                f"[compaction] step={step} compacted: {event.tokens_before} -> "
++                f"{event.tokens_after} est tokens, {event.messages_before} -> "
++                f"{event.messages_after} messages, summary={event.summary_chars} chars, "
++                f"{event.duration_s:.1f}s",
++            )
++            return new_messages
++        except Exception as exc:  # malformed/oversized summaries can fall back; infra failures cannot
++            from uni_agent.rollout_lifecycle import RolloutInfrastructureError
++
++            if isinstance(exc, RolloutInfrastructureError):
++                exc.messages = list(messages)
++                raise
++            event.stage = "error"
++            event.error = f"{type(exc).__name__}: {exc}"
++            event.duration_s = time.perf_counter() - t0
++            self.state.steps_since_failure = 1
++            self._log("error", f"[compaction] step={step} failed: {event.error}; keeping original")
++            return None
++
++    # -- observability -------------------------------------------------------
++
++    def notify_step(self) -> None:
++        """Call once per agent step so failure backoff can expire."""
++        if self.state.steps_since_failure:
++            self.state.steps_since_failure += 1
++
++    def stats(self) -> dict[str, Any]:
++        return {
++            "events": [e.as_dict() for e in self.state.events],
++            "num_compactions": sum(1 for e in self.state.events if e.stage == "summary"),
++            "num_failures": sum(1 for e in self.state.events if e.stage in ("rejected", "error")),
++        }
+diff --git a/uni_agent/compaction/token_meter.py b/uni_agent/compaction/token_meter.py
+new file mode 100644
+index 0000000..e6cd5cc
+--- /dev/null
++++ b/uni_agent/compaction/token_meter.py
+@@ -0,0 +1,91 @@
++"""Token estimation for conversation compaction.
++
++Follows the deepseek-harness ``TokenMeter`` design: a fixed-density
++heuristic estimator (no real tokenizer dependency) so that the same
++content is always priced with the same number, across models.
++
++When the provider reports real usage (``prompt_tokens`` /
++``completion_tokens`` from the chat-completions response), callers should
++prefer those numbers; this module provides the fallback estimate and the
++per-message pricing used to decide *what* to compact and to verify the
++summary is actually smaller than the shadowed content.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++# Fixed-density heuristic constants (deepseek-harness token-meter).
++CHARS_PER_TOKEN = 4
++BLOCK_OVERHEAD = 4  # per content block JSON structure overhead
++ROLE_OVERHEAD = 4  # per message role framing overhead
++
++
++def estimate_text(text: str) -> int:
++    """Heuristic token count for a plain text string."""
++    if not text:
++        return 0
++    return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN + BLOCK_OVERHEAD
++
++
++def _estimate_tool_calls(tool_calls: list[dict[str, Any]]) -> int:
++    total = 0
++    for tc in tool_calls:
++        function = tc.get("function") or {}
++        name = str(function.get("name") or "")
++        arguments = str(function.get("arguments") or "")
++        total += (
++            (len(name) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
++            + (len(arguments) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
++            + BLOCK_OVERHEAD
++        )
++    return total
++
++
++def estimate_message(message: dict[str, Any]) -> int:
++    """Heuristic token count for one chat message (any role)."""
++    content = message.get("content")
++    if content is None:
++        content_tokens = 0
++    elif isinstance(content, str):
++        content_tokens = estimate_text(content)
++    elif isinstance(content, list):
++        content_tokens = sum(
++            estimate_text(block.get("text") or "") if isinstance(block, dict) else estimate_text(str(block))
++            for block in content
++        )
++    else:
++        content_tokens = estimate_text(str(content))
++
++    tool_call_tokens = _estimate_tool_calls(message.get("tool_calls") or [])
++    return content_tokens + tool_call_tokens + ROLE_OVERHEAD
++
++
++class TokenMeter:
++    """Stateless token estimator for a list of chat messages.
++
++    ``estimate_messages`` prices the full conversation. ``current_tokens``
++    prefers the provider-reported usage when available (more accurate) and
++    falls back to the heuristic estimate.
++    """
++
++    def estimate_messages(self, messages: list[dict[str, Any]]) -> int:
++        return sum(estimate_message(m) for m in messages)
++
++    def current_tokens(
++        self,
++        messages: list[dict[str, Any]],
++        last_usage: tuple[int | None, int | None] | None = None,
++    ) -> int:
++        """Best-available token count for the current conversation.
++
++        ``last_usage`` is the ``(prompt_tokens, completion_tokens)`` pair
++        reported by the provider for the most recent model call. When
++        present and non-zero, ``prompt_tokens`` already prices the whole
++        context as seen by the server, so ``prompt + completion`` is the
++        projected pressure for the *next* request.
++        """
++        prompt_tokens, completion_tokens = last_usage or (None, None)
++        if prompt_tokens:
++            return int(prompt_tokens) + int(completion_tokens or 0)
++        return self.estimate_messages(messages)
+diff --git a/uni_agent/framework/framework.py b/uni_agent/framework/framework.py
+index e748b7f..352a0d4 100644
+--- a/uni_agent/framework/framework.py
++++ b/uni_agent/framework/framework.py
+@@ -893,8 +893,13 @@ class GatewayAgentFramework(AgentFramework):
+                 )
+                 reward_source = "reward_loop_worker"
+             elif task_result.reward is not None:
+-                annotations = [(float(task_result.reward), {}) for _ in session_trajectories]
+-                reward_source = "agent_runner"
++                segment_rewards = (task_result.extra_info or {}).get("segment_combined_rewards")
++                if isinstance(segment_rewards, list) and len(segment_rewards) == len(session_trajectories):
++                    annotations = [(float(score), {}) for score in segment_rewards]
++                    reward_source = "atrl_segment"
++                else:
++                    annotations = [(float(task_result.reward), {}) for _ in session_trajectories]
++                    reward_source = "agent_runner"
+             elif self.reward_loop_worker_handles:
+                 annotations = await self._score_trajectories(session_trajectories, sample_fields, task_result)
+                 reward_source = "reward_loop_worker"
+@@ -907,15 +912,29 @@ class GatewayAgentFramework(AgentFramework):
+                 result_trajectories = session_trajectories
+             else:
+                 logger.info("session %s: scored via %s", session_id, reward_source)
+-                result_trajectories = [
+-                    replace(
+-                        traj,
+-                        finished=task_result.finished,
+-                        reward_score=score,
+-                        reward_metrics=extra if reward_source == "reward_loop_worker" else dict(task_metrics),
++                segment_mode = reward_source == "atrl_segment"
++                result_trajectories = []
++                for traj, (score, extra) in zip(session_trajectories, annotations, strict=True):
++                    extra_fields = dict(traj.extra_fields)
++                    if segment_mode:
++                        response_len = len(traj.response_ids)
++                        extra_fields["segment_boundaries"] = [
++                            {
++                                "response_start": 0,
++                                "response_end": response_len,
++                                "num_segments_in_rollout": len(annotations),
++                            }
++                        ]
++                        extra_fields["combined_rewards"] = [float(score)]
++                    result_trajectories.append(
++                        replace(
++                            traj,
++                            finished=task_result.finished,
++                            reward_score=score,
++                            reward_metrics=extra if reward_source == "reward_loop_worker" else dict(task_metrics),
++                            extra_fields=extra_fields,
++                        )
+                     )
+-                    for traj, (score, extra) in zip(session_trajectories, annotations, strict=True)
+-                ]
+ 
+             self._log_trajectory_summary(session_id, result_trajectories)
+             if run_dir is not None:
+@@ -1186,6 +1205,9 @@ class GatewayAgentFramework(AgentFramework):
+             **trajectory.extra_fields,
+             "reward_extra_info": dict(trajectory.reward_metrics),
+         }
++        if trajectory.extra_fields.get("segment_boundaries"):
++            field["segment_boundaries"] = trajectory.extra_fields["segment_boundaries"]
++            field["combined_rewards"] = trajectory.extra_fields.get("combined_rewards", [])
+         # Framework-owned masks must win over same-named Gateway extra fields.
+         field["response_mask"] = response_mask
+         field["loss_mask"] = response_mask
+diff --git a/uni_agent/tasks/kernel_bench/task.py b/uni_agent/tasks/kernel_bench/task.py
+index 2a25029..eacf6f2 100644
+--- a/uni_agent/tasks/kernel_bench/task.py
++++ b/uni_agent/tasks/kernel_bench/task.py
+@@ -7,6 +7,7 @@ import asyncio
+ import json
+ import logging
+ import math
++import os
+ import re
+ import shlex
+ import time
+@@ -147,6 +148,9 @@ class TritonOperatorTask(Task):
+                         "exit_code": agent_result.info.get("exit_code"),
+                         "finished": agent_result.finished,
+                     }
++                    boundary_rewards = agent_result.info.get("segment_boundary_rewards")
++                    if isinstance(boundary_rewards, list):
++                        agent_info["segment_boundary_rewards"] = [float(item) for item in boundary_rewards]
+                 except asyncio.CancelledError:
+                     raise
+                 except Exception as exc:  # preserve partial workspace and agent-time verifier artifacts
+@@ -1149,9 +1153,10 @@ def _compact_extra_info(
+         )
+         if key in metrics
+     }
++    final_reward = float(metrics.get("reward", 0.0))
+     result: dict[str, Any] = {
+         "op_name": op_name,
+-        "reward_score": float(metrics.get("reward", 0.0)),
++        "reward_score": final_reward,
+         "metrics": compact_metrics,
+         "selected_metrics_source": evaluation.get("selected_metrics_source"),
+         "used_best_metrics": bool(evaluation.get("used_best_metrics")),
+@@ -1179,6 +1184,16 @@ def _compact_extra_info(
+     ):
+         if key in evaluation:
+             result[key] = evaluation[key]
++    boundary_rewards = agent_info.get("segment_boundary_rewards")
++    if isinstance(boundary_rewards, list):
++        from uni_agent.atrl.segment_reward import combined_segment_rewards
++
++        alpha = float(os.environ.get("TRITON_COMPACTION_REWARD_ALPHA", "0.5"))
++        result["segment_combined_rewards"] = combined_segment_rewards(
++            [float(item) for item in boundary_rewards],
++            final_reward,
++            alpha=alpha,
++        )
+     return result
+ 
+ 
+diff --git a/uni_agent/tools/__init__.py b/uni_agent/tools/__init__.py
+index a3248a3..4da8373 100644
+--- a/uni_agent/tools/__init__.py
++++ b/uni_agent/tools/__init__.py
+@@ -30,7 +30,7 @@ from .base import (
+ )
+ 
+ # Built-in tools self-register on import; keep these imports for that side effect.
+-from . import edit_file, finish, shell, submit  # noqa: F401
++from . import edit_file, finish, run_verify, shell, skills, submit  # noqa: F401
+ 
+ __all__ = [
+     "Tool",
+diff --git a/uni_agent/tools/run_verify.py b/uni_agent/tools/run_verify.py
+new file mode 100644
+index 0000000..e05a72a
+--- /dev/null
++++ b/uni_agent/tools/run_verify.py
+@@ -0,0 +1,38 @@
++"""``run_verify``: AST check, correctness, then a performance benchmark.
++
++The command is the image-owned verifier. It takes no model arguments.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from pydantic import BaseModel, Field
++
++from .base import Tool, ToolResult, register_tool
++
++DESCRIPTION = """
++Run AST check + correctness verify + performance benchmark (speedup_vs_torch).
++No arguments needed. Call it after writing code or after any optimization.
++If AST fails or any case fails, the benchmark is skipped.
++""".strip()
++
++
++class RunVerifyArguments(BaseModel):
++    max_error_chars: int = Field(default=2000, description="Unused. Kept so older prompts stay valid.")
++
++
++@register_tool("run_verify")
++class RunVerifyTool(Tool):
++    name = "run_verify"
++    description = DESCRIPTION
++    args_model = RunVerifyArguments
++
++    async def run(self, args: dict[str, Any], *, timeout: float | None = None) -> ToolResult:
++        del args
++        command = "/opt/triton-agent-tools/verify_once.sh"
++        result = await self.sandbox.exec_shell(command, timeout=timeout or 900)
++        text = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
++        if result.exit_code != 0:
++            return ToolResult(text=text.strip() or f"{command} exited {result.exit_code}", status="error")
++        return ToolResult(text=text.strip() or "verify finished")
+diff --git a/uni_agent/tools/skills.py b/uni_agent/tools/skills.py
+new file mode 100644
+index 0000000..ab6ea32
+--- /dev/null
++++ b/uni_agent/tools/skills.py
+@@ -0,0 +1,54 @@
++"""``list_skills`` and ``read_skill`` over the sandbox workspace."""
++
++from __future__ import annotations
++
++import shlex
++from typing import Any
++
++from pydantic import BaseModel, Field
++
++from .base import Tool, ToolResult, register_tool
++
++
++class ListSkillsArguments(BaseModel):
++    pass
++
++
++@register_tool("list_skills")
++class ListSkillsTool(Tool):
++    name = "list_skills"
++    description = "List available skills with name, description, and path."
++    args_model = ListSkillsArguments
++
++    async def run(self, args: dict[str, Any], *, timeout: float | None = None) -> ToolResult:
++        del args
++        script = (
++            "for root in /workspace/.skills /opt/triton-agent-template/.skills "
++            "/opt/triton-agent-template/.claude/skills; do "
++            "if [ -d \"$root\" ]; then find \"$root\" -name SKILL.md -print; fi; done"
++        )
++        result = await self.sandbox.exec_shell(script, timeout=timeout or 30)
++        text = (result.stdout or "").strip()
++        if result.exit_code != 0:
++            return ToolResult(text=result.stderr.strip() or "list_skills failed", status="error")
++        return ToolResult(text=text or "(no skills found)")
++
++
++class ReadSkillArguments(BaseModel):
++    path: str = Field(description="Path of a SKILL.md or reference file returned by list_skills.")
++
++
++@register_tool("read_skill")
++class ReadSkillTool(Tool):
++    name = "read_skill"
++    description = "Read a skill SKILL.md or one of its reference files."
++    args_model = ReadSkillArguments
++
++    async def run(self, args: dict[str, Any], *, timeout: float | None = None) -> ToolResult:
++        path = str(args.get("path", ""))
++        if not path.startswith(("/workspace/", "/opt/triton-agent-template/")):
++            return ToolResult(text="path must stay inside the workspace or the skill template", status="error")
++        result = await self.sandbox.exec_shell(f"sed -n '1,400p' {shlex.quote(path)}", timeout=timeout or 30)
++        if result.exit_code != 0:
++            return ToolResult(text=result.stderr.strip() or f"cannot read {path}", status="error")
++        return ToolResult(text=result.stdout or "")
