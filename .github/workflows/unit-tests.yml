@@ -30,7 +30,7 @@ jobs:
         run: pip install pytest numpy
 
       - name: Run unit tests
-        run: python -m pytest tests/ dapo_predictor/tests/ -v --tb=short
+        run: PYTHONPATH=adaptive_spec python -m pytest tests/ dapo_predictor/tests/ adaptive_spec/tests/ -v --tb=short
 
   predictor-cpu:
     runs-on: ubuntu-latest

@@ -1,0 +1,8 @@
+include REQUIRED_VERL.txt
+include BACKEND.md
+include VALIDATION.md
+recursive-include examples *.json *.yaml *.py
+recursive-include scripts *.py
+include PERFORMANCE.md
+include UPGRADING.md
+include tests/gloo_smoke.py
