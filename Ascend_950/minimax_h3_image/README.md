@@ -2,7 +2,7 @@
 
 Run DiffusionNFT LoRA training for MiniMax H3 Image on a single eight-NPU Ascend 950DT node. The recipe trains a six-step PDD sampler to render dense text. On 64 held-out prompts, mean validation reward increased from 0.52441 at initialization to 0.60182 at step 50. We extended training to 100 steps, reaching a mean validation reward of 0.62208. These results demonstrate that the Ascend 950 implementation supports end-to-end DiffusionNFT LoRA training for MiniMax H3 Image.
 
-The implementation, including the H3 Image Actor, native vLLM-Omni rollout, checkpoint converter and Ascend execution paths, is submitted in [verl-omni PR #897](https://github.com/verl-project/verl-omni/pull/897). This recipe pins that contribution to commit `92a3ff23ad7c5ea1724fca1fb025a2d3c3cf35bf` for reproduction.
+The implementation, including the H3 Image Actor, native vLLM-Omni rollout, checkpoint converter and Ascend execution paths, is submitted in [verl-omni PR #897](https://github.com/verl-project/verl-omni/pull/897). This recipe pins that contribution to commit `92a3ff23ad7c5ea1724fca1fb025a2d3c3cf35bf` for reproduction. Fetch it through the official repository's `refs/pull/897/head` ref before checking out the pinned commit. The recipe currently requires this unmerged contribution; the upstream default branch does not yet include it.
 
 ## Required verl version and environment
 
@@ -27,10 +27,19 @@ Load the node's driver, CANN and ATB runtime libraries before activating the pre
 
 ```bash
 git clone \
-    https://github.com/Li-Jicheng/verl-omni.git \
+    --no-checkout \
+    https://github.com/verl-project/verl-omni.git \
     /path/to/verl-omni
 export VERL_OMNI_PATH=/path/to/verl-omni
-git -C "$VERL_OMNI_PATH" checkout \
+git \
+    -C "$VERL_OMNI_PATH" \
+    fetch \
+    origin \
+    refs/pull/897/head
+git \
+    -C "$VERL_OMNI_PATH" \
+    checkout \
+    --detach \
     92a3ff23ad7c5ea1724fca1fb025a2d3c3cf35bf
 pip install \
     --no-deps \
@@ -118,7 +127,7 @@ Set `TOTAL_TRAINING_STEPS=1` for a one-step smoke run. Trailing Hydra arguments 
 
 Combined reward is `0.5 × PickScore + 0.2 × guarded OCR + 0.3 × HPSv2.1`.
 
-PickScore is normalized by dividing its logit by 26. OCR is evaluated with Qwen3-VL at temperature 0 with up to 160 response tokens. The layout guard is zero if a PP-OCR text box touches the image border within 2 pixels, otherwise it is `min(1, 0.08 / text_area)`. Guarded OCR multiplies the raw OCR score by this guard. The reward protocol follows the [published GPU recipe](https://github.com/aoshen02/verl-omni/blob/5216577fa6524e235967537a5cba39153e4670b8/examples/diffusionnft_trainer/minimax_h3_image/README.md).
+PickScore is normalized by dividing its logit by 26. OCR is evaluated with Qwen3-VL at temperature 0 with up to 160 response tokens. The layout guard is zero if a PP-OCR text box touches the image border within 2 pixels, otherwise it is `min(1, 0.08 / text_area)`. Guarded OCR multiplies the raw OCR score by this guard. The reward protocol follows the [published GPU recipe](https://github.com/verl-project/verl-omni/pull/890).
 
 ## Results
 
@@ -148,6 +157,6 @@ The following held-out examples show generation at steps 0, 50 and 100. Each row
 
 ## Implementation and verification
 
-The pinned verl-omni contribution contains FP32 lookup of the six PDD timesteps on NPU, BF16 NPU Actor execution, RMSNorm dispatch through `torch_npu.npu_rms_norm`, device assignment for preference-scoring subprocesses, and the Diffusers image-packing fix. The H3 Image converter, adapters and dense-text reward recipe derive from aoshen524's commits `46ebe8a`, `b5dd965` and `5216577`. [Original shared implementation](https://github.com/aoshen02/verl-omni/blob/5216577fa6524e235967537a5cba39153e4670b8/verl_omni/pipelines/minimax_h3_image_diffusion_nft/diffusers_training_adapter.py)
+The pinned verl-omni contribution contains FP32 lookup of the six PDD timesteps on NPU, BF16 NPU Actor execution, RMSNorm dispatch through `torch_npu.npu_rms_norm`, device assignment for preference-scoring subprocesses, and the Diffusers image-packing fix. The H3 Image converter, adapters and dense-text reward recipe derive from aoshen524's commits `46ebe8a`, `b5dd965` and `5216577`. [Original shared implementation](https://github.com/verl-project/verl-omni/pull/890/files)
 
 The experimental source passed 14 NPU regression cases. Its main-based contribution passed 51 CPU pipeline tests. The plots report the Ascend experiment's first 100 training steps. Recipe-level launcher checks cover Bash syntax, argument forwarding, the default 100-step limit, and invocation from a working directory outside the verl-omni checkout.
