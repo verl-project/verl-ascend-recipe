@@ -1,0 +1,158 @@
+diff --git a/fsdp_turbo/distributed/expert_parallel/dispatcher.py b/fsdp_turbo/distributed/expert_parallel/dispatcher.py
+index af51b77..9b746eb 100644
+--- a/fsdp_turbo/distributed/expert_parallel/dispatcher.py
++++ b/fsdp_turbo/distributed/expert_parallel/dispatcher.py
+@@ -116,6 +116,32 @@ def experts_computation(
+         gate, up = torch.nn.functional.linear(hidden_states, gate_up_weights[0]).chunk(2, dim=-1)
+         return torch.nn.functional.linear(gate * up, down_weights[0])
+ 
++    # P2a (2026-11-14): no-grad scoring path fused with the rollout's swiglu
++    # kernel. Only for plain-SwiGLU MXFP8 MoE without balance/clipping/SiTU;
++    # everything else (grad, W4A16 QAT, W4A8 format, other activations,
++    # ep_balance) falls through to the original path below.
++    if (
++        not torch.is_grad_enabled()
++        and quant_config is not None
++        and not is_w4a16
++        and ep_balance is None
++        and act_fn is None
++        and act_alpha is None
++        and (act_limit is None or act_limit <= 0)
++        and not getattr(weight_owner, "use_fused_clipped_swiglu", False)
++    ):
++        from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
++        from fsdp_turbo.quantization.mx_formats.mx_gmm import mx_fused_swiglu_group_gemm
++
++        if isinstance(quant_config, MXFP8LinearConfig) and getattr(quant_config, "quant_format", None) != "W4A8":
++            return mx_fused_swiglu_group_gemm(
++                x=hidden_states,
++                gate_up_weight=gate_up_weights,
++                down_weight=down_weights,
++                tokens_per_expert=split_list,
++                config=quant_config,
++            )
++
+     def gemm_fn(x, w, weight_attr):
+         if is_w4a16:
+             num_local_experts = gate_up_weights.shape[0]
+diff --git a/fsdp_turbo/quantization/mx_formats/mx_gmm.py b/fsdp_turbo/quantization/mx_formats/mx_gmm.py
+index 8e5effb..f185318 100644
+--- a/fsdp_turbo/quantization/mx_formats/mx_gmm.py
++++ b/fsdp_turbo/quantization/mx_formats/mx_gmm.py
+@@ -156,6 +156,116 @@ def mx_quant_group_gemm(
+     )
+ 
+ 
++_P2A_FUSED_ANNOUNCED = False
++
++
++def _pack_mx_act_scale(scale: torch.Tensor) -> torch.Tensor:
++    """Pack a 2D per-block e8m0 activation scale into [T, nb//2, 2].
++
++    Mirrors vLLM-Ascend's maybe_normalize_mxfp_scale_layout: the grouped
++    matmul kernels take the interleaved pack; already-packed (3D) scales and
++    None pass through unchanged.
++    """
++    if scale is not None and scale.ndim == 2 and scale.shape[-1] % 2 == 0:
++        return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
++    return scale
++
++
++def mx_fused_swiglu_group_gemm(
++    x: torch.Tensor,
++    gate_up_weight: torch.Tensor,
++    down_weight: torch.Tensor,
++    tokens_per_expert: torch.Tensor,
++    config: MXFP8LinearConfig,
++) -> torch.Tensor:
++    """No-grad MoE expert path using the rollout's fused swiglu kernel.
++
++    Runs gate/up GMM + SiLU*up + output quantization inside
++    torch_npu.npu_grouped_matmul_swiglu_quant_v2 — the same fused kernel
++    vLLM-Ascend's W8A8_MXFP8 rollout uses (w8a8_mxfp8.apply_gmm1_act_quant) —
++    then the down GMM via npu_grouped_matmul with split_item=2, matching the
++    rollout's apply_gmm2. This removes the train/infer numerical asymmetry of
++    the unfused path (bf16 round trip + extra activation re-quantization,
++    P1/run29 E_cross 1.2-1.4% per layer) for no-grad scoring of rollout
++    samples; the backward path is untouched.
++
++    Scale layouts are kernel-native: torch_npu's npu_dynamic_mx_quant meta
++    returns [E, ceil(ceil(K/32)/2), N, 2] for axis=-2 weights and
++    [T, nb//2, 2] for axis=-1 activations — exactly what the split_item=2
++    kernel family consumes (P1 run29 X1 cross-feed 0.0000%).
++    """
++    if torch.is_grad_enabled():
++        raise RuntimeError("mx_fused_swiglu_group_gemm is a no-grad-only path")
++    global _P2A_FUSED_ANNOUNCED
++    if not _P2A_FUSED_ANNOUNCED:
++        _P2A_FUSED_ANNOUNCED = True
++        print("[P2a] fused swiglu MX MoE no-grad path engaged", flush=True)
++    import torch_npu
++
++    x_fp8, x_scale = dynamic_mx_quant(x, axis=-1, dst_type=config.get_key_dtype("inputs"))
++    x_scale = _pack_mx_act_scale(x_scale)
++
++    num_experts = len(tokens_per_expert)
++    group_list_cum = torch.cumsum(tokens_per_expert, dim=0).to(torch.int64)
++
++    def _prep_weight(weight, k):
++        w = weight
++        if isinstance(w, torch.nn.Parameter):
++            w = w.data
++        if hasattr(w, "to_local"):
++            w = w.to_local()
++        if w.dtype == torch.float32:
++            w = w.to(torch.bfloat16)
++        w_3d = to_gmm_3d(w, num_experts, k=k)
++        w_fp8, w_scale = dynamic_mx_quant(w_3d, axis=-2, dst_type=config.get_key_dtype("weight"))
++        n = w_3d.shape[-1]
++        k_blocks = (k + 31) // 32
++        expected = (num_experts, (k_blocks + 1) // 2, n, 2)
++        if tuple(w_scale.shape) != expected:
++            raise ValueError(
++                f"axis=-2 MX weight scale shape {tuple(w_scale.shape)} != kernel contract {expected}"
++            )
++        return w_fp8, w_scale
++
++    w13_fp8, w13_scale = _prep_weight(gate_up_weight, k=x.shape[1])
++    intermediate_size = w13_fp8.shape[-1] // 2
++    w2_fp8, w2_scale = _prep_weight(down_weight, k=intermediate_size)
++
++    h_fp8, out_scale = torch_npu.npu_grouped_matmul_swiglu_quant_v2(
++        x=x_fp8,
++        weight=[w13_fp8],
++        group_list=group_list_cum,
++        weight_scale=[w13_scale],
++        x_scale=x_scale,
++        dequant_mode=2,
++        quant_mode=2,
++        dequant_dtype=torch.float32,
++        quant_dtype=config.get_key_dtype("inputs"),
++        x_dtype=None,
++        weight_dtype=None,
++        weight_scale_dtype=torch_npu.float8_e8m0fnu,
++        x_scale_dtype=torch_npu.float8_e8m0fnu,
++    )
++    out_scale = _pack_mx_act_scale(out_scale)
++
++    return torch_npu.npu_grouped_matmul(
++        [h_fp8],
++        [w2_fp8],
++        scale=[w2_scale],
++        bias=None,
++        per_token_scale=[out_scale],
++        group_list=tokens_per_expert.to(torch.int64),
++        group_list_type=1,
++        group_type=0,
++        output_dtype=torch.bfloat16,
++        scale_dtype=torch_npu.float8_e8m0fnu,
++        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
++        split_item=2,
++        x_dtype=None,
++        weight_dtype=None,
++    )[0]
++
++
+ def _mx_gmm_transform(module: torch.nn.Module, config: MXFP8LinearConfig):
+     """Handler to convert an expert module to MXFP8GMM."""
+     return MXFP8GMM.from_float(module, config=config)
