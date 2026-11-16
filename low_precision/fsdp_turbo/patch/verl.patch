@@ -1,556 +1,119 @@
 diff --git a/tests/utils/test_ascend_mxfp8_on_cpu.py b/tests/utils/test_ascend_mxfp8_on_cpu.py
-new file mode 100644
-index 0000000..914cca5
---- /dev/null
+index 24a3ae73..4f88c4c1 100644
+--- a/tests/utils/test_ascend_mxfp8_on_cpu.py
 +++ b/tests/utils/test_ascend_mxfp8_on_cpu.py
-@@ -0,0 +1,227 @@
-+# Copyright 2026 Bytedance Ltd. and/or its affiliates
-+#
-+# Licensed under the Apache License, Version 2.0 (the "License");
-+# you may not use this file except in compliance with the License.
-+# You may obtain a copy of the License at
-+#
-+#     http://www.apache.org/licenses/LICENSE-2.0
-+#
-+# Unless required by applicable law or agreed to in writing, software
-+# distributed under the License is distributed on an "AS IS" BASIS,
-+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+# See the License for the specific language governing permissions and
-+# limitations under the License.
-+
-+import json
-+import sys
-+from types import SimpleNamespace
-+
-+import pytest
-+import torch
-+
-+
-+def _patch_torch_npu(monkeypatch):
-+    calls = []
-+
-+    def npu_dynamic_mx_quant(weight, axis, dst_type):
-+        calls.append((weight, axis, dst_type))
-+        groups = (weight.shape[-1] + 31) // 32
-+        scale = torch.ones(*weight.shape[:-1], groups, 1, dtype=torch.uint8)
-+        return weight.to(dst_type), scale
-+
-+    monkeypatch.setitem(
-+        sys.modules,
-+        "torch_npu",
-+        SimpleNamespace(npu_dynamic_mx_quant=npu_dynamic_mx_quant, float8_e4m3fn=torch.float8_e4m3fn),
-+    )
-+    return calls
-+
-+
-+def test_native_ascend_dispatch_reads_modelslim_description(tmp_path):
-+    from verl.utils.qat.ascend import AscendMxfp8WeightQuantizer
-+    from verl.utils.qat.compressed_tensors import dispatch_rollout_weight_quantizer
-+
-+    description = {"quant_method": "ascend", "model.layers.0.self_attn.q_proj.weight": "W8A8_MXFP8"}
-+    (tmp_path / "quant_model_description.json").write_text(json.dumps(description))
-+    model_config = SimpleNamespace(
-+        local_path=str(tmp_path), hf_config=SimpleNamespace(model_type="qwen3_moe", text_config=None)
-+    )
-+    rollout_config = SimpleNamespace(
-+        name="vllm", quantization="ascend", checkpoint_engine=SimpleNamespace(backend="naive")
-+    )
-+
-+    quantizer = dispatch_rollout_weight_quantizer(model_config=model_config, rollout_config=rollout_config)
-+
-+    assert isinstance(quantizer, AscendMxfp8WeightQuantizer)
-+    assert quantizer.quant_description == description
-+
-+
-+def test_auto_detected_ascend_dispatch_reads_modelslim_description(tmp_path, monkeypatch):
-+    from verl.utils.qat.ascend import AscendMxfp8WeightQuantizer
-+    from verl.utils.qat.compressed_tensors import dispatch_rollout_weight_quantizer
-+
-+    description = {"quant_method": "ascend", "model.layers.0.self_attn.q_proj.weight": "W8A8_MXFP8"}
-+    (tmp_path / "quant_model_description.json").write_text(json.dumps(description))
-+    monkeypatch.setattr("verl.utils.qat.ascend.detect_ascend_modelslim", lambda path: True)
-+    model_config = SimpleNamespace(
-+        local_path=str(tmp_path), hf_config=SimpleNamespace(model_type="qwen3_moe", text_config=None)
-+    )
-+    rollout_config = SimpleNamespace(
-+        name="vllm",
-+        quantization=SimpleNamespace(linear=None, moe=None, moe_activation=None, ignore=[], config_file=None),
-+        checkpoint_engine=SimpleNamespace(backend="naive"),
-+    )
-+
-+    quantizer = dispatch_rollout_weight_quantizer(model_config=model_config, rollout_config=rollout_config)
-+
-+    assert isinstance(quantizer, AscendMxfp8WeightQuantizer)
-+    assert quantizer.quant_description == description
-+
-+
-+def test_ascend_auto_detection_keeps_unquantized_without_signature(tmp_path, monkeypatch):
-+    from verl.utils.qat.compressed_tensors import dispatch_rollout_weight_quantizer
-+
-+    monkeypatch.setattr("verl.utils.qat.ascend.detect_ascend_modelslim", lambda path: False)
-+    model_config = SimpleNamespace(
-+        local_path=str(tmp_path), hf_config=SimpleNamespace(model_type="qwen3_moe", text_config=None)
-+    )
-+    rollout_config = SimpleNamespace(
-+        name="vllm",
-+        quantization=SimpleNamespace(linear=None, moe=None, moe_activation=None, ignore=[], config_file=None),
-+        checkpoint_engine=SimpleNamespace(backend="naive"),
-+    )
-+
-+    assert dispatch_rollout_weight_quantizer(model_config=model_config, rollout_config=rollout_config) is None
-+
-+
-+def test_ascend_quantizer_emits_mxfp8_weights_and_scales(monkeypatch):
-+    from verl.utils.qat.ascend import AscendMxfp8WeightQuantizer
+@@ -179,6 +179,22 @@ def test_ascend_quantizer_expands_packed_experts(monkeypatch):
+     assert output[f"{prefix}.down_proj.weight_scale"].shape == (64, 1)
+ 
+ 
++def test_ascend_quantizer_uses_experts_zero_template(monkeypatch):
++    from verl.utils.qat.ascend_modelslim import ModelSlimMxfp8WeightExporter
 +
 +    calls = _patch_torch_npu(monkeypatch)
-+    name = "model.layers.0.self_attn.q_proj.weight"
-+    gate = "model.layers.0.mlp.gate.weight"
-+    quantizer = AscendMxfp8WeightQuantizer({name: "W8A8_MXFP8", gate: "FLOAT"})
-+    weight = torch.randn(2, 64, dtype=torch.bfloat16)
-+    gate_weight = torch.randn(4, 64, dtype=torch.bfloat16)
++    name = "model.layers.0.mlp.experts.7.gate_proj.weight"
++    template = "model.layers.0.mlp.experts.0.gate_proj.weight"
++    quantizer = ModelSlimMxfp8WeightExporter({template: "W8A8_MXFP8"})
++    weight = torch.randn(32, 64, dtype=torch.bfloat16)
 +
-+    output = dict(quantizer([(name, weight), (gate, gate_weight)]))
++    output = dict(quantizer([(name, weight)]))
 +
-+    assert set(output) == {name, name + "_scale", gate}
-+    assert output[name].dtype == torch.float8_e4m3fn
-+    assert output[name + "_scale"].shape == (2, 2)
-+    assert output[name + "_scale"].dtype == torch.uint8
-+    assert output[gate] is gate_weight
++    assert set(output) == {name, name + "_scale"}
++    assert output[name + "_scale"].shape == (32, 2)
 +    assert calls == [(weight, -1, torch.float8_e4m3fn)]
 +
 +
-+def test_ascend_quantizer_expands_packed_experts(monkeypatch):
-+    from verl.utils.qat.ascend import AscendMxfp8WeightQuantizer
-+
-+    _patch_torch_npu(monkeypatch)
-+    prefix = "model.layers.0.mlp.experts.0"
-+    description = {
-+        f"{prefix}.{projection}.weight": "W8A8_MXFP8" for projection in ("gate_proj", "up_proj", "down_proj")
-+    }
-+    quantizer = AscendMxfp8WeightQuantizer(description)
-+
-+    output = dict(
-+        quantizer(
-+            [
-+                ("model.layers.0.mlp.experts.gate_up_proj", torch.randn(1, 64, 64, dtype=torch.bfloat16)),
-+                ("model.layers.0.mlp.experts.down_proj", torch.randn(1, 64, 32, dtype=torch.bfloat16)),
-+            ]
-+        )
-+    )
-+
-+    assert len(output) == 6
-+    assert output[f"{prefix}.gate_proj.weight_scale"].shape == (32, 2)
-+    assert output[f"{prefix}.up_proj.weight_scale"].shape == (32, 2)
-+    assert output[f"{prefix}.down_proj.weight_scale"].shape == (64, 1)
-+
-+
-+def test_ascend_quantizer_rejects_unsupported_weight_types():
-+    from verl.utils.qat.ascend import AscendMxfp8WeightQuantizer
-+
-+    with pytest.raises(NotImplementedError, match="W8A8_DYNAMIC"):
-+        AscendMxfp8WeightQuantizer({"model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC"})
-+
-+
-+def test_native_string_quantization_needs_no_hf_override():
-+    from verl.workers.rollout.vllm_rollout.vllm_async_server import build_cli_args_from_config, vLLMHttpServer
-+
-+    server = SimpleNamespace(config=SimpleNamespace(quantization="ascend"))
-+
-+    assert vLLMHttpServer._apply_quantization(server) == {}
-+    engine_kwargs = {}
-+    vLLMHttpServer._set_native_quantization(server, engine_kwargs)
-+    assert engine_kwargs == {"quantization": "ascend"}
-+    assert build_cli_args_from_config(engine_kwargs) == ["--quantization", "ascend"]
-+
-+
-+def test_structured_quantization_does_not_set_native_engine_arg():
-+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
-+
-+    server = SimpleNamespace(config=SimpleNamespace(quantization=SimpleNamespace(enabled=True)))
-+    engine_kwargs = {}
-+
-+    vLLMHttpServer._set_native_quantization(server, engine_kwargs)
-+
-+    assert engine_kwargs == {}
-+
-+
-+def test_ascend_mx_config_is_quantized(monkeypatch):
-+    from verl.utils.vllm.vllm_quant_utils import is_quantized_model
-+
-+    class AscendModelSlimConfig:
-+        def __init__(self, description):
-+            self.quant_description = description
-+
-+    quantization_module = SimpleNamespace(AscendModelSlimConfig=AscendModelSlimConfig)
-+    monkeypatch.setitem(sys.modules, "vllm_ascend.quantization", quantization_module)
-+    config = SimpleNamespace(quant_config=AscendModelSlimConfig({"layer.weight": "W8A8_MXFP8"}))
-+
-+    assert is_quantized_model(config)
-+
-+
-+def test_prepare_and_process_brackets_ascend_layout_reload():
-+    from verl.utils.vllm.vllm_quant_utils import (
-+        prepare_quanted_weights_for_loading,
-+        process_quanted_weights_after_loading,
-+    )
-+
-+    calls = []
-+
-+    class Scheme:
-+        def restore_weights_for_rl_loading(self, layer):
-+            calls.append("restore")
-+            layer._mxfp8_transformed = False
-+
-+        def process(self, layer):
-+            calls.append("process")
-+            layer._mxfp8_transformed = True
-+
-+    class Method:
-+        def __init__(self, scheme):
-+            self.quant_method = scheme
-+
-+        def process_weights_after_loading(self, layer):
-+            self.quant_method.process(layer)
-+
-+    scheme = Scheme()
-+    layer = SimpleNamespace(_mxfp8_transformed=True, _mxfp8_original_shapes={}, quant_method=Method(scheme))
-+
-+    class Model:
-+        def named_modules(self):
-+            return [("layer", layer)]
-+
-+        def modules(self):
-+            return [layer]
-+
-+    model = Model()
-+    state = prepare_quanted_weights_for_loading(model)
-+    assert not layer._mxfp8_transformed
-+
-+    process_quanted_weights_after_loading(model, state)
-+
-+    assert layer._mxfp8_transformed
-+    assert calls == ["restore", "process"]
-diff --git a/verl/utils/qat/ascend.py b/verl/utils/qat/ascend.py
-new file mode 100644
-index 0000000..b8cdfb0
---- /dev/null
-+++ b/verl/utils/qat/ascend.py
-@@ -0,0 +1,108 @@
-+# Copyright 2026 Bytedance Ltd. and/or its affiliates
-+#
-+# Licensed under the Apache License, Version 2.0 (the "License");
-+# you may not use this file except in compliance with the License.
-+# You may obtain a copy of the License at
-+#
-+#     http://www.apache.org/licenses/LICENSE-2.0
-+#
-+# Unless required by applicable law or agreed to in writing, software
-+# distributed under the License is distributed on an "AS IS" BASIS,
-+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+# See the License for the specific language governing permissions and
-+# limitations under the License.
-+
-+import json
+ def test_ascend_quantizer_rejects_unsupported_weight_types():
+     from verl.utils.qat.ascend_modelslim import ModelSlimMxfp8WeightExporter
+ 
+diff --git a/verl/utils/qat/ascend_modelslim.py b/verl/utils/qat/ascend_modelslim.py
+index 8c86bdc8..2ea307dd 100644
+--- a/verl/utils/qat/ascend_modelslim.py
++++ b/verl/utils/qat/ascend_modelslim.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import json
 +import re
-+from collections.abc import Iterable, Iterator, Mapping
-+from pathlib import Path
-+from typing import Any
-+
-+import torch
-+
-+from verl.utils.qat.compressed_tensors import _HIGH_PRECISION_DTYPES, _PACKED_EXPERTS, _unpack_experts
-+
-+
-+def detect_ascend_modelslim(model_path: str) -> bool:
-+    try:
-+        from vllm_ascend.quantization.utils import detect_quantization_method
-+    except ImportError:
-+        return False
-+    return detect_quantization_method(model_path) == "ascend"
-+
-+
+ from collections.abc import Iterable, Iterator, Mapping
+ from pathlib import Path
+ from typing import Any
+@@ -30,6 +31,14 @@ def detect_ascend_modelslim(model_path: str) -> bool:
+     return detect_quantization_method(model_path) == "ascend"
+ 
+ 
 +_EXPERT_INDEX_RE = re.compile(r"(\.experts\.)\d+(\.)")
 +
 +
 +def _modelslim_template_key(name: str) -> str:
-+    """Fold an expert index in a weight name to the description's template key.
-+
-+    ModelSlim descriptions store one template entry per layer (e.g.
-+    ``...mlp.experts.0.gate_proj.weight``); vllm-ascend expands that entry to
-+    every expert when it creates the engine parameters (modelslim_config
-+    normalizes expert indices, vllm_ascend/quantization/configs/
-+    modelslim_config.py:669-672). The export side must match that template
-+    semantics, otherwise only expert 0 is quantized and the engine's scales
-+    for the remaining experts stay at their ``torch.empty`` init. Literal
-+    entries in the description still win over the template fallback.
-+    """
++    """Fold an expert index to the description's experts.0 template key."""
 +    return _EXPERT_INDEX_RE.sub(r"\g<1>0\g<2>", name, count=1)
 +
 +
-+class AscendMxfp8WeightQuantizer:
-+    """Export trainer weights in vLLM-Ascend's native W8A8_MXFP8 layout."""
-+
-+    def __init__(self, quant_description: Mapping[str, Any]):
-+        self.quant_description = dict(quant_description)
-+        unsupported = sorted(
-+            {
-+                quant_type
-+                for name, quant_type in self.quant_description.items()
-+                if name.endswith(".weight") and quant_type not in {"W8A8_MXFP8", "FLOAT"}
-+            }
+ class ModelSlimMxfp8WeightExporter:
+     """Export trainer weights using an existing ModelSlim MXFP8 recipe.
+ 
+@@ -60,10 +69,11 @@ class ModelSlimMxfp8WeightExporter:
+     def _export_weight(name: str, weight: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+         import torch_npu
+ 
+-        quantized, scale = torch_npu.npu_dynamic_mx_quant(weight, axis=-1, dst_type=torch.float8_e4m3fn)
+-        groups = (weight.shape[-1] + 31) // 32
++        quantized, scale = torch_npu.npu_dynamic_mx_quant(
++            weight.to(torch.bfloat16).contiguous(), axis=-1, dst_type=torch.float8_e4m3fn
 +        )
-+        if unsupported:
-+            raise NotImplementedError(f"Unsupported Ascend ModelSlim weight quantization types: {unsupported}")
-+
-+    @classmethod
-+    def from_model_path(cls, model_path: str):
-+        with (Path(model_path) / "quant_model_description.json").open() as f:
-+            return cls(json.load(f))
-+
-+    @staticmethod
-+    def _export_weight(name: str, weight: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
-+        import torch_npu
-+
-+        # SCALEFIX-B (20261109): old-stack R1 chain semantics. Pre-cast to
-+        # bf16 (the old stack quantized w.to(torch.bfloat16); pr8511 fed the
-+        # raw dtype) and keep the operator's per-group scale grid via
-+        # flatten+squeeze (R1 original) instead of the truncated slice.
-+        w = weight.to(torch.bfloat16).contiguous()
-+        quantized, scale = torch_npu.npu_dynamic_mx_quant(w, axis=-1, dst_type=torch.float8_e4m3fn)
-+        yield name, quantized
-+        yield name + "_scale", scale.flatten(-2, -1).squeeze(-1)
-+
-+    def __call__(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
-+        for name, tensor in weights:
-+            packed = _PACKED_EXPERTS.match(name) if tensor.ndim == 3 else None
-+            if packed:
-+                for weight_name, weight in _unpack_experts(name, tensor):
-+                    yield from self._export_selected_weight(weight_name, weight)
-+            else:
-+                yield from self._export_selected_weight(name, tensor)
-+
-+    def _export_selected_weight(self, name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+         yield name, quantized
+-        yield name + "_scale", scale.flatten(-2, -1)[..., :groups]
++        yield name + "_scale", scale.flatten(-2, -1)
+ 
+     def __call__(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
+         for name, tensor in weights:
+@@ -75,8 +85,11 @@ class ModelSlimMxfp8WeightExporter:
+                 yield from self._export_selected_weight(name, tensor)
+ 
+     def _export_selected_weight(self, name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
 +        quant_type = self.quant_description.get(name)
 +        if quant_type is None and ".experts." in name:
-+            # Path A (20261105): literal miss -> fall back to the experts.0
-+            # template entry, matching the engine's parameter-creation
-+            # semantics (see _modelslim_template_key).
 +            quant_type = self.quant_description.get(_modelslim_template_key(name))
-+        if (
+         if (
+-            self.quant_description.get(name) != "W8A8_MXFP8"
 +            quant_type != "W8A8_MXFP8"
-+            or tensor.ndim != 2
-+            or tensor.dtype not in _HIGH_PRECISION_DTYPES
-+        ):
-+            yield name, tensor
-+            return
-+        yield from self._export_weight(name, tensor)
-diff --git a/verl/utils/qat/compressed_tensors.py b/verl/utils/qat/compressed_tensors.py
-index 6916b60..522707b 100644
---- a/verl/utils/qat/compressed_tensors.py
-+++ b/verl/utils/qat/compressed_tensors.py
-@@ -729,7 +729,8 @@ def dispatch_rollout_weight_quantizer(
-     The rollout engine keeps its native ``quantization_config`` unless
-     ``rollout.quantization`` explicitly overrides it. Both native and override
-     compressed-tensors configs use :class:`CompressedTensorsWeightQuantizer`;
--    native ``Fp8Config`` uses :class:`Fp8ConfigWeightQuantizer`. DeepSeek-V4
-+    native ``Fp8Config`` uses :class:`Fp8ConfigWeightQuantizer`; native Ascend
-+    ModelSlim MXFP8 uses :class:`verl.utils.qat.ascend.AscendMxfp8WeightQuantizer`. DeepSeek-V4
-     still gets an FP8 quantizer object, but it passes through the private mixed
-     FP8/FP4 layout already produced by Megatron-Bridge.
-     Per-token NVFP4 routed experts use :class:`NVFP4PerTokenWeightQuantizer`. NVFP4 training
-@@ -752,7 +753,21 @@ def dispatch_rollout_weight_quantizer(
-         getattr(hf_config, "model_type", None),
-         getattr(getattr(hf_config, "text_config", None), "model_type", None),
-     }
--    if has_override:
-+    use_ascend = rollout_quantization == "ascend"
-+    if (
-+        not use_ascend
-+        and not isinstance(rollout_quantization, str)
-+        and not has_override
-+        and native is None
-+        and getattr(rollout_config, "name", None) == "vllm"
-+        and getattr(model_config, "local_path", None) is not None
-+    ):
-+        from verl.utils.qat.ascend import detect_ascend_modelslim
-+
-+        use_ascend = detect_ascend_modelslim(model_config.local_path)
-+    if use_ascend:
-+        quantization_config = {"quant_method": "ascend"}
-+    elif has_override:
-         if model_types & _DEEPSEEK_V4_MODEL_TYPES:
-             raise NotImplementedError(
-                 "rollout.quantization overrides are not supported for DeepSeek-V4: the trainer exports its "
-@@ -815,6 +830,11 @@ def dispatch_rollout_weight_quantizer(
-             quantizer = SGLangMxfp8WeightQuantizer(quantization_config)
-         else:
-             quantizer = CompressedTensorsWeightQuantizer(quantization_config)
-+    elif quant_method == "ascend":
-+        from verl.utils.qat.ascend import AscendMxfp8WeightQuantizer
-+
-+        qat_modes = set()
-+        quantizer = AscendMxfp8WeightQuantizer.from_model_path(model_config.local_path)
-     elif "fp8" in quant_method:
-         qat_modes = {"fp8"}
-         quantizer = Fp8ConfigWeightQuantizer(quantization_config, model_types=model_types)
+             or tensor.ndim != 2
+             or tensor.dtype not in _HIGH_PRECISION_DTYPES
+         ):
 diff --git a/verl/utils/vllm/vllm_quant_utils.py b/verl/utils/vllm/vllm_quant_utils.py
-index 95e938a..d3016fd 100644
+index 1fe8903e..32fa7023 100644
 --- a/verl/utils/vllm/vllm_quant_utils.py
 +++ b/verl/utils/vllm/vllm_quant_utils.py
-@@ -24,7 +24,8 @@ The layout surgery each quantization scheme needs is delegated to a sibling
- module: ``vllm_fp8_utils`` for ``Fp8LinearMethod`` / ``Fp8MoEMethod``, and
- ``vllm_fp4_utils`` for ``Mxfp4MoEMethod``. Each exposes a stage/process pair
- that returns an empty result when the model has no layer it owns, so the
--dispatch below stays unconditional.
-+dispatch below stays unconditional. Ascend ModelSlim layouts use their native
-+restore/process hooks below.
- """
- 
- import importlib.metadata
-@@ -136,12 +137,24 @@ def is_quantized_model(vllm_config):
-     if hasattr(vllm_config, "quant_config"):
-         if isinstance(vllm_config.quant_config, Fp8Config):
-             return True
-+        elif is_vllm_ascend_mx_quant(vllm_config.quant_config):
-+            return True
-         elif is_compressed_tensors_model(vllm_config):
-             return True
- 
-     return False
- 
- 
-+def is_vllm_ascend_mx_quant(quant_config):
-+    try:
-+        from vllm_ascend.quantization import AscendModelSlimConfig
-+    except ImportError:
-+        return False
-+    if not isinstance(quant_config, AscendModelSlimConfig):
-+        return False
-+    return "W8A8_MXFP8" in quant_config.quant_description.values()
-+
-+
- def is_compressed_tensors_model(vllm_config) -> bool:
-     """Compressed-tensors rollout, whose refit weights the trainer already quantized."""
-     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-@@ -208,6 +221,27 @@ def refresh_rocm_attention_weight_caches(model):
-             module._dsv4_wo_a_bf16 = live
- 
- 
-+def restore_mxfp8_weights_for_loading(model):
-+    for _, module in model.named_modules():
-+        if not hasattr(module, "_mxfp8_transformed"):
-+            continue
-+        method = getattr(module, "quant_method", None)
-+        scheme = getattr(method, "quant_method", None)
-+        restore = getattr(scheme, "restore_weights_for_rl_loading", None)
-+        if restore is not None:
-+            restore(module)
-+
-+
-+def apply_mxfp8_transformation_after_loading(model):
-+    for _, module in model.named_modules():
-+        if not hasattr(module, "_mxfp8_original_shapes"):
-+            continue
-+        method = getattr(module, "quant_method", None)
-+        process = getattr(method, "process_weights_after_loading", None)
-+        if process is not None:
-+            process(module)
-+
-+
- def prepare_quanted_weights_for_loading(model):
-     """Restore quantized params to the layout their ``weight_loader`` expects.
- 
-@@ -218,6 +252,7 @@ def prepare_quanted_weights_for_loading(model):
-     so this is safe to call for any quantization scheme. The returned value is
-     opaque reload state for the paired call.
-     """
-+    restore_mxfp8_weights_for_loading(model)
-     reload_state: dict[str, Any] = {
-         "fp8_layers": stage_fp8_params_for_loading(model),
-         "mxfp4_moe_modules": stage_mxfp4_moe_params_for_loading(model),
-@@ -231,6 +266,7 @@ def prepare_quanted_weights_for_loading(model):
- 
- def process_quanted_weights_after_loading(model, reload_state):
-     """Re-apply the inference layout undone by ``prepare_quanted_weights_for_loading``."""
-+    apply_mxfp8_transformation_after_loading(model)
-     reload_state = reload_state or {}
-     process_fp8_weights_after_loading(reload_state.get("fp8_layers") or [])
-     process_mxfp4_moe_weights_after_loading(reload_state.get("mxfp4_moe_modules") or [])
-@@ -244,6 +280,51 @@ def process_quanted_weights_after_loading(model, reload_state):
+@@ -280,6 +280,7 @@ def process_quanted_weights_after_loading(model, reload_state):
      # Last: the rebuild reads ``wo_a``, which is only back in its inference
      # layout once the staged FP8 params above have been reinstated.
      refresh_rocm_attention_weight_caches(model)
 +    refresh_ascend_gdn_conv_weights(model)
-+
-+
+ 
+ 
+ def reset_uncalibrated_kv_cache_scales(model):
+@@ -311,6 +312,31 @@ def reset_uncalibrated_kv_cache_scales(model):
+             set_default_quant_scales(module, register_buffer=False)
+ 
+ 
 +def refresh_ascend_gdn_conv_weights(model):
-+    """Repack the GDN conv kernel-layout buffers after every refit.
-+
-+    ``load_format="dummy"`` fills every persistent tensor -- including the
-+    vllm-ascend GDN derived buffer ``ascend_conv1d_weight`` -- with random
-+    values. A refit rewrites the source parameters and reprocesses the
-+    quantized modules listed above, but the GDN conv is an unquantized
-+    layer: no refit step fires its packing hook, so the packed buffer keeps
-+    the dummy values and prefill/decode consume them (gdn.py reads the
-+    packed weight in every conv call). A native load stays correct only
-+    because the initial model-wide processing runs the wrapped hook.
-+    Refresh the pack from the already-loaded source weights here so every
-+    sync wave ends with real packed conv weights.
-+
-+    GDN-REPACK (20261110, 调查员): opt-out with ``VERL_GDN_REPACK=0``.
-+    """
-+    import os as _os
-+    if _os.environ.get("VERL_GDN_REPACK", "1") == "0":
-+        return
++    """Repack the GDN conv kernel-layout buffers after every refit."""
 +    refreshed = 0
 +    for module in model.modules():
 +        pack = getattr(module, "_pack_conv_weights", None)
 +        if pack is None:
 +            continue
-+        try:
-+            pack()
-+            refreshed += 1
-+        except Exception as e:
-+            logger.warning("[GDN-REPACK] %s repack failed: %s: %s",
-+                           type(module).__name__, type(e).__name__,
-+                           str(e)[:160])
++        pack()
++        refreshed += 1
 +    if refreshed:
 +        logger.info("[GDN-REPACK] refreshed %d GDN conv packs", refreshed)
-+        return
-+    # Negative sentinel: packed buffers exist but no hook matched. Loud,
-+    # not silent -- a vllm-ascend version mismatch must not pass quietly.
-+    packed = sum(1 for _n, _p in model.named_parameters()
-+                 if _n.endswith("ascend_conv1d_weight"))
-+    if packed:
-+        logger.warning("[GDN-REPACK] %d packed conv buffers present but no "
-+                       "_pack_conv_weights hook matched -- version mismatch? "
-+                       "packs NOT refreshed", packed)
- 
- 
- def reset_uncalibrated_kv_cache_scales(model):
-@@ -275,6 +356,31 @@ def reset_uncalibrated_kv_cache_scales(model):
-             set_default_quant_scales(module, register_buffer=False)
- 
- 
++
++
 +def translate_weight_names_for_vllm(weights, model):
-+    """Map HF-checkpoint weight names to the vLLM module tree before loading.
-+
-+    vLLM VLM wrappers (e.g. Qwen3.5, Qwen2.5-VL) register the language model
-+    under a vLLM-side prefix (``language_model.*``) while the RL actor state
-+    dict uses HF names (``model.language_model.*``). The models expose the
-+    mapping via ``hf_to_vllm_mapper``; without applying it here, every weight
-+    lookup in ``get_module_from_param_name``/``model.load_weights`` fails and
-+    the engine silently keeps its initial (dummy) weights.
-+
-+    Weights mapped to ``None`` are ignored by vLLM and dropped.
-+
-+    Ported 20261103 from the old turbo stack (verl_fsdp_turbo.patch).
-+    """
++    """Map HF-checkpoint weight names to the vLLM module tree before loading."""
 +    mapper = getattr(model, "hf_to_vllm_mapper", None)
 +    if mapper is None or not hasattr(mapper, "_map_name"):
-+        for name, tensor in weights:
-+            yield name, tensor
++        yield from weights
 +        return
 +    for name, tensor in weights:
 +        mapped_name = mapper._map_name(name)
@@ -561,7 +124,7 @@ index 95e938a..d3016fd 100644
  def load_quanted_weights(weights, model_runner, is_drafter=False):
      if is_drafter:
          drafter = getattr(model_runner, "drafter", None)
-@@ -286,6 +392,7 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
+@@ -322,6 +348,7 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
      else:
          model = model_runner.model
      weights = list(weights)
@@ -570,25 +133,22 @@ index 95e938a..d3016fd 100644
      # Monkey patch the param class to their subclass, as certain models
      # will check the param type to call the proper weightloader
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index 3f0f145..2de24c1 100644
+index 3f0f1455..6232669d 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
-@@ -171,6 +171,9 @@ class FSDPEngine(BaseEngine):
-         self._autocast_dtype = torch.bfloat16
-         self.scaler = None
- 
-+        # Trainer-side rollout weight quantizer, set via set_rollout_weight_quantizer.
+@@ -162,6 +162,7 @@ class FSDPEngine(BaseEngine):
+         self._is_offload_param = self.engine_config.param_offload
+         self._is_offload_optimizer = self.engine_config.optimizer_offload
+         self._is_lora = self.model_config.lora_rank > 0
 +        self._rollout_weight_quantizer = None
-+
-         if self.engine_config.entropy_from_logits_with_chunking:
-             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
-         else:
-@@ -972,9 +975,20 @@ class FSDPEngine(BaseEngine):
+         # Set in _build_fsdp_module when FSDP2 CPUOffloadPolicy is configured (see #5995).
+         self._uses_fsdp2_cpu_offload_policy = False
+ 
+@@ -972,9 +973,19 @@ class FSDPEngine(BaseEngine):
              )
              per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
  
 +        if self._rollout_weight_quantizer is not None and not (peft_config is not None and base_sync_done):
-+            # Skip the adapter-only LoRA stream: adapters stay in high precision.
 +            refresh_scales = getattr(self._rollout_weight_quantizer, "refresh_input_global_scales", None)
 +            if refresh_scales is not None:
 +                refresh_scales(self.module)
@@ -604,85 +164,16 @@ index 3f0f145..2de24c1 100644
      def _merged_lora_per_tensor_param(self):
          """Stream merged (base + LoRA) weights for rollout weight sync.
  
-@@ -1010,7 +1024,13 @@ class FSDPEngine(BaseEngine):
+@@ -1010,7 +1021,11 @@ class FSDPEngine(BaseEngine):
          """Full HF-format weights for the checkpoint 'hf_model' export, with LoRA adapters merged."""
          if self._is_lora:
              return self._merged_lora_per_tensor_param(), None
 -        return self.get_per_tensor_param()
 +        quantizer, self._rollout_weight_quantizer = self._rollout_weight_quantizer, None
 +        try:
-+            # Checkpoints keep the high-precision master weights; only the
-+            # rollout sync consumes the quantized stream.
 +            return self.get_per_tensor_param()
 +        finally:
 +            self._rollout_weight_quantizer = quantizer
  
      def disable_adapter(self) -> ContextManager:
          return self.module.disable_adapter()
-diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
-index 9677c13..1978539 100644
---- a/verl/workers/rollout/vllm_rollout/utils.py
-+++ b/verl/workers/rollout/vllm_rollout/utils.py
-@@ -350,8 +350,17 @@ class vLLMColocateWorkerExtension:
-         if peft_config and base_sync_done:
-             logger.info("LoRA adapter sync, no post-process needed")
-         elif is_quantized_model(self.model_runner.vllm_config):
--            for model, reload_state in quant_reload_states:
--                process_quanted_weights_after_loading(model, reload_state)
-+            # E2 fix (20261103): RL weight sync runs this process loop inside
-+            # multiproc worker RPC contexts where no VllmConfig is set.
-+            # vllm-ascend w8a8_mxfp8 process hooks call get_current_vllm_config()
-+            # (strict assert in vllm 0.30 core; 0.19 w8a8_mxfp8.py:389 via
-+            # use_cann_megamoe) -> AssertionError. Set the engine's own config
-+            # around the loop; with-exit restores the previous value.
-+            from vllm.config import set_current_vllm_config
-+
-+            with set_current_vllm_config(self.model_runner.vllm_config):
-+                for model, reload_state in quant_reload_states:
-+                    process_quanted_weights_after_loading(model, reload_state)
-         else:
-             # Some post-load transforms are non-idempotent; run once after all buckets.
-             from vllm.model_executor.model_loader.utils import process_weights_after_loading
-diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-index a3b1a78..9e72195 100644
---- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-+++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
-@@ -306,6 +306,7 @@ class vLLMHttpServer:
-             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
- 
-         self._preprocess_engine_kwargs(engine_kwargs)
-+        self._set_native_quantization(engine_kwargs)
- 
-         # Override default generation config from hugging face model config,
-         # user can still override them by passing kwargs in each request.
-@@ -517,6 +518,10 @@ class vLLMHttpServer:
-         engine_args = AsyncEngineArgs.from_cli_args(args)
-         usage_context = UsageContext.OPENAI_API_SERVER
-         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-+        quant_config = vllm_config.quant_config
-+        logger.info(
-+            f"vLLM quantization config type: {type(quant_config).__name__ if quant_config is not None else None}"
-+        )
-         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
- 
-         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
-@@ -1480,6 +1485,10 @@ class vLLMHttpServer:
-             max_new_tokens=self.config.response_length,
-         )
- 
-+    def _set_native_quantization(self, engine_kwargs: dict) -> None:
-+        if isinstance(self.config.quantization, str):
-+            engine_kwargs["quantization"] = self.config.quantization
-+
-     def _apply_quantization(self) -> dict:
-         """hf_overrides for a rollout quantization set in the rollout config.
- 
-@@ -1487,6 +1496,8 @@ class vLLMHttpServer:
-         workers install the refit patches from the resulting vLLM ``quant_config``.
-         """
-         quantization = self.config.quantization
-+        if isinstance(quantization, str):
-+            return {}
-         if not quantization.enabled:
-             return {}
- 

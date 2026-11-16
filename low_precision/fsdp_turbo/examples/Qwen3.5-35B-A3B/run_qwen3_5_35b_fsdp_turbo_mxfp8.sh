@@ -28,8 +28,6 @@ TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/geo3k/test.parquet"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 QUANT_MODE=${QUANT_MODE:-ascend}
-VLLM_ASCEND_ONLINE_WEIGHT_QUANT=${VLLM_ASCEND_ONLINE_WEIGHT_QUANT:-1}
-export VLLM_ASCEND_ONLINE_WEIGHT_QUANT
 MXFP8=${MXFP8:-1}
 ########################### MXFP8 quantization plan (训练侧) ###########################
 QUANT_APPLY_MODULES="['model.language_model.layers.{*}']"

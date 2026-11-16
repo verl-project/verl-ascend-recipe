@@ -1,12 +1,12 @@
 # Qwen3.5-35B-A3B MXFP8 GRPO（FSDPTurbo 链路）on Ascend NPU
 
-> ⚠️ **依赖合入状态提示**：本 recipe 使用实际长跑 `GRPO-Qwen3_5-35B-exp1102-08-pr8511-MXFP8LR200-R2` 的代码面，三个依赖仓均以固定 commit + patch 复现：
+> ⚠️ **依赖合入状态提示**：本 recipe 使用实际长跑 `GRPO-Qwen3_5-35B-exp1102-08-pr8511-MXFP8LR200-R2` 的代码面；verl 与 FSDPTurbo 以固定 commit + patch 复现，vLLM-Ascend 使用固定基线：
 >
 > | 依赖 | 基线 commit | patch |
 > | :--- | :--- | :--- |
-> | verl | `7454326` | `patch/verl.patch`（PR #8511 + FSDP rollout 量化接线 + ModelSlim 导出/加载修正） |
+> | verl | `3d050639`（PR #8511 head） | `patch/verl.patch`（R2-only：FSDP rollout 量化接线 + ModelSlim 导出/GDN refit 修正） |
 > | FSDPTurbo | `759a348` | `patch/fsdpturbo.patch`（P2a no-grad fused SwiGLU MX MoE 路径） |
-> | vLLM-Ascend | `c09d3e2` | `patch/vllm-ascend.patch`（`VLLM_ASCEND_ONLINE_WEIGHT_QUANT=1` 在线权重量化） |
+> | vLLM-Ascend | `c09d3e2` | 无 patch（原生 ModelSlim MXFP8 加载；RL refit 由 verl 发送 FP8+scale） |
 >
 > `install.sh` 会先 checkout 上表 commit，再应用对应 patch，并在末尾做硬性自检。
 
@@ -25,9 +25,9 @@ checkpoint 仍以训练后的高精权重保存：下游评测时按普通 BF16 
 | CANN                   | 9.2.0                        |
 | PyTorch                | 2.10.0+cpu                   |
 | torch\_npu             | 2.10.0.post4                 |
-| verl                   | 7454326 + patch/verl.patch   |
+| verl                   | 3d050639 + patch/verl.patch  |
 | vLLM                   | ced6857                      |
-| vLLM-Ascend            | c09d3e2 + patch              |
+| vLLM-Ascend            | c09d3e2                     |
 | FSDPTurbo              | 759a348 + patch              |
 | triton\_ascend         | 3.2.2                        |
 | transformers           | 5.10.4                       |
@@ -54,13 +54,13 @@ export PYTHONPATH=$PWD/FSDPTurbo:$PYTHONPATH
 
 ## 版本依赖
 
-本链路附带三个 patch，`install.sh` 会按固定基线 commit 应用：
+本链路附带两个 patch，`install.sh` 会按固定基线 commit 应用：
 
-- **verl**：`patch/verl.patch`，相对 `7454326` 共 7 个文件，包含 Ascend ModelSlim MXFP8 权重量化器、FSDP rollout 权重量化接线、checkpoint 高精保存、vLLM 配置保护、异步服务原生量化参数、GDN conv refit 后重打包与 scale 导出修正。
+- **verl**：`patch/verl.patch`，相对 PR #8511 head `3d050639` 共 4 个文件（76 行新增、5 行删除），只包含 FSDP rollout 权重量化接线、checkpoint 高精保存、GDN conv refit 重打包、HF→vLLM 权重名映射和 ModelSlim scale/专家模板修正。
 - **FSDPTurbo**：`patch/fsdpturbo.patch`，相对 `759a348` 共 2 个文件，包含 no-grad fused SwiGLU MX MoE 路径，消除 rollout 样本打分时的训练/推理数值不对称。
-- **vLLM-Ascend**：`patch/vllm-ascend.patch`，相对 `c09d3e2` 共 1 个文件，包含 `VLLM_ASCEND_ONLINE_WEIGHT_QUANT=1` 在线权重量化，支持 BF16 权重目录 + ModelSlim 描述文件。
+- **vLLM-Ascend**：不附加 patch，使用 `c09d3e2` 原生 ModelSlim MXFP8 加载；RL 权重同步由 verl 导出 FP8 权重与 scale。
 
-`install.sh` 末尾会对 `AscendMxfp8WeightQuantizer`、`mx_fused_swiglu_group_gemm`、`VLLM_ASCEND_ONLINE_WEIGHT_QUANT` 做硬性自检，缺失即退出。
+`install.sh` 末尾会对 `ModelSlimMxfp8WeightExporter`、`mx_fused_swiglu_group_gemm` 做硬性自检，缺失即退出。
 
 ## 权重下载与 quant_model_description.json 生成
 
@@ -84,7 +84,7 @@ python verl-ascend-recipe/low_precision/tool/smart_create_mxfp8_weight_dir.py \
 
 - 训练侧 actor/ref 各 7 项 FSDPTurbo MXFP8 配置。
 - rollout 侧固定 `actor_rollout_ref.rollout.quantization=ascend`。
-- `VLLM_ASCEND_ONLINE_WEIGHT_QUANT=1`，用于 BF16 权重目录 + ModelSlim 描述文件的在线权重量化。
+- 不设置 `VLLM_ASCEND_ONLINE_WEIGHT_QUANT`；RL refit 使用 verl 导出的 FP8 权重与 scale。
 - EP 使用 `all2all + use_fused_ops=True`，并启用 fused causal conv1d / fused GDN。
 - `trainer.total_training_steps=200`、`trainer.save_freq=100`，与实际长跑一致。
 
