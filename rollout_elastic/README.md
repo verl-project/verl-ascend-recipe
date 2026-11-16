@@ -10,7 +10,7 @@ The recipe builds on verl's fully-async and one-step-off execution paths and che
 
 ## Compatibility
 
-This recipe targets **verl 0.9.0**, as specified in [REQUIRED_VERL.txt](REQUIRED_VERL.txt). Use consistent versions of verl, this recipe and inference dependencies across the driver and all Ray workers. Revalidate patch compatibility when upgrading verl.
+This recipe targets the **verl 0.9.0 release line**, as specified in [REQUIRED_VERL.txt](REQUIRED_VERL.txt). Use `release/v0.9.0` at commit [`91c297dc8d9991b79c90cad5b50683a5d6d8c02b`](https://github.com/verl-project/verl/commit/91c297dc8d9991b79c90cad5b50683a5d6d8c02b).
 
 | Category | Supported configurations |
 | --- | --- |
@@ -56,13 +56,16 @@ Refer to the upstream [Ascend image tags and Dockerfiles](https://github.com/ver
 
 **Download the source on the host**
 
-Check out **verl v0.9.0** and copy the recipe's patch directory into the verl checkout:
+Check out the **specified commit on `release/v0.9.0`** and copy the recipe's patch directory into the verl checkout:
 
 ```bash
 export WORKSPACE="${WORKSPACE:-$HOME/verl-workspace}"
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
-git clone --branch v0.9.0 --depth 1 https://github.com/verl-project/verl.git verl
+git clone --branch release/v0.9.0 --single-branch https://github.com/verl-project/verl.git verl
+git -C verl checkout --detach 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+git -C verl rev-parse HEAD
+# Expected: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
 git clone https://github.com/verl-project/verl-ascend-recipe.git
 cp -r verl-ascend-recipe/rollout_elastic verl/
 ```

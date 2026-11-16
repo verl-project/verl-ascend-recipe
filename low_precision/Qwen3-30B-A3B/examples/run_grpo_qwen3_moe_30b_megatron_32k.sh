@@ -6,11 +6,37 @@ project_name='GRPO-Qwen3-30b-A3B-BASE-MATH'
 exp_name='GRPO-Qwen3-30B-A3B-BASE-Megatron-vLLM'
 
 # Node Info
-NNODES=2
-NPUS_PER_NODE=${NPUS_PER_NODE:-8}
+NNODES="${NNODES:?NNODES must be set by ray_start.sh}"
+NPUS_PER_NODE="${NPUS_PER_NODE:?NPUS_PER_NODE must be set by ray_start.sh}"
+
+# Low Precision Configuration
+ENABLE_MXFP8="${ENABLE_MXFP8:?ENABLE_MXFP8 must be set by ray_start.sh}"
+
+# Generation Configuration
+IGNORE_EOS="${IGNORE_EOS:?IGNORE_EOS must be set by ray_start.sh}"
+case "${IGNORE_EOS}" in
+  True|False)
+    ;;
+  *)
+    echo "Unsupported IGNORE_EOS: ${IGNORE_EOS}. Expected True or False." >&2
+    exit 1
+    ;;
+esac
 
 # Model Weights Paths
-MODEL_PATH=/model/Qwen3-30B-A3B-MXFP8
+case "${ENABLE_MXFP8}" in
+  True)
+    MODEL_PATH=${MODEL_PATH:-"/model/Qwen3-30B-A3B-MXFP8"}
+    ;;
+  False)
+    MODEL_PATH=${MODEL_PATH:-"/model/Qwen3-30B-A3B"}
+    ;;
+  *)
+    echo "Unsupported ENABLE_MXFP8: ${ENABLE_MXFP8}. Expected True or False." >&2
+    exit 1
+    ;;
+esac
+
 MCORE_MODEL_PATH=Qwen/Qwen3-30B-A3B-Base-dist
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
@@ -22,7 +48,7 @@ TEST_FILE=${TEST_FILE:-"/data/gsm8k/test.parquet"}
 
 # Data Configuration
 max_prompt_length=1024
-max_response_length=8192
+max_response_length=32768
 
 # Training Batch Configuration
 train_prompt_bsz=64
@@ -36,28 +62,28 @@ kl_coef=0.0
 use_kl_loss=True
 kl_loss_coef=0.001
 
-# Performance and Memory Management Configuration
-all_offload=True
-use_dynamic_bsz=True
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 1))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 8))
-optimizer_offload_fraction=1
-
 # Megatron Configuration
-train_tp=4
-train_ep=4
+train_tp=1
+train_ep=32
 train_etp=1
-train_pp=2
-train_cp=1
+train_pp=1
+train_cp=4
 
 # vLLM Configuration
-gen_tp=2
+gen_tp=4
 gen_dp=1
 gen_ep=1
-gpu_memory_utilization=0.6
+gpu_memory_utilization=0.5
 max_model_len=$((max_prompt_length + max_response_length))
 max_num_batched_tokens=$(((max_prompt_length + max_response_length) * 1))
 
+
+# Performance and Memory Management Configuration
+all_offload=True
+use_dynamic_bsz=True
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / train_cp))
+infer_ppo_max_token_len=${actor_ppo_max_token_len}
+optimizer_offload_fraction=1
 
 
 # Data Configuration
@@ -117,7 +143,7 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rotary_pos_emb=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.position_embedding_type=rope
-    +actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel=False
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type="alltoall"
     +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True
@@ -127,23 +153,19 @@ ACTOR_CONFIG=(
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.tensor_model_parallel_size=${train_tp}
     actor_rollout_ref.actor.megatron.use_mbridge=True
-    actor_rollout_ref.actor.megatron.vanilla_mbridge=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.hccl_op_mode=\"tp:6,pp:2,tp_dp:2,cp:2,ep:6,tp_ep_mp:2,dp:2,tp_cp:2,dp_cp:2,default_group:2\"
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
-    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=True
+    actor_rollout_ref.actor.entropy_from_logits_chunk_size=2048
     +actor_rollout_ref.actor.megatron.override_transformer_config.transformer_impl=transformer_engine
-    # Low-precision parameters
-    +actor_rollout_ref.actor.megatron.override_transformer_config.fp8=e4m3
-    +actor_rollout_ref.actor.megatron.override_transformer_config.fp8_format=e4m3
-    +actor_rollout_ref.actor.megatron.override_transformer_config.fp8_recipe=mxfp8
-    +actor_rollout_ref.actor.megatron.override_transformer_config.fp8_reuse_quantized_weight=True
 )
 
 # Reference Model Configuration
 REF_CONFIG=(
     actor_rollout_ref.ref.use_torch_compile=False
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz}
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len}
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp}
@@ -154,6 +176,8 @@ REF_CONFIG=(
     actor_rollout_ref.ref.megatron.param_offload=${all_offload}
     actor_rollout_ref.ref.megatron.dist_checkpointing_path=${MCORE_MODEL_PATH}
     actor_rollout_ref.ref.megatron.use_dist_checkpointing=False
+    actor_rollout_ref.ref.entropy_from_logits_with_chunking=True
+    actor_rollout_ref.ref.entropy_from_logits_chunk_size=2048
 )
 
 # Rollout Configuration
@@ -182,12 +206,21 @@ ROLLOUT_CONFIG=(
     actor_rollout_ref.rollout.val_kwargs.top_k=-1
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY"
-    actor_rollout_ref.rollout.ignore_eos=True
     ++actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.enable_cpu_binding=True
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode=0
     ++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=True
-    # Low-precision parameters
-    actor_rollout_ref.rollout.quantization=ascend
+    actor_rollout_ref.rollout.ignore_eos=${IGNORE_EOS}
 )
+
+if [ "${ENABLE_MXFP8}" = "True" ]; then
+    ACTOR_CONFIG+=(
+        +actor_rollout_ref.actor.megatron.override_transformer_config.fp8=e4m3
+        +actor_rollout_ref.actor.megatron.override_transformer_config.fp8_recipe=mxfp8
+    )
+    ROLLOUT_CONFIG+=(
+        ++actor_rollout_ref.rollout.engine_kwargs.vllm.quantization=ascend
+    )
+fi
 
 # Trainer Configuration
 TRAINER_CONFIG=(
@@ -215,4 +248,4 @@ python3 -m verl.trainer.main_ppo \
     "${REF_CONFIG[@]}" \
     "${ROLLOUT_CONFIG[@]}" \
     "${ALGORITHM_CONFIG[@]}" \
-    "${TRAINER_CONFIG[@]}" | tee train.log
+    "${TRAINER_CONFIG[@]}" 2>&1 | tee train.log

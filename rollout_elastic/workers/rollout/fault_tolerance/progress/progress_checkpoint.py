@@ -77,8 +77,6 @@ class VLLMProgressCheckPoint:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     schema_version: int = 1
-    min_global_steps: Optional[int] = None
-    max_global_steps: Optional[int] = None
 
     # ------------------------------------------------------------------ store
     def attach_store(self, store: Any) -> None:
@@ -86,7 +84,7 @@ class VLLMProgressCheckPoint:
         self._store_ref = store
 
     # ------------------------------------------------------------------ ingest
-    def ingest(self, request_output: Any, global_steps: Optional[int] = None) -> None:
+    def ingest(self, request_output: Any) -> None:
         """Consume a vLLM ``RequestOutput`` from the streaming loop.
 
         vLLM emits cumulative ``token_ids`` per output chunk, so we replace
@@ -104,11 +102,6 @@ class VLLMProgressCheckPoint:
         # vLLM shouldn't shrink token_ids, but be defensive.
         if new_count <= 0:
             return
-
-        if global_steps is not None:
-            self.model_weight_version = str(global_steps)
-            self.min_global_steps = min(v for v in (self.min_global_steps, global_steps) if v is not None)
-            self.max_global_steps = max(v for v in (self.max_global_steps, global_steps) if v is not None)
 
         self.cumulative_token_ids = inherited + all_ids
 
@@ -223,8 +216,6 @@ class VLLMProgressCheckPoint:
             created_at=self.created_at,
             updated_at=self.updated_at,
             schema_version=self.schema_version,
-            min_global_steps=self.min_global_steps,
-            max_global_steps=self.max_global_steps,
         )
 
     @classmethod
@@ -259,8 +250,6 @@ class VLLMProgressCheckPoint:
             created_at=payload.created_at,
             updated_at=payload.updated_at,
             schema_version=payload.schema_version,
-            min_global_steps=getattr(payload, "min_global_steps", None),
-            max_global_steps=getattr(payload, "max_global_steps", None),
         )
 
     def validate_integrity(self) -> None:
@@ -319,8 +308,6 @@ class VLLMProgressCheckPoint:
                 model_weight_version=model_weight_version,
                 inherited_prefix_len=len(payload.cumulative_token_ids),
                 base_attempt_id=payload.attempt_id,
-                min_global_steps=getattr(payload, "min_global_steps", None),
-                max_global_steps=getattr(payload, "max_global_steps", None),
                 cumulative_token_ids=list(payload.cumulative_token_ids),
                 cumulative_log_probs=list(payload.cumulative_log_probs)
                 if payload.cumulative_log_probs is not None

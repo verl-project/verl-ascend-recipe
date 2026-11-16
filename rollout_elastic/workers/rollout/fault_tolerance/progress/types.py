@@ -66,8 +66,6 @@ class CheckPointPayLoad:
     created_at: float
     updated_at: float
     schema_version: int = 1
-    min_global_steps: Optional[int] = None
-    max_global_steps: Optional[int] = None
 
 
 @dataclass
