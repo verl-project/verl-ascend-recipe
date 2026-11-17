@@ -1,0 +1,26 @@
+From eb6d6b07b91912e3558ce97b40e7fde0f324a21c Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:33 +0000
+Subject: [PATCH] feat: forward the rollout task queue setting
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: taskqueue
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/workers/rollout/vllm_rollout/vllm_async_server.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 19581c9f003eadb878bdb40f4c2efdb3be0a84cc..f2bda258da90903bce1c4742967de4b275ad82db 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -1199,6 +1199,7 @@ class vLLMReplica(RolloutReplica):
+             env_vars = {
+                 **{var: "1" for var in get_platform().ray_noset_envvars()},
+                 **get_platform().rollout_env_vars(),
++                "TASK_QUEUE_ENABLE": os.environ.get("VLLM_ASCEND_TASK_QUEUE_ENABLE", "0"),
+             }
+ 
+             server = self.server_class.options(

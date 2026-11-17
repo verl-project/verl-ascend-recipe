@@ -1,0 +1,88 @@
+From 0780fdbb0accb83790f8ece78e392a184b1ccf2d Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:36 +0000
+Subject: [PATCH] fix: stop and flush rollout profiling before sleep
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: profiling
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/trainer/ppo/v1/trainer_base.py | 40 ++++++++++++++++++++++-------
+ 1 file changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 85219fdafea070fd79b59bf14641a3fdf7062119..097ac5b8c884ebe0c62ddff5e6e520d7e9d26357 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -141,6 +141,7 @@ class PPOTrainer(ABC):
+         )
+         # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
+         self.local_trigger_step = 0
++        self._rollout_profiler_active = False
+ 
+     def _build_replay_buffer(self) -> ReplayBuffer:
+         """Instantiate the replay buffer (or a user-provided custom sampler).
+@@ -464,7 +465,10 @@ class PPOTrainer(ABC):
+                     self.on_step_begin()
+ 
+                     self._start_profiling()
+-                    batch = self.step(metrics, self.timing_raw)
++                    try:
++                        batch = self.step(metrics, self.timing_raw)
++                    finally:
++                        self._stop_profiling()
+ 
+                     # 2. save checkpoint
+                     if self.config.trainer.save_freq > 0 and (
+@@ -551,14 +555,18 @@ class PPOTrainer(ABC):
+         """Run a single local update: sample one mini-batch and perform the full PPO pipeline once."""
+         # 1. sample batch from replay buffer
+         with marked_timer("gen", timing_raw, color="red"):
+-            self.on_sample_begin()
+-            batch, off_policy_metrics = self.replay_buffer.sample(
+-                global_steps=self.global_steps,
+-                partition_id="train",
+-                batch_size=sample_batch_size,
+-            )
+-            metrics.update(off_policy_metrics)
+-            batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
++            try:
++                self.on_sample_begin()
++                batch, off_policy_metrics = self.replay_buffer.sample(
++                    global_steps=self.global_steps,
++                    partition_id="train",
++                    batch_size=sample_batch_size,
++                )
++                metrics.update(off_policy_metrics)
++                batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
++            finally:
++                # Flush rollout traces before on_sample_end sleeps the replicas.
++                self._stop_rollout_profiling()
+             self.on_sample_end()
+ 
+         # 2. [OPTIONAL] compute reward score with colocated reward model
+@@ -1440,8 +1448,22 @@ class PPOTrainer(ABC):
+             if self.use_critic:
+                 self.critic_wg.start_profile(profile_step=self.global_steps)
+ 
++        # Rollout profiling is discrete even when training profiles consecutive steps.
++        # Start before step() dispatches requests, not in on_sample_begin(). The server
++        # applies its own enable/rank/discrete gates; AsyncLLM accepts no role/step kwargs.
++        if self.curr_step_profile:
++            self.llm_server_manager.start_profile()
++            self._rollout_profiler_active = True
++
++    def _stop_rollout_profiling(self) -> None:
++        if self._rollout_profiler_active:
++            self.llm_server_manager.stop_profile()
++            self._rollout_profiler_active = False
++
+     def _stop_profiling(self) -> None:
+         """Stop profiling for all worker groups if profiling is enabled."""
++        # Also clean up if request submission failed before sampling began.
++        self._stop_rollout_profiling()
+         self.next_step_profile = (
+             self.global_steps + 1 in self.config.global_profiler.steps
+             if self.config.global_profiler.steps is not None

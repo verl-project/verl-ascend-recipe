@@ -1,0 +1,43 @@
+From 5c0f744d9c6e774398c17ca3ce350f75dfeb6948 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 08:45:54 +0000
+Subject: [PATCH] Load FP8 checkpoint tensors on the current CUDA device
+
+Use cuda:<current_device> consistently for weight files and scale tensors stored in other files.
+
+Source-base: 0cd4ae23f2425da77a80cb3f517828452fa8e984
+Source-state: uncommitted worktree
+---
+ mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py b/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
+index 5012942c82914384d02cb9e8c4d7c40dd8ebd600..1e9606b7192149e29bdd5f01c027499f87492544 100644
+--- a/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
++++ b/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
+@@ -18,6 +18,7 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
+         super().__init__(hf_dir)
+ 
+     def load_some_hf_weight(self, hf_weight_names: list[str]) -> dict:
++        device = f"cuda:{torch.cuda.current_device()}"
+         # set default dtype to bfloat16
+         torch.set_default_dtype(torch.bfloat16)
+         weight_to_file_map = self.index
+@@ -31,7 +32,7 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
+             file_to_weight_map[filename].append(name)
+         for filename, weight_names in file_to_weight_map.items():
+             safetensor_file = os.path.join(hf_dir, filename)
+-            with safe_open(safetensor_file, framework="pt", device="cuda") as f:
++            with safe_open(safetensor_file, framework="pt", device=device) as f:
+                 for name in weight_names:
+                     weight = f.get_tensor(name)
+                     scale_inv_name = f"{name}_scale_inv"
+@@ -48,7 +49,7 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
+                                         hf_dir, weight_to_file_map[scale_inv_name]
+                                     ),
+                                     framework="pt",
+-                                    device="cuda",
++                                    device=device,
+                                 ) as f2:
+                                     scale_inv = f2.get_tensor(scale_inv_name)
+                             ret[name] = weight_dequant(weight, scale_inv)

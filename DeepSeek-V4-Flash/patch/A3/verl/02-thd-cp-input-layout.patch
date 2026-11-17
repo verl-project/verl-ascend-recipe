@@ -1,0 +1,128 @@
+From 859137b28560ad24a17d8080419050f59ede6bd2 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:32 +0000
+Subject: [PATCH] fix: align THD input IDs and context-parallel layout
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: thd
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/models/mcore/model_forward.py            |  5 ++++-
+ verl/models/mcore/model_forward_fused.py      |  6 ++++--
+ verl/models/mcore/util.py                     |  9 +++++----
+ .../engine/megatron/transformer_impl.py       | 19 ++++++++++++++++---
+ 4 files changed, 29 insertions(+), 10 deletions(-)
+
+diff --git a/verl/models/mcore/model_forward.py b/verl/models/mcore/model_forward.py
+index 6d2a6b291fd0171d308abfae38488eb648abce72..87dc616c90721b5da9fbe7f6aa1cbe212963f899 100644
+--- a/verl/models/mcore/model_forward.py
++++ b/verl/models/mcore/model_forward.py
+@@ -302,7 +302,10 @@ def gptmodel_forward_model_engine(
+     if data_format == "thd":
+         input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
+             input_ids,
+-            pre_process=pre_process or (post_process and mtp_enable_train),
++            # Hash-based MoE routers consume token IDs on every pipeline stage.
++            # Keep them aligned with the packed hidden states even on stages
++            # that do not run the embedding pre-process.
++            pre_process=True,
+             use_fp8_padding=use_fp8_padding,
+             local_cp_size=local_cp_size,
+             pad_to_length_bucket=pad_to_length_bucket,
+diff --git a/verl/models/mcore/model_forward_fused.py b/verl/models/mcore/model_forward_fused.py
+index baf61cedca24c3362d629428d8f3c7f567aafc73..d99d15ef74ffe42cf16c46e97e81b1f51cb3f1de 100644
+--- a/verl/models/mcore/model_forward_fused.py
++++ b/verl/models/mcore/model_forward_fused.py
+@@ -270,7 +270,6 @@ def fused_forward_model_engine(vision_model: bool = False):
+         router_padding_mask: Tensor | None = None,
+         pad_to_length_bucket: int | None = None,
+     ):
+-        pre_process = unwrap_model(model).pre_process
+         post_process = unwrap_model(model).post_process
+ 
+         fp8 = unwrap_model(model).config.fp8
+@@ -282,7 +281,10 @@ def fused_forward_model_engine(vision_model: bool = False):
+ 
+         input_ids_rmpad, packed_seq_params, _ = preprocess_thd_engine(
+             input_ids,
+-            pre_process=pre_process,
++            # Hash-based MoE routers consume token IDs on every pipeline stage.
++            # Keep them aligned with the packed hidden states even on stages
++            # that do not run the embedding pre-process.
++            pre_process=True,
+             use_fp8_padding=use_fp8_padding,
+             min_local_rows=min_local_rows,
+             pad_to_length_bucket=pad_to_length_bucket,
+diff --git a/verl/models/mcore/util.py b/verl/models/mcore/util.py
+index 6a5541e74d2128f9ce129017a6730e7d4e79a7c8..c62e34b4579cf1d15c64cafd15610ff602445ebe 100644
+--- a/verl/models/mcore/util.py
++++ b/verl/models/mcore/util.py
+@@ -357,6 +357,7 @@ def preprocess_thd_engine(
+ 
+     tp_size = mpu.get_tensor_model_parallel_world_size()
+     extra_packed_args = {}
++    legacy_cp_partition_mode = None
+     if local_cp_size is not None:
+         # dynamic CP
+         cp_size = local_cp_size
+@@ -543,10 +544,8 @@ def preprocess_thd_engine(
+         # raises "DSv4 THD CP requires a contiguous CP partition." on every forward.
+         extra_packed_args["cp_partition_mode"] = cp_layout
+     elif cp_layout != "zigzag" and cp_size > 1:
+-        raise ValueError(
+-            f"cp_layout='{cp_layout}' requires PackedSeqParams.cp_partition_mode, which this "
+-            "Megatron-core version does not provide. Upgrade Megatron-core or use the zigzag layout."
+-        )
++        legacy_cp_partition_mode = cp_layout
++
+ 
+     packed_seq_params = PackedSeqParams(
+         qkv_format="thd",
+@@ -558,6 +557,8 @@ def preprocess_thd_engine(
+         cu_seqlens_kv_padded=cu_seqlens_padded,
+         **extra_packed_args,
+     )
++    if legacy_cp_partition_mode is not None:
++        packed_seq_params.cp_partition_mode = legacy_cp_partition_mode
+     if pre_process:
+         return input_ids_rmpad.unsqueeze(0), packed_seq_params, position_ids_rmpad.unsqueeze(0)
+     else:
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index e8a6c560696868d051589d3fa185978683f6fd57..8367580af2ce08fd5f87bbbd13ff7827ee7b9224 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -171,7 +171,17 @@ class MegatronEngine(BaseEngine):
+ 
+     @staticmethod
+     def _get_context_parallel_layout(unwrapped_model) -> str:
+-        if getattr(unwrapped_model.config, "experimental_attention_variant", None) == "dsv4_hybrid":
++        config = unwrapped_model.config
++        if (
++            getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid"
++            or getattr(config, "position_embedding_type", None) == "deepseek4"
++        ):
++            # DeepSeek4 CSA's TND kv-allgather path computes RoPE/prefix-KV
++            # offsets from one full TP-gathered sequence block per CP rank and
++            # therefore requires one contiguous global interval per CP rank.
++            # The generic zigzag THD partition gives each rank two disjoint
++            # intervals and silently changes actor logits relative to the
++            # BSHD/vLLM path.
+             return "contiguous"
+         return "zigzag"
+ 
+@@ -310,8 +320,11 @@ class MegatronEngine(BaseEngine):
+                     "max_seqlen_per_dp_cp_rank": self.engine_config.max_seqlen_per_dp_cp_rank,
+                 }
+             )
+-        if getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v4" and (
+-            self.engine_config.context_parallel_size > 1 or self.engine_config.dynamic_context_parallel
++        if (
++            get_device_name() != "npu"
++            and not getattr(self.engine_config, "strategy", "").startswith("mindspeed_")
++            and getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v4"
++            and (self.engine_config.context_parallel_size > 1 or self.engine_config.dynamic_context_parallel)
+         ):
+             override_transformer_config.update(
+                 {

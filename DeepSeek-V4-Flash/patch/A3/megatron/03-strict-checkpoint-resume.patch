@@ -1,0 +1,1089 @@
+diff --git a/megatron/core/dist_checkpointing/strategies/cached_metadata_filesystem_reader.py b/megatron/core/dist_checkpointing/strategies/cached_metadata_filesystem_reader.py
+index f8cb0326e26fcb14aafbd384d745e164c3c012b2..7df477028c2cf17e41ce7c066d7b5b2935dfefea 100644
+--- a/megatron/core/dist_checkpointing/strategies/cached_metadata_filesystem_reader.py
++++ b/megatron/core/dist_checkpointing/strategies/cached_metadata_filesystem_reader.py
+@@ -7,6 +7,73 @@ from typing import Union
+ 
+ from torch.distributed.checkpoint import FileSystemReader, Metadata
+ 
++_PAGE_BYTES = 4096
++
++
++def _read_fadvise_chunk_bytes():
++    """Bytes of an already-consumed prefix to drop per posix_fadvise call.
++
++    dsv4-ckpt-24: default 512MiB. Set MEGATRON_CKPT_READ_FADVISE_CHUNK_BYTES=0
++    to keep upstream FileSystemReader.read_data unchanged.
++    """
++    return int(os.environ.get("MEGATRON_CKPT_READ_FADVISE_CHUNK_BYTES", "536870912"))
++
++
++class _PrefixPageCacheReleaser:
++    """Drop clean page-cache pages that checkpoint loading has finished reading.
++
++    ``posix_fadvise(DONTNEED)`` is applied only to ``[released, until)`` after
++    that prefix is no longer referenced by a later read item. The length is the
++    byte count, not an end offset. A partial trailing page is left in place so
++    the next tensor, which may share that page, is not evicted.
++
++    This does not advise the whole file (``len=0``). Doing so also drops
++    readahead of the next tensor. ``POSIX_FADV_SEQUENTIAL`` / ``NOREUSE`` are
++    not set: the former widens readahead, and Linux ignores the latter.
++    """
++
++    def __init__(self, stream, chunk, path):
++        self._fd = stream.fileno()
++        self._chunk = chunk
++        self._path = path
++        self._released = 0
++        self._advises = 0
++        self._bytes = 0
++        self._failed = False
++        self._announced = False
++
++    def release_until(self, until):
++        if self._failed or self._chunk <= 0:
++            return
++        until_aligned = until - (until % _PAGE_BYTES)
++        pos = self._released
++        if until_aligned <= pos:
++            return
++        try:
++            while pos < until_aligned:
++                step = min(self._chunk, until_aligned - pos)
++                os.posix_fadvise(self._fd, pos, step, os.POSIX_FADV_DONTNEED)
++                pos += step
++                self._advises += 1
++                self._bytes += step
++        except OSError as exc:
++            self._failed = True
++            print(f"[CKPT-READ] fadvise failed: {exc}", flush=True)
++            return
++        self._released = pos
++        if not self._announced:
++            self._announced = True
++            print(
++                f"[CKPT-READ] streaming fadvise on, chunk={self._chunk} file={self._path}",
++                flush=True,
++            )
++
++    def close_log(self):
++        print(
++            f"[CKPT-READ] close advises={self._advises} released={self._bytes} file={self._path}",
++            flush=True,
++        )
++
+ 
+ class CachedMetadataFileSystemReader(FileSystemReader):
+     """
+@@ -36,3 +103,115 @@ class CachedMetadataFileSystemReader(FileSystemReader):
+         if self._cached_metadata is None:
+             self._cached_metadata = super().read_metadata()
+         return self._cached_metadata
++
++    def read_data(self, plan, planner):
++        """Load each ``.distcp`` item, then drop the page-cache prefix behind it.
++
++        Upstream reads a rank file from the first tensor through the last and
++        leaves every clean page in the memcg. Items in one file are sorted by
++        storage offset so the finished prefix is exactly the bytes no remaining
++        item starts before.
++
++        A single ``torch.load`` still brings that tensor's pages in. They are
++        released after ``copy_`` into the target, not during the load. Zip
++        readers seek to the end of the slice before the payload; advising inside
++        that call would drop bytes the same load still has to read. Splitting
++        one ``read()`` into an extra userspace buffer would also double the anon
++        copy of that tensor, which the cgroup counts the same way it counts
++        file cache.
++        """
++        chunk = _read_fadvise_chunk_bytes()
++        if (
++            chunk <= 0
++            or not hasattr(os, "posix_fadvise")
++            or not hasattr(self, "_slice_file")
++        ):
++            return super().read_data(plan, planner)
++
++        import io
++
++        import torch
++        from torch.distributed._shard._utils import narrow_tensor_by_index
++        from torch.distributed.checkpoint.planner import LoadItemType
++        from torch.futures import Future
++
++        per_file = {}
++        for read_item in plan.items:
++            item_md = self.storage_data[read_item.storage_index]
++            per_file.setdefault(item_md.relative_path, []).append(read_item)
++
++        for relative_path, reqs in per_file.items():
++            reqs.sort(key=lambda item: self.storage_data[item.storage_index].offset)
++            new_path = self.fs.concat_path(self.path, relative_path)
++            with self.fs.create_stream(new_path, "rb") as stream:
++                try:
++                    releaser = _PrefixPageCacheReleaser(stream, chunk, new_path)
++                except (AttributeError, OSError) as exc:
++                    print(f"[CKPT-READ] fadvise unavailable: {exc}", flush=True)
++                    releaser = None
++                try:
++                    done_end = 0
++                    for index, req in enumerate(reqs):
++                        item_md = self.storage_data[req.storage_index]
++                        self._load_read_item(
++                            stream,
++                            req,
++                            item_md,
++                            planner,
++                            io,
++                            torch,
++                            LoadItemType,
++                            narrow_tensor_by_index,
++                        )
++                        done_end = max(done_end, item_md.offset + item_md.length)
++                        if releaser is None:
++                            continue
++                        # Remaining items are sorted by offset, so the next
++                        # start is the first byte any of them can still need.
++                        # The last item releases the max end, which also covers
++                        # an earlier tensor that extended past a small overlap.
++                        if index + 1 < len(reqs):
++                            horizon = self.storage_data[reqs[index + 1].storage_index].offset
++                        else:
++                            horizon = done_end
++                        releaser.release_until(horizon)
++                finally:
++                    if releaser is not None:
++                        releaser.close_log()
++
++        fut = Future()
++        fut.set_result(None)
++        return fut
++
++    def _load_read_item(
++        self, stream, req, item_md, planner, io, torch, load_item_type, narrow_tensor_by_index
++    ):
++        file_slice = self._slice_file(stream, item_md)
++        transform_from = file_slice
++        transforms = getattr(self, "transforms", None)
++        if transforms is not None and hasattr(transforms, "transform_load_stream"):
++            descriptors = getattr(item_md, "transform_descriptors", None) or ()
++            transform_from = transforms.transform_load_stream(req, descriptors, file_slice)
++
++        if req.type == load_item_type.BYTE_IO:
++            read_bytes = io.BytesIO(transform_from.read(-1))
++            read_bytes.seek(0)
++            planner.load_bytes(req, read_bytes)
++            return
++
++        if transform_from.seekable():
++            seekable = transform_from
++        else:
++            seekable = io.BytesIO(transform_from.read(-1))
++            seekable.seek(0)
++
++        tensor = torch.load(seekable, map_location="cpu", weights_only=True)
++        tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
++        target_tensor = planner.resolve_tensor(req).detach()
++        if target_tensor.size() != tensor.size():
++            raise AssertionError(
++                f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
++            )
++        target_tensor.copy_(tensor)
++        planner.commit_tensor(req, target_tensor)
++        del tensor
+diff --git a/megatron/core/dist_checkpointing/strategies/filesystem_async.py b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+index 2af90a65b8c4bb9ed33b117a95c30286a479670c..83b69c0e969df3296cf37f2d2c3cea8b4c455026 100644
+--- a/megatron/core/dist_checkpointing/strategies/filesystem_async.py
++++ b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+@@ -2,11 +2,13 @@
+ 
+ """ Storage writer for PyT Distributed format allowing asynchronous save. """
+ import dataclasses
++import inspect
+ import logging
+ import os
+ import queue
++import socket
+ from functools import partial
+-from heapq import heappop, heappush
++from heapq import heappop, heappush, heapreplace
+ from itertools import chain
+ from operator import itemgetter
+ from pathlib import Path
+@@ -24,10 +26,486 @@ from torch.futures import Future
+ 
+ from .async_utils import _disable_gc
+ 
++try:
++    from torch.distributed.checkpoint.filesystem import SerializationFormat
++except ImportError:
++    SerializationFormat = None
++
++# torch>=2.10 的 _write_item 在参数末尾新增了必填的 serialization_format，
++# 同时 FileSystemWriter 已带 transforms 属性，调用方必须显式补上该参数。
++_WRITE_ITEM_EXTRA_ARGS = ()
++if SerializationFormat is not None and 'serialization_format' in inspect.signature(_write_item).parameters:
++    _TORCH_SAVE_FORMAT = getattr(SerializationFormat, 'TORCH_SAVE', None)
++    if _TORCH_SAVE_FORMAT is not None:
++        _WRITE_ITEM_EXTRA_ARGS = (_TORCH_SAVE_FORMAT,)
++
+ logger = logging.getLogger(__name__)
+ 
+ WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
+ 
++# 流式刷盘开关：每累计写入指定字节数就 fdatasync + fadvise(DONTNEED)。默认 512MiB，设 0 关闭。
++# dsv4-ckpt-17: 分段必须发生在数据进入 page cache 之前。整段 write() 返回后才
++# fadvise 时，一次几百 GiB 的 tensor 会在返回前把 cgroup 顶满。
++# dsv4-ckpt-23: 未设置环境变量时用 512MiB，想改再覆盖。
++_CKPT_FSYNC_CHUNK_BYTES = int(os.environ.get("MEGATRON_CKPT_FSYNC_CHUNK_BYTES", "536870912"))
++
++
++class _ChunkedSyncWriter:
++    """按写入量分段刷盘的文件包装器。
++
++    调用方一次 write() 可能带上整个 tensor。先把 buffer 切成 chunk，每段
++    flush + fdatasync + fadvise(DONTNEED) 之后再写下一段。关闭时把尾段也丢掉。
++    """
++
++    def __init__(self, raw):
++        self._raw = raw
++        self._flushed_offset = 0
++        self._sync_count = 0
++        self._write_path = 'byte-view'
++        self._announced_path = None
++
++    def _sync(self, force):
++        self._raw.flush()
++        fd = self._raw.fileno()
++        # 字节是 os.write 进去的，偏移以 lseek 为准，不读 FileIO 自己记的 tell()。
++        pos = os.lseek(fd, 0, os.SEEK_CUR)
++        pending = pos - self._flushed_offset
++        if pending <= 0:
++            return
++        if not force and pending < _CKPT_FSYNC_CHUNK_BYTES:
++            return
++        os.fdatasync(fd)
++        # dsv4-ckpt-21: 探测里对刚写完的 512MiB 调用 fadvise，resident 从 0.50GiB
++        # 掉到 0，随后再写不会把前面的页带回来。训练时整份文件留在 cache，是这段
++        # 调用没有打到那些页上。这里按刚写完的区间 advise，再用 len=0 覆盖到 EOF。
++        start = self._flushed_offset - (self._flushed_offset % 4096)
++        try:
++            os.posix_fadvise(fd, start, max(pos - start, 0), os.POSIX_FADV_DONTNEED)
++            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++        except OSError as exc:
++            if self._sync_count == 0:
++                print(f"[CKPT-SYNC] fadvise failed: {exc}", flush=True)
++        self._flushed_offset = pos
++        self._sync_count += 1
++        if self._announced_path != self._write_path:
++            self._announced_path = self._write_path
++            print(
++                f"[CKPT-SYNC] streaming fsync on, chunk={_CKPT_FSYNC_CHUNK_BYTES} "
++                f"mode=inside-write path={self._write_path} file={getattr(self._raw, 'name', '?')}",
++                flush=True,
++            )
++
++    def _write_all(self, blob):
++        # dsv4-ckpt-21: 用 os.write，和探测脚本同一条系统调用。
++        mv = memoryview(blob)
++        try:
++            fd = self._raw.fileno()
++            wrote = 0
++            while wrote < len(mv):
++                n = os.write(fd, mv[wrote:])
++                if n is None:
++                    n = len(mv) - wrote
++                if n <= 0:
++                    raise OSError('short write while saving checkpoint')
++                wrote += n
++            return wrote
++        finally:
++            mv.release()
++
++    def _write_contiguous(self, view):
++        total = 0
++        try:
++            length = len(view)
++            while total < length:
++                step = min(_CKPT_FSYNC_CHUNK_BYTES, length - total)
++                self._write_all(view[total:total + step])
++                total += step
++                self._sync(force=False)
++            return total
++        finally:
++            view.release()
++
++    def _write_copied(self, view):
++        # dsv4-ckpt-20: 不能 cast 成一维 byte view 时，按 chunk 拷贝再写。
++        # 禁止把整个对象交给一次 _raw.write()。
++        self._write_path = 'chunk-copy'
++        itemsize = view.itemsize or 1
++        try:
++            if view.ndim != 1:
++                nrows = len(view)
++                row_bytes = view.nbytes // nrows if nrows else view.nbytes
++                if row_bytes > _CKPT_FSYNC_CHUNK_BYTES:
++                    total = 0
++                    for i in range(nrows):
++                        row = view[i:i + 1]
++                        try:
++                            flat = row.cast('B')
++                        except (TypeError, ValueError):
++                            row.release()
++                            raise TypeError(
++                                'checkpoint write cannot be chunked: non-contiguous row'
++                            )
++                        try:
++                            total += self._write_contiguous(flat)
++                        finally:
++                            row.release()
++                    return total
++                rows = max(1, _CKPT_FSYNC_CHUNK_BYTES // max(row_bytes, 1))
++                total = 0
++                for start in range(0, nrows, rows):
++                    blob = view[start:start + rows].tobytes()
++                    self._write_all(blob)
++                    total += len(blob)
++                    self._sync(force=False)
++                return total
++            elems = max(1, _CKPT_FSYNC_CHUNK_BYTES // itemsize)
++            total = 0
++            n = len(view)
++            for start in range(0, n, elems):
++                blob = view[start:start + elems].tobytes()
++                self._write_all(blob)
++                total += len(blob)
++                self._sync(force=False)
++            return total
++        finally:
++            view.release()
++
++    def _write_torch(self, data):
++        storage_fn = getattr(data, 'untyped_storage', None)
++        nbytes = getattr(data, 'nbytes', None)
++        if not callable(storage_fn) or not isinstance(nbytes, int):
++            raise TypeError('checkpoint write cannot be chunked: %r' % (type(data),))
++        self._write_path = 'tensor'
++        es = data.element_size()
++        raw = memoryview(storage_fn())
++        try:
++            if data.is_contiguous():
++                start = data.storage_offset() * es
++                return self._write_contiguous(raw[start:start + nbytes])
++            elems = max(1, _CKPT_FSYNC_CHUNK_BYTES // max(es, 1))
++            flat = data.detach().reshape(-1)
++            total = 0
++            for start in range(0, flat.numel(), elems):
++                piece = flat[start:start + elems].contiguous()
++                piece_raw = memoryview(piece.untyped_storage())
++                try:
++                    self._write_all(piece_raw[:piece.nbytes])
++                    total += piece.nbytes
++                finally:
++                    piece_raw.release()
++                self._sync(force=False)
++            return total
++        finally:
++            raw.release()
++
++    def write(self, data):
++        # dsv4-ckpt-17: 分段必须发生在数据进入 page cache 之前。
++        # dsv4-ckpt-20: cast 失败时按 chunk 拷贝，禁止整段 _raw.write(data)。
++        if _CKPT_FSYNC_CHUNK_BYTES <= 0:
++            return self._raw.write(data)
++        self._write_path = 'byte-view'
++        try:
++            view = memoryview(data)
++        except TypeError:
++            return self._write_torch(data)
++        if view.format == 'B' and view.ndim == 1 and view.c_contiguous:
++            return self._write_contiguous(view)
++        try:
++            flat = view.cast('B')
++        except (TypeError, ValueError):
++            return self._write_copied(view)
++        try:
++            return self._write_contiguous(flat)
++        finally:
++            view.release()
++
++    def close(self):
++        try:
++            self._sync(force=True)
++            if self._sync_count:
++                print(
++                    f"[CKPT-SYNC] close syncs={self._sync_count} "
++                    f"pos={self._flushed_offset} path={self._write_path} "
++                    f"file={getattr(self._raw, 'name', '?')}",
++                    flush=True,
++                )
++        finally:
++            self._raw.close()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.close()
++        return False
++
++    def __getattr__(self, name):
++        return getattr(self._raw, name)
++
++
++# dsv4-ckpt-25: read-only counters for the save-plan allocation. Nothing here
++# changes which tensors are cloned or made contiguous.
++_CKPT_PLAN_DIR = ""
++_CKPT_PLAN_ACTIVE = False
++_CKPT_PLAN = None
++_CKPT_PLAN_HOST = socket.gethostname()
++# dsv4-ckpt-27: True keeps the plan-stage clone of every CPU view. The sync
++# in-process writer turns this off and copies one shard at write time instead.
++_CKPT_CLONE_CPU_VIEWS = True
++
++
++def set_ckpt_clone_cpu_views(enabled: bool) -> None:
++    """dsv4-ckpt-27: False skips the plan-stage clone of CPU storage views."""
++    global _CKPT_CLONE_CPU_VIEWS
++    _CKPT_CLONE_CPU_VIEWS = bool(enabled)
++
++
++def _ckpt_clone_cpu_views() -> bool:
++    override = os.environ.get("MEGATRON_CKPT_CLONE_CPU_VIEWS")
++    if override is not None:
++        return override.lower() not in ("0", "false", "no")
++    return _CKPT_CLONE_CPU_VIEWS
++
++
++class _CkptPlanProbe:
++    def __init__(self):
++        self.contig_calls = 0
++        self.contig_copied = 0
++        self.contig_bytes = 0
++        self.contig_top = []
++        self.clone_n = 0
++        self.cloned_n = 0
++        self.cloned_bytes = 0
++        self.view_n = 0
++        self.view_bytes = 0
++        self.device_n = 0
++        self.device_bytes = 0
++        self.passthrough_n = 0
++        self.passthrough_bytes = 0
++        self.noncontig_passthrough_n = 0
++        self.clone_top = []
++        self.view_storage_bytes = {}
++        self.failed = None
++
++    def reset(self):
++        self.__init__()
++
++
++def _ckpt_plan_probe():
++    global _CKPT_PLAN
++    if _CKPT_PLAN is None:
++        _CKPT_PLAN = _CkptPlanProbe()
++    return _CKPT_PLAN
++
++
++def _ckpt_plan_rank():
++    if torch.distributed.is_available() and torch.distributed.is_initialized():
++        return torch.distributed.get_rank()
++    return -1
++
++
++def _ckpt_plan_gib(nbytes):
++    return nbytes / (1024.0 ** 3)
++
++
++def _ckpt_plan_top(heap, nbytes, name):
++    name = str(name)
++    if len(heap) < 5:
++        heappush(heap, (int(nbytes), name))
++    elif nbytes > heap[0][0]:
++        heapreplace(heap, (int(nbytes), name))
++
++
++def _ckpt_plan_path_tag():
++    parts = [part for part in _CKPT_PLAN_DIR.rstrip("/").split("/") if part]
++    return "/".join(parts[-2:]) if parts else ""
++
++
++def _ckpt_plan_print(message):
++    print(
++        f"[CKPT-PLAN] host={_CKPT_PLAN_HOST} rank={_ckpt_plan_rank()} "
++        f"path={_ckpt_plan_path_tag()} {message}",
++        flush=True,
++    )
++
++
++def _account_tensors(state_dict):
++    """Logical nbytes and unique storage nbytes reachable from a state dict.
++
++    dsv4-ckpt-25: walks existing objects only. Does not clone or copy.
++    """
++    logical = 0
++    unique = {}
++    count = 0
++
++    def visit(tensor):
++        nonlocal logical, count
++        count += 1
++        logical += tensor.numel() * tensor.itemsize
++        try:
++            storage = tensor.untyped_storage()
++            unique[storage.data_ptr()] = storage.size()
++        except Exception:
++            pass
++
++    def walk(obj):
++        if isinstance(obj, torch.Tensor):
++            visit(obj)
++            return
++        if isinstance(obj, dict):
++            for value in obj.values():
++                walk(value)
++            return
++        if isinstance(obj, (list, tuple)):
++            for value in obj:
++                walk(value)
++            return
++        data = getattr(obj, "data", None)
++        if isinstance(data, torch.Tensor):
++            visit(data)
++
++    try:
++        walk(state_dict)
++    except Exception as exc:
++        _ckpt_plan_probe().failed = exc
++    return count, logical, sum(unique.values())
++
++
++def begin_ckpt_plan(path, state_dict):
++    """Mark the start of one save. The following contiguous/clone calls are counted."""
++    global _CKPT_PLAN_ACTIVE, _CKPT_PLAN_DIR
++    _CKPT_PLAN_ACTIVE = True
++    _CKPT_PLAN_DIR = str(path)
++    probe = _ckpt_plan_probe()
++    probe.reset()
++    count, logical, unique = _account_tensors(state_dict)
++    _ckpt_plan_print(
++        f"where=enter tensors={count} logical_gib={_ckpt_plan_gib(logical):.2f} "
++        f"unique_storage_gib={_ckpt_plan_gib(unique):.2f}"
++    )
++
++
++def note_ckpt_plan_contiguous(key, tensor):
++    """Record a save-path ``.contiguous()`` that is about to allocate. Does not copy."""
++    if not _CKPT_PLAN_ACTIVE:
++        return
++    probe = _ckpt_plan_probe()
++    probe.contig_calls += 1
++    try:
++        if tensor.is_contiguous():
++            return
++        nbytes = tensor.numel() * tensor.itemsize
++        probe.contig_copied += 1
++        probe.contig_bytes += nbytes
++        _ckpt_plan_top(probe.contig_top, nbytes, f"{key}:{tensor.device.type}")
++    except Exception as exc:
++        probe.failed = exc
++
++
++def finish_ckpt_plan_contiguous(state_dict):
++    if not _CKPT_PLAN_ACTIVE:
++        return
++    probe = _ckpt_plan_probe()
++    count, logical, unique = _account_tensors(state_dict)
++    top = [(name, round(_ckpt_plan_gib(nbytes), 3)) for nbytes, name in sorted(probe.contig_top, reverse=True)]
++    _ckpt_plan_print(
++        f"where=contiguous calls={probe.contig_calls} copied={probe.contig_copied} "
++        f"copied_gib={_ckpt_plan_gib(probe.contig_bytes):.2f} "
++        f"alive_tensors={count} alive_logical_gib={_ckpt_plan_gib(logical):.2f} "
++        f"alive_unique_storage_gib={_ckpt_plan_gib(unique):.2f} top={top} failed={probe.failed}"
++    )
++
++
++def note_ckpt_plan_clone(tensor, name, clone_views=True):
++    """Classify the tensor ``_clone_if_needed`` is about to handle. Does not clone.
++
++    dsv4-ckpt-27: ``cloned_gib`` counts clones that actually run. A CPU view that
++    is passed through is passthrough, not a clone.
++    """
++    if not _CKPT_PLAN_ACTIVE:
++        return
++    probe = _ckpt_plan_probe()
++    probe.clone_n += 1
++    try:
++        nbytes = tensor.numel() * tensor.itemsize
++        device = tensor.device.type
++        if device != "cpu":
++            probe.device_n += 1
++            probe.device_bytes += nbytes
++            return
++        storage = tensor.untyped_storage()
++        is_view = storage.size() != nbytes
++        if is_view:
++            probe.view_n += 1
++            probe.view_bytes += nbytes
++            probe.view_storage_bytes[storage.data_ptr()] = storage.size()
++            if clone_views:
++                probe.cloned_n += 1
++                probe.cloned_bytes += nbytes
++                _ckpt_plan_top(probe.clone_top, nbytes, name or "?")
++            else:
++                probe.passthrough_n += 1
++                probe.passthrough_bytes += nbytes
++            return
++        probe.passthrough_n += 1
++        probe.passthrough_bytes += nbytes
++        if not tensor.is_contiguous():
++            probe.noncontig_passthrough_n += 1
++            _ckpt_plan_top(probe.clone_top, nbytes, f"noncontig:{name or '?'}")
++    except Exception as exc:
++        probe.failed = exc
++
++
++def finish_ckpt_plan_clone(write_buckets):
++    """Log clone totals and the tensors still held in ``write_buckets``."""
++    global _CKPT_PLAN_ACTIVE
++    if not _CKPT_PLAN_ACTIVE:
++        return
++    probe = _ckpt_plan_probe()
++    parents = sum(probe.view_storage_bytes.values())
++    top = [(name, round(_ckpt_plan_gib(nbytes), 3)) for nbytes, name in sorted(probe.clone_top, reverse=True)]
++    _ckpt_plan_print(
++        f"where=clone_if_needed clone_cpu_views={int(_ckpt_clone_cpu_views())} "
++        f"n={probe.clone_n} cloned={probe.cloned_n} "
++        f"cloned_gib={_ckpt_plan_gib(probe.cloned_bytes):.2f} "
++        f"view_n={probe.view_n} view_gib={_ckpt_plan_gib(probe.view_bytes):.2f} "
++        f"view_parent_storage_gib={_ckpt_plan_gib(parents):.2f} "
++        f"device_n={probe.device_n} device_gib={_ckpt_plan_gib(probe.device_bytes):.2f} "
++        f"passthrough_n={probe.passthrough_n} "
++        f"passthrough_gib={_ckpt_plan_gib(probe.passthrough_bytes):.2f} "
++        f"noncontig_passthrough_n={probe.noncontig_passthrough_n} top={top} failed={probe.failed}"
++    )
++    logical = 0
++    unique = {}
++    count = 0
++    try:
++        for _bucket_path, _file_name, (_bytes_data, tensor_data) in write_buckets:
++            for _item, tensor in tensor_data:
++                if not isinstance(tensor, torch.Tensor):
++                    continue
++                count += 1
++                logical += tensor.numel() * tensor.itemsize
++                storage = tensor.untyped_storage()
++                unique[storage.data_ptr()] = storage.size()
++    except Exception as exc:
++        probe.failed = exc
++    # dsv4-ckpt-25b: unique is {data_ptr: nbytes}. Passing the dict to
++    # _ckpt_plan_gib raises TypeError inside prepare_write_data's finally
++    # and aborts the save before any byte is written.
++    try:
++        unique_bytes = sum(unique.values())
++        _ckpt_plan_print(
++            f"where=buckets_alive tensors={count} logical_gib={_ckpt_plan_gib(logical):.2f} "
++            f"unique_storage_gib={_ckpt_plan_gib(unique_bytes):.2f} failed={probe.failed}"
++        )
++    except Exception as exc:
++        probe.failed = exc
++        try:
++            _ckpt_plan_print(f"where=buckets_alive failed={exc!r}")
++        except Exception:
++            pass
++    _CKPT_PLAN_ACTIVE = False
++
+ _results_queue = None
+ 
+ 
+@@ -107,7 +585,14 @@ class FileSystemWriterAsync(FileSystemWriter):
+             file_count += 1
+             return file_name
+ 
+-        def _clone_if_needed(ten: torch.Tensor):
++        def _item_name(item):
++            index = getattr(item, "index", None)
++            if index is None:
++                return "?"
++            fqn = getattr(index, "fqn", None)
++            return str(fqn) if fqn else str(index)
++
++        def _clone_if_needed(ten: torch.Tensor, item_name: str = ""):
+             """Clone if we detect incontiguous storage for CPU tensors
+ 
+             Makes sure we perform a `clone` only if we detect incontiguous storage,
+@@ -117,44 +602,53 @@ class FileSystemWriterAsync(FileSystemWriter):
+             to shared_memory.
+             """
+             ten = ten.detach()
++            # dsv4-ckpt-27: sync saves pass CPU views through. Async saves still clone.
++            clone_views = _ckpt_clone_cpu_views()
++            note_ckpt_plan_clone(ten, item_name, clone_views=clone_views)
+             if ten.device.type != "cpu":
+                 # We do D2H later when the async_request is scheduled for both sync / async
+                 # checkpointing
+                 return ten
+             is_view = ten.untyped_storage().size() != ten.numel() * ten.itemsize
+-            return ten.clone() if is_view else ten
++            if is_view and clone_views:
++                return ten.clone()
++            return ten
+ 
+         # Prepare bytes / tensor data in each bucket, which will be assigned to each writer process
+         self.write_buckets = []
+-        for group_name, group_buckets in _split_by_separation_hint(
+-            item_buckets, self.separation_hint
+-        ).items():
+-            for bucket in group_buckets:
+-                bytes_data = [
+-                    (item, planner.resolve_data(item))
+-                    for item in bucket
+-                    if item.type == WriteItemType.BYTE_IO
+-                ]
+-                tensor_data = [
+-                    (item, _clone_if_needed(planner.resolve_data(item)))
+-                    for item in bucket
+-                    if item.type != WriteItemType.BYTE_IO
+-                ]
+-                if len(bytes_data) > 0 or len(tensor_data) > 0:
+-                    file_name = gen_file(prefix=group_name)
+-                    self.write_buckets.append(
+-                        (self.path / file_name, file_name, (bytes_data, tensor_data))
+-                    )
++        try:
++            for group_name, group_buckets in _split_by_separation_hint(
++                item_buckets, self.separation_hint
++            ).items():
++                for bucket in group_buckets:
++                    bytes_data = [
++                        (item, planner.resolve_data(item))
++                        for item in bucket
++                        if item.type == WriteItemType.BYTE_IO
++                    ]
++                    tensor_data = [
++                        (item, _clone_if_needed(planner.resolve_data(item), _item_name(item)))
++                        for item in bucket
++                        if item.type != WriteItemType.BYTE_IO
++                    ]
++                    if len(bytes_data) > 0 or len(tensor_data) > 0:
++                        file_name = gen_file(prefix=group_name)
++                        self.write_buckets.append(
++                            (self.path / file_name, file_name, (bytes_data, tensor_data))
++                        )
+ 
+-        # Check if there is anything to write on this rank
+-        if len(self.write_buckets) > 0:
+-            assert len(self.write_buckets) <= self.thread_count, (
+-                len(self.write_buckets),
+-                self.thread_count,
+-            )
+-            self.results_queue = _get_write_results_queue()
+-        else:
+-            self.results_queue = None
++            # Check if there is anything to write on this rank
++            if len(self.write_buckets) > 0:
++                assert len(self.write_buckets) <= self.thread_count, (
++                    len(self.write_buckets),
++                    self.thread_count,
++                )
++                self.results_queue = _get_write_results_queue()
++            else:
++                self.results_queue = None
++        finally:
++            # dsv4-ckpt-25: still emit the counters if the clone itself raises.
++            finish_ckpt_plan_clone(self.write_buckets)
+         end = time()
+         logger.debug(f"D2H and push, time: {end - start}")
+ 
+@@ -314,16 +808,22 @@ class FileSystemWriterAsync(FileSystemWriter):
+         local_results = []
+         try:
+             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+-            with open(file_name, "wb") as stream:
++            raw_stream = open(file_name, "wb", buffering=0)
++            stream = _ChunkedSyncWriter(raw_stream) if _CKPT_FSYNC_CHUNK_BYTES > 0 else raw_stream
++            with stream:
+                 for write_item, data in bytes_data:
+                     local_results.append(
+-                        _write_item(*transform_list, stream, data, write_item, storage_key)
++                        _write_item(
++                            *transform_list, stream, data, write_item, storage_key, *_WRITE_ITEM_EXTRA_ARGS
++                        )
+                     )
+ 
+                 for write_item, tensor in tensor_data:
+                     assert tensor.is_cpu
+                     local_results.append(
+-                        _write_item(*transform_list, stream, tensor, write_item, storage_key)
++                        _write_item(
++                            *transform_list, stream, tensor, write_item, storage_key, *_WRITE_ITEM_EXTRA_ARGS
++                        )
+                     )
+ 
+                 if use_fsync:
+diff --git a/megatron/core/dist_checkpointing/strategies/torch.py b/megatron/core/dist_checkpointing/strategies/torch.py
+index 06c262a8f4d5aea422b78a8521861991242c7724..af53f175cf2f6721d6df55ea97b4452be2df3fae 100644
+--- a/megatron/core/dist_checkpointing/strategies/torch.py
++++ b/megatron/core/dist_checkpointing/strategies/torch.py
+@@ -57,7 +57,12 @@ from .base import (
+     register_default_strategy,
+ )
+ from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
+-from .filesystem_async import FileSystemWriterAsync
++from .filesystem_async import (
++    FileSystemWriterAsync,
++    begin_ckpt_plan,
++    finish_ckpt_plan_contiguous,
++    note_ckpt_plan_contiguous,
++)
+ from .resharding import (
+     TensorReformulationMetadata,
+     apply_nd_flattened_tensors_reformulation,
+@@ -172,6 +177,8 @@ def sharded_tensor_to_torch_sharded_tensor(
+     for sh_ten in sh_tens:
+         assert (sh_ten.flattened_range is not None) == has_flattened_range, sh_tens
+         if not sh_ten.data.is_contiguous():
++            # dsv4-ckpt-25: count the copy. The contiguous() call itself is unchanged.
++            note_ckpt_plan_contiguous(sh_ten.key, sh_ten.data)
+             sh_ten.data = sh_ten.data.contiguous()
+ 
+     if load_legacy_1d_flatten_tensors and len(some_sh_ten.global_shape) == 1:
+@@ -352,6 +359,7 @@ def mcore_to_pyt_state_dict(
+             v = cast(List[ShardedObject], v)
+             pyt_state_dict[k] = _mcore_to_torch_sharded_object(v)
+ 
++    finish_ckpt_plan_contiguous(state_dict)
+     return pyt_state_dict
+ 
+ 
+@@ -709,6 +717,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
+                 sharded_state_dict, self.keep_only_main_replica
+             )
+         )
++        begin_ckpt_plan(checkpoint_dir, sharded_state_dict)
+         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+         # Use PyT saving mechanism
+         writer = FileSystemWriterAsync(
+@@ -812,25 +821,35 @@ def get_reformulation_metadata(
+             as stored in `mcore_data` in the checkpoint.
+     """
+     ckpt_metadata = FileSystemReader(checkpoint_dir).read_metadata()
++    # torch>=2.10 does not persist MCore's dynamic `mcore_data` attribute in the
++    # on-disk metadata, so fall back to the layout of the live state dict.
++    ckpt_mcore_data = getattr(ckpt_metadata, 'mcore_data', None)
+     reformulation_metadata = {}
+     for sh_ten in nested_values(sharded_state_dict):
+         if not is_nd_flattened_tensor(sh_ten):
+             continue
+-        try:
+-            ckpt_global_shape = ckpt_metadata.mcore_data[sh_ten.key][
+-                'nd_reformulated_orig_global_shape'
+-            ]
+-        except KeyError as e:
+-            if len(sh_ten.global_shape) == 1:
+-                warnings.warn(
+-                    f'Legacy checkpoint format detected for 1-D flattened tensor {sh_ten}. '
+-                    'Skip metadata reformulation.'
+-                )
+-                continue
+-            raise CheckpointingException(
+-                f'Cannot find global shape metadata for N-D flattened tensor {sh_ten} '
+-                f'in checkpoint metadata: {ckpt_metadata.mcore_data}'
+-            ) from e
++        if ckpt_mcore_data is None:
++            warnings.warn(
++                'Checkpoint metadata has no `mcore_data` (dropped by this torch version); '
++                'fall back to the current sharded state dict layout for N-D reformulation.'
++            )
++            ckpt_global_shape = tuple(sh_ten.global_shape)
++        else:
++            try:
++                ckpt_global_shape = ckpt_mcore_data[sh_ten.key][
++                    'nd_reformulated_orig_global_shape'
++                ]
++            except KeyError as e:
++                if len(sh_ten.global_shape) == 1:
++                    warnings.warn(
++                        f'Legacy checkpoint format detected for 1-D flattened tensor {sh_ten}. '
++                        'Skip metadata reformulation.'
++                    )
++                    continue
++                raise CheckpointingException(
++                    f'Cannot find global shape metadata for N-D flattened tensor {sh_ten} '
++                    f'in checkpoint metadata: {ckpt_mcore_data}'
++                ) from e
+ 
+         reformulation_metadata[sh_ten.key] = TensorReformulationMetadata(
+             ckpt_global_shape, ckpt_metadata.state_dict_metadata[sh_ten.key].size
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index a00d1a35e88930a2ed1528341ca814d982dae649..52a5478688d1d5e25abafbd591204b9620fbb794 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -1305,9 +1305,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                 ) from e
+ 
+             # Set DP corresponding replica_id coordinate to 0.
+-            assert (
+-                len(sharded_metadata.replica_id) == 3
+-            ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
++            assert isinstance(sharded_metadata.replica_id, tuple) and len(
++                sharded_metadata.replica_id
++            ) == 3, (
++                'Expected replica_id format (PP, TP, DP), got: '
++                f'{sharded_metadata} type={type(sharded_metadata).__name__} '
++                f'replica_id={sharded_metadata.replica_id!r}'
++            )
+             replica_id = (*sharded_metadata.replica_id[:2], self.distributed_optimizer_instance_id)
+ 
+             # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
+diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
+index ee3e69e970ddf7b3fe99004e9d2a319b254a3e8a..294912fe30b1ad23cb150ea16f56d6444ff52ab8 100644
+--- a/megatron/core/transformer/moe/experts.py
++++ b/megatron/core/transformer/moe/experts.py
+@@ -404,112 +404,29 @@ class GroupedMLP(MegatronModule):
+                 # load process.
+                 assert t.ndim == 1, (key, t.shape)
+                 if with_glu:
+-                    non_flat_local_shape = (1, self.config.hidden_size, local_ffn_dim_size)
+-                    chunk_numel = local_ffn_dim_size
+-                    sub_states = []
+-                    start_pos = 0
+-                    for local_expert_idx in range(self.num_local_experts):
+-                        first_glu_idx = -1
+-                        w_start_range = -1
+-                        v_start_range = -1
+-                        w_tensors = []
+-                        v_tensors = []
+-                        w_lens = []
+-                        v_lens = []
+-                        expert_global_idx = local_expert_indices_offset + local_expert_idx
+-                        for input_dim_idx in range(self.config.hidden_size):
+-                            for glu_idx in range(2):
+-                                local_idx = (
+-                                    local_expert_idx * self.config.hidden_size * 2
+-                                    + input_dim_idx * 2
+-                                    + glu_idx
+-                                )
+-                                if (
+-                                    flattened_range.start < chunk_numel * (local_idx + 1)
+-                                    and flattened_range.stop > chunk_numel * local_idx
+-                                ):
+-                                    if first_glu_idx == -1:
+-                                        first_glu_idx = glu_idx
+-                                    end_pos = min(
+-                                        flattened_range.stop,
+-                                        chunk_numel * (local_idx + 1) - flattened_range.start,
+-                                    )
+-                                    local_tensor = t[start_pos:end_pos]
+-                                    local_flattened_range = slice(
+-                                        max(0, flattened_range.start - chunk_numel * local_idx),
+-                                        min(
+-                                            chunk_numel,
+-                                            flattened_range.stop - chunk_numel * local_idx,
+-                                        ),
+-                                    )
+-                                    assert (
+-                                        len(local_tensor)
+-                                        == local_flattened_range.stop - local_flattened_range.start
+-                                    )
+-                                    start_pos += len(local_tensor)
+-                                    if glu_idx == 0:
+-                                        w_tensors.append(local_tensor)
+-                                        w_lens.append(len(local_tensor))
+-                                        if w_start_range == -1:
+-                                            w_start_range = max(
+-                                                0, flattened_range.start - chunk_numel * local_idx
+-                                            )
+-                                    else:
+-                                        v_tensors.append(local_tensor)
+-                                        v_lens.append(len(local_tensor))
+-                                        if v_start_range == -1:
+-                                            v_start_range = max(
+-                                                0, flattened_range.start - chunk_numel * local_idx
+-                                            )
+-                        sub_states.append(
+-                            {
+-                                'w_tensors': ShardedTensor.from_rank_offsets_flat(
+-                                    key,
+-                                    (
+-                                        torch.cat(w_tensors, -1)
+-                                        if len(w_tensors) > 0
+-                                        else torch.Tensor()
+-                                    ),
+-                                    non_flat_local_shape,
+-                                    *sharded_offsets,
+-                                    (
+-                                        prepend_axis_num,
+-                                        expert_global_idx,  # pylint: disable=E0606
+-                                        num_global_experts,
+-                                    ),
+-                                    (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size * 2),
+-                                    replica_id=replica_id,
+-                                    prepend_axis_num=prepend_axis_num,
+-                                    flattened_range=slice(
+-                                        w_start_range, w_start_range + sum(w_lens)
+-                                    ),
+-                                ),
+-                                'w_lens': LocalNonpersistentObject(w_lens),
+-                                'v_tensors': ShardedTensor.from_rank_offsets_flat(
+-                                    key,
+-                                    (
+-                                        torch.cat(v_tensors, -1)
+-                                        if len(v_tensors) > 0
+-                                        else torch.Tensor()
+-                                    ),
+-                                    non_flat_local_shape,
+-                                    *sharded_offsets,
+-                                    (prepend_axis_num, expert_global_idx, num_global_experts),
+-                                    (
+-                                        prepend_axis_num + 1 + tp_axis,
+-                                        tp_rank + tp_size,
+-                                        tp_size * 2,
+-                                    ),
+-                                    replica_id=replica_id,
+-                                    prepend_axis_num=prepend_axis_num,
+-                                    flattened_range=slice(
+-                                        v_start_range, v_start_range + sum(v_lens)
+-                                    ),
+-                                ),
+-                                'v_lens': LocalNonpersistentObject(v_lens),
+-                                'first_glu_idx': LocalNonpersistentObject(first_glu_idx),
+-                            }
++                    # dsv4-ckpt-18: flattened GLU optimizer states already live in this
++                    # 1D buffer. torch.cat of the interleaved w/v chunks allocated a
++                    # second copy of every fp32 state before write() started.
++                    covered = flattened_range.stop - flattened_range.start
++                    if t.numel() != covered:
++                        raise AssertionError(
++                            f'{key}: flattened GLU state numel {t.numel()} != range {flattened_range}'
+                         )
++                    sub_states = ShardedTensor.from_rank_offsets_flat(
++                        key,
++                        t,
++                        real_shape,
++                        *sharded_offsets,
++                        (
++                            prepend_axis_num,
++                            parallel_state.get_expert_model_parallel_rank(),
++                            parallel_state.get_expert_model_parallel_world_size(),
++                        ),
++                        (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size),
++                        replica_id=replica_id,
++                        prepend_axis_num=prepend_axis_num,
++                        flattened_range=flattened_range,
++                    )
+                 else:
+                     non_flat_local_shape = (
+                         real_shape[0] // self.num_local_experts,
+@@ -567,6 +484,9 @@ class GroupedMLP(MegatronModule):
+                 assert with_glu == False
+             else:
+                 raise ValueError("tp_axis should be 0 or 1.")
++            if torch.is_tensor(sub_state_dict) and sub_state_dict.ndim == 1:
++                # dsv4-ckpt-18: load the in-place 1D layout back unchanged
++                return sub_state_dict
+             if isinstance(sub_state_dict, list) and isinstance(sub_state_dict[0], dict):
+                 # flattened tensor with glu
+                 res = []

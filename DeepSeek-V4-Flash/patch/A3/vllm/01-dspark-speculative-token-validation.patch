@@ -1,0 +1,30 @@
+From 69c8a574f23ff45f976691c5c69bc543699e6417 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 10:16:28 +0000
+Subject: [PATCH] fix: allow DSpark speculative token counts
+
+Skip the MTP divisibility restriction for the dspark method.
+
+Source-base: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+Source-state: uncommitted tracked files
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ vllm/config/speculative.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 2396b26cb01a11d1b94bad51aa9a3396b73dbcc9..04cf4ce6bbad443f1083b9335c0ddae0fb17d7f1 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1476,7 +1476,8 @@ class SpeculativeConfig:
+                         # Default to max value defined in draft model config.
+                         self.num_speculative_tokens = n_predict
+                     elif (
+-                        self.num_speculative_tokens > n_predict
++                        self.method != "dspark"
++                        and self.num_speculative_tokens > n_predict
+                         and self.num_speculative_tokens % n_predict != 0
+                     ):
+                         # Ensure divisibility for MTP module reuse.
