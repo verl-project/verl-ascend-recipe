@@ -1,0 +1,48 @@
+diff --git a/verl/trainer/runtime_env.yaml b/verl/trainer/runtime_env.yaml
+index 7d38fdde..96804fd5 100644
+--- a/verl/trainer/runtime_env.yaml
++++ b/verl/trainer/runtime_env.yaml
+@@ -1,7 +1,40 @@
+ working_dir: ./
+-excludes: ["/.git/"]
++py_modules:
++  - /opt/tiger/code-pt/code/mbridge/mbridge
++  - /opt/tiger/code-pt/code/Megatron-LM/megatron
++  - /opt/tiger/code-pt/code/MindSpeed/mindspeed
++  - /opt/tiger/code-pt/code/MindSpeed-LLM/mindspeed_llm
++  - /opt/tiger/code-pt/code/vllm/vllm
++  - /opt/tiger/code-pt/code/vllm-ascend/vllm_ascend
++excludes:
++  - "/.git/"
++  - "/.github/"
++  - "/.agent/"
++  - "/.claude/"
++  - "/.codex/"
++  - "/.vscode/"
++  - "/docs/"
++  - "/tests/"
++  - "/examples/"
++  - "/docker/"
++  - "/recipe/"
++  - "/logs-xzy/"
++  - "**/__pycache__/"
++  - "*.pyc"
++  - "*.egg-info/"
+ env_vars:
+   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+   CUDA_DEVICE_MAX_CONNECTIONS: "1"
+   HCCL_HOST_SOCKET_PORT_RANGE: "auto"
+-  HCCL_NPU_SOCKET_PORT_RANGE: "auto"
+\ No newline at end of file
++  HCCL_NPU_SOCKET_PORT_RANGE: "auto"
++  PYTHONPATH: ./runtime_overlays/protobuf_3_20_3:$PYTHONPATH
++  LD_LIBRARY_PATH: "$LD_LIBRARY_PATH"
++  # HCCL_SOCKET_IFNAME: eth0
++  # TP_SOCKET_IFNAME: eth0
++  # GLOO_SOCKET_IFNAME: eth0
++  # HCCL_SOCKET_FAMILY: AF_INET6
++  # GLOO_SOCKET_FAMILY: AF_INET6
++  TRANSFORMERS_VERBOSITY: "error"
++  VLLM_VERSION: 0.30.0
++  VLLM_USE_V2_MODEL_RUNNER: '1'
++  HCCL_BUFFSIZE: '250'
