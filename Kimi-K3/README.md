@@ -22,16 +22,16 @@
 
 | A5 配套软件 | 版本 | 备注 |
 | --- | --- | --- |
-| Python | 3.12.15 |
-| CANN | 9.2.1 |
-| torch | 2.10.0 |
-| torch-npu | 2.10.0.post6 |
-| vLLM | 0.30.0+empty |
-| transformers | 5.16.1 |
-| triton | 3.5.0 |
-| triton-ascend | 3.2.2 |
-| flash-linear-attention | 0.5.2 |
-| triton-ascend-kernels | 0.1.dev1+gd4bb38e3e.d20261027 |
+| Python | 3.12.15 | |
+| CANN | 9.2.1 | |
+| torch | 2.10.0 | |
+| torch-npu | 2.10.0.post6 | |
+| vLLM | 0.30.0+empty | |
+| transformers | 5.16.1 | |
+| triton | 3.5.0 | |
+| triton-ascend | 3.2.2 | |
+| flash-linear-attention | 0.5.2 | |
+| triton-ascend-kernels | 0.1.dev1+gd4bb38e3e.d20261027 | |
 | verl | main | 基于3c6d9b43b67c74ec343d77874cd8fa6e841523da基线应用 Patch |
 | FSDPTurbo | main | 基于1fa40ad350eb681ed413ca64bffedc166c986e0f基线应用 Patch |
 | vllm-ascend | v0.30.0 | 基于cb629ea1925a280d57b41b48416a85097f6cdb6b基线应用 Patch |
@@ -172,11 +172,28 @@ cp verl-ascend-recipe/Kimi-K3/examples/ray_start_4nodes_a5.sh .
 bash ray_start_4nodes_a5.sh
 ```
 
-## 4. 训练效果
+## 4. 可选: 异步训练功能修复
+
+默认流程只应用 `Kimi-K3/patch/verl.patch`。若需使用异步（separate async）训练，需在应用 `verl.patch` 之后追加应用 `Kimi-K3/patch/verl-separate-async.patch`，该 patch 修复了以下问题：
+
+- **权重同步**：为 FSDPTurbo（`fsdp_turbo`）补齐 CPU sharded 权重的保存与恢复路径，使异步模式下 Actor 与 Rollout 的权重同步可用。
+- **Kimi 专家权重流式传输**：新增 `kimi_expert_stream.py`，按有界 tile 分块传输专家权重，避免一次性聚合整份 packed 参数带来的显存与内存峰值。
+- **分片布局校验**：`fsdp2_sharded_save_to_cpu` / `fsdp2_sharded_load_from_cpu` 改为按参数各自的 DTensorSpec 校验，支持 FSDP 与 EP/eFSDP 混合布局。
+- **HCCL 建链端口竞争**：预留监听 socket 并交给 TCPStore 复用，修复异步初始化阶段端口被抢占导致的建链失败。
+
+```bash
+# A3：在已应用 verl.patch 的 verl 目录中执行
+git -C "$WORK/verl" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$WORK/verl-ascend-recipe/Kimi-K3/patch/verl-separate-async.patch"
+
+# A5：在已应用 verl.patch 的 verl 目录中执行
+cd verl && git am --keep ../verl-ascend-recipe/Kimi-K3/patch/verl-separate-async.patch && cd ..
+```
+
+## 5. 训练效果
 
 以下展示 Kimi K3 16 专家裁剪模型在 Ascend A3 和 A5 上的 GRPO 训练结果。
 
-### 4.1 Ascend A3：4 机、16 专家训练结果
+### 5.1 Ascend A3：4 机、16 专家训练结果
 
 | 配置项 | 配置说明 |
 | --- | --- |
@@ -190,7 +207,7 @@ bash ray_start_4nodes_a5.sh
 
 ![Kimi K3 A3训练结果](src/kimi_k3_200steps_a3.png)
 
-### 4.2 Ascend A5：4 机、16 专家训练结果
+### 5.2 Ascend A5：4 机、16 专家训练结果
 
 | 配置项 | 配置说明 |
 | --- | --- |
