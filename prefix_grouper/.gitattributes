@@ -1,0 +1,6 @@
+# Keep the tested patch byte-for-byte, including single-space context lines.
+patches/verl.patch -text -whitespace
+*.py text eol=lf
+*.sh text eol=lf
+*.jsonl text eol=lf
+*.log text eol=lf
