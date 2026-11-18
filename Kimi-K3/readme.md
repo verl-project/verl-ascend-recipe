@@ -83,7 +83,7 @@ git -C "$WORK/vllm-ascend" checkout --detach cb629ea1925a280d57b41b48416a85097f6
 
 # 应用Patch
 PATCH_DIR="$WORK/verl-ascend-recipe/Kimi-K3/patch"
-git -C "$WORK/verl" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/verl.patch"
+git -C "$WORK/verl" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/verl.patch" "$PATCH_DIR/verl-separate-async.patch"
 git -C "$WORK/FSDPTurbo" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/fsdpturbo.patch"
 git -C "$WORK/vllm-ascend" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/vllm-ascend.patch"
 git -C "$WORK/vllm-ascend" submodule update --init --recursive
@@ -163,7 +163,7 @@ cd FSDPTurbo && git checkout 1fa40ad350eb681ed413ca64bffedc166c986e0f && cd ..
 cd vllm-ascend && git checkout cb629ea1925a280d57b41b48416a85097f6cdb6b && cd ..
 
 # 应用Patch
-cd verl && git am --keep ../verl-ascend-recipe/Kimi-K3/patch/verl.patch && cd ..
+cd verl && git am --keep ../verl-ascend-recipe/Kimi-K3/patch/verl.patch ../verl-ascend-recipe/Kimi-K3/patch/verl-separate-async.patch && cd ..
 cd FSDPTurbo && git am --keep ../verl-ascend-recipe/Kimi-K3/patch/fsdpturbo.patch && cd ..
 cd vllm-ascend && git am --keep ../verl-ascend-recipe/Kimi-K3/patch/vllm-ascend.patch && cd ..
 
