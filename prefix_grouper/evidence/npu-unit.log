@@ -1,0 +1,11 @@
+test_bfloat16_logits_loss_and_parameter_gradients (__main__.PrefixGrouperTests.test_bfloat16_logits_loss_and_parameter_gradients) ... ok
+test_empty_response_and_single_prompt_token (__main__.PrefixGrouperTests.test_empty_response_and_single_prompt_token) ... ok
+test_logits_loss_and_parameter_gradients (__main__.PrefixGrouperTests.test_logits_loss_and_parameter_gradients) ... ok
+test_malformed_padding (__main__.PrefixGrouperTests.test_malformed_padding) ... ok
+test_mismatched_shared_positions_and_tokens (__main__.PrefixGrouperTests.test_mismatched_shared_positions_and_tokens) ... ok
+test_native_ascend_attention_and_gradients (__main__.PrefixGrouperTests.test_native_ascend_attention_and_gradients) ... ok
+test_sibling_isolation_in_forward_and_backward (__main__.PrefixGrouperTests.test_sibling_isolation_in_forward_and_backward) ... ok
+test_topology_and_reconstruction (__main__.PrefixGrouperTests.test_topology_and_reconstruction) ... ok
+test_ungrouped_prompts (__main__.PrefixGrouperTests.test_ungrouped_prompts) ... ok
+Ran 9 tests in 8.197s
+OK
