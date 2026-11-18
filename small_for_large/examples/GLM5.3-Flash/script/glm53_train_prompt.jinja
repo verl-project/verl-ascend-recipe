@@ -1,0 +1,28 @@
+{#-
+  与 MindSpeed-MM 训练侧 template: glm4.1v 渲染出的 prompt 逐 token 一致的推理模板。
+
+  训练侧来源(mindspeed_mm/fsdp/data/data_utils/func_utils/template.py:610-623 注册,
+  format_* 槽位见 :611-614):
+      format_prefix    = "[gMASK]<sop>"
+      format_user      = "<|user|>\n{{content}}<|assistant|>"
+      format_assistant = "\n{{content}}"
+
+  另外 yaml 的 dataset_param.attr 里没有 `system` 键 -> convert.py:158 得 system="" ->
+  template.py _encode 里 `system or default_system` 为假 -> 训练 prompt 里**没有** <|system|> 槽。
+
+  于是训练序列是:
+      [gMASK]<sop><|user|>\n{题面}<|assistant|>
+  labels 从 "\n<think>\n{CoT}</think>\n\nAnswer: \boxed{x}" 开始 ——
+  所以这里**不能**预填 <think>,必须让模型自己生成 "\n<think>"。
+
+  跑 vLLM 时用（$BASE_DIR 默认为 $HOME/glm5-3-s_b，与 vllm_server*.sh 中一致）:
+      --chat-template $HOME/glm5-3-s_b/start/glm53_train_prompt.jinja
+-#}
+{%- for m in messages -%}
+{%- set c = m.content if m.content is string else m.content | map(attribute='text', default='') | join('') -%}
+{%- if m.role == 'user' -%}
+{{- ('[gMASK]<sop>' if loop.first else '') + '<|user|>\n' + c + '<|assistant|>' -}}
+{%- elif m.role == 'assistant' -%}
+{{- '\n' + c -}}
+{%- endif -%}
+{%- endfor -%}
