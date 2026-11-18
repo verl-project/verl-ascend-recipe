@@ -258,4 +258,29 @@ ais_bench --models vllm_api_general_V4_pruned --dataset gsm8k_gen --num-prompt 5
 | gsm8k   | 64     | 6      | 500        | 39.58                 |
 
 
+8、校验裁剪产物（建议）
+
+`expert_pruned.py` 一次性完成分片重写、专家重编号与 `config.json` 改写。建议在拉起裁剪模型的服务之前，先用配套门禁工具 `verify_pruned.py` 校验裁剪产物：
+
+```bash
+# 8.1 裁剪前：对源模型目录做指纹快照
+python verify_pruned.py --source /path/DeepSeek-V4-Flash-bf16 --snapshot source_fp.json --fingerprint-only
+
+# 8.2 照常裁剪（第 6 步），然后校验：
+python verify_pruned.py --source /path/DeepSeek-V4-Flash-bf16 --pruned /path/DeepSeek-V4-Flash-bf16-top64-pruned --json-path top64_experts.json --top-k 64 --snapshot source_fp.json
+```
+
+门禁在**不把整模型载入内存**的前提下核验：
+
+| 检查项 | 证明什么 |
+|---|---|
+| 源完整性 | 裁剪后源目录与裁剪前快照完全一致（证明裁剪从未碰过原始权重） |
+| 保留专家保真 | 裁剪模型里每个保留专家张量与源模型对应切片**字节级相等**（`torch.equal`），映射关系与 `expert_pruned.py` 完全一致 |
+| 路由保真 | `gate.weight` / `gate.bias` 中保留专家对应的行与源模型对应行字节级相等 |
+| 覆盖率 | topk JSON 覆盖全部可裁层——缺层时 `expert_pruned.py` 会静默回退为保留专家 `0..N-1`，门禁将其判 FAIL |
+| config 差异 | 仅 `n_routed_experts` 发生变化 |
+| 残留专家维 | 裁剪层中仍带旧专家数维度的直通张量（如未裁的路由偏置）被点名供人工复核 |
+
+结果以 `PROVENANCE.json` 落在裁剪模型目录旁（源指纹、keep 表哈希、逐检查统计、判定结论）。任一项失败即非零退出，可直接作为自动化流水线的硬门禁。
+
 ## 三、训练侧patch适配（TODO）
