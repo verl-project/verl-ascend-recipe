@@ -172,7 +172,7 @@ cp verl-ascend-recipe/Kimi-K3/examples/ray_start_4nodes_a5.sh .
 bash ray_start_4nodes_a5.sh
 ```
 
-## 4. 异步训练功能修复
+## 4. 可选: 异步训练功能修复
 
 默认流程只应用 `Kimi-K3/patch/verl.patch`。若需使用异步（separate async）训练，需在应用 `verl.patch` 之后追加应用 `Kimi-K3/patch/verl-separate-async.patch`，该 patch 修复了以下问题：
 
@@ -180,7 +180,6 @@ bash ray_start_4nodes_a5.sh
 - **Kimi 专家权重流式传输**：新增 `kimi_expert_stream.py`，按有界 tile 分块传输专家权重，避免一次性聚合整份 packed 参数带来的显存与内存峰值。
 - **分片布局校验**：`fsdp2_sharded_save_to_cpu` / `fsdp2_sharded_load_from_cpu` 改为按参数各自的 DTensorSpec 校验，支持 FSDP 与 EP/eFSDP 混合布局。
 - **HCCL 建链端口竞争**：预留监听 socket 并交给 TCPStore 复用，修复异步初始化阶段端口被抢占导致的建链失败。
-- **Profiling 时序**：恢复基类 trainer 的 profiler 停止时机，在 `on_step_end` 开头先停止 rollout profiling 再同步权重，避免 profiling 输出缺失。
 
 ```bash
 # A3：在已应用 verl.patch 的 verl 目录中执行
