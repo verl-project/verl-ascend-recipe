@@ -1,0 +1,115 @@
+--- a/verl/experimental/fully_async_policy/fully_async_main.py
++++ b/verl/experimental/fully_async_policy/fully_async_main.py
+@@ -20,7 +20,7 @@
+ 
+ import hydra
+ import ray
+-from omegaconf import OmegaConf
++from omegaconf import OmegaConf, open_dict
+ 
+ from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
+ from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+@@ -50,6 +50,25 @@
+ 
+     def _initialize_components(self, config) -> None:
+         print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
++        rollout_config = config.actor_rollout_ref.rollout
++        # Only this runner guarantees the full sync below before rollout.fit/validation.
++        initial_weight_sync = (
++            rollout_config.name == "vllm"
++            and rollout_config.load_format == "dummy"
++            and config.rollout.nnodes > 0
++        )
++        if initial_weight_sync:
++            if rollout_config.checkpoint_engine.backend in (None, "naive"):
++                raise ValueError("Standalone dummy rollout requires a non-naive checkpoint engine for initial sync.")
++            model_config = config.actor_rollout_ref.model
++            if model_config.get("lora_rank", 0) > 0 or model_config.get("lora", {}).get("rank", 0) > 0:
++                raise ValueError("Standalone dummy rollout currently requires full-model training, not LoRA.")
++            mtp_config = rollout_config.get("mtp")
++            if mtp_config and mtp_config.get("enable", False) and mtp_config.get("enable_rollout", False):
++                raise ValueError("Standalone dummy rollout with MTP needs separate drafter-weight verification.")
++            print("[ASYNC MAIN] Keeping dummy load; full actor weight sync is required before first generation.")
++        with open_dict(rollout_config):
++            rollout_config.initial_weight_sync = initial_weight_sync
+         pprint(OmegaConf.to_container(config, resolve=True))
+         OmegaConf.resolve(config)
+ 
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -98,6 +98,10 @@
+ # Which loader to use for rollout model weights: dummy, hf, megatron, etc.
+ # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
+ load_format: dummy
++
++# Internal contract: the fully async runner syncs actor weights before generation.
++# Leave false for standalone inference, teacher and reward models.
++initial_weight_sync: false
+ 
+ # for huge model, layered summon can save memory (prevent OOM) but make it slower
+ layered_summon: False
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -247,6 +247,8 @@
+     enable_prefix_caching: bool = True
+ 
+     load_format: str = "dummy"
++    # Set by the fully async runner, which awaits a full weight sync before generation.
++    initial_weight_sync: bool = False
+ 
+     layered_summon: bool = False
+ 
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -160,9 +160,7 @@
+         self.global_steps = None
+         self._warned_missing_spec_decode_stats = False
+ 
+-        if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+-            logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
+-            self.config.load_format = "auto"
++        self._configure_load_format()
+ 
+         # used for http server
+         self._server_address = ray.util.get_node_ip_address().strip("[]")
+@@ -529,6 +527,8 @@
+         Args:
+             kv_transfer_params: vLLM KV-transfer payload for PD requests.
+         """
++        if self._requires_initial_weight_sync and self.global_steps is None:
++            raise RuntimeError("Dummy rollout cannot generate before the initial actor weight sync completes.")
+         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+             return await self._pd_dispatch(
+                 prompt_ids,
+@@ -848,6 +848,8 @@
+ 
+     async def set_global_steps(self, global_steps: int):
+         """Set the global steps of the model weights."""
++        if self._requires_initial_weight_sync and self.global_steps is None and global_steps is not None:
++            logger.info("Initial actor weight sync complete; dummy rollout ready at version %s", global_steps)
+         self.global_steps = global_steps
+ 
+     async def wait_for_requests_to_drain(self):
+@@ -960,6 +962,22 @@
+     def _init_model_config(self, model_config):
+         """Initialise model_config. Override when a specific dataclass_type is needed."""
+         return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
++
++    def _configure_load_format(self) -> None:
++        """Allow standalone dummy initialization only with an initial full-sync contract."""
++        self._requires_initial_weight_sync = (
++            self.rollout_mode == RolloutMode.STANDALONE
++            and self.config.load_format == "dummy"
++            and self.config.initial_weight_sync
++        )
++        if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
++            if self._requires_initial_weight_sync:
++                logger.info(
++                    "Keeping dummy load for standalone rollout; generation waits for initial actor weight sync."
++                )
++            else:
++                logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
++                self.config.load_format = "auto"
+ 
+     def _validate_configs(self) -> None:
+         """Validate config/model_config after initialisation."""
