@@ -1,0 +1,6 @@
+{
+  "original_ms": 7.254274300066754,
+  "vectorized_ms": 0.2561977005098015,
+  "speedup": 28.31514211732444,
+  "scope": "CPU advantage microbenchmark only; not end-to-end training"
+}
