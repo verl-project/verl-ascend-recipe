@@ -1,6 +1,10 @@
 # Qwen3-8B RLOO FSDP2 + vLLM Ascend Recipe
 ---
 
+当前 8 卡 910B3 复现、算法补丁与验收状态见
+[`PRACTICE_ISSUE79.md`](PRACTICE_ISSUE79.md)。下文的 20 步结果是历史实验，不能代替当前 100 步验收。
+本次 PR 更新仅提交文档与结果文件；新增补丁、测试和脚本改动目前位于本地/实验服务器工作树，尚待单独代码提交。
+
 ### 1. 范围与验收链路
 
 提供 Qwen3-8B 在昇腾 NPU 上的 RLOO训练配方：
@@ -134,8 +138,10 @@ actor_rollout_ref.model.trust_remote_code=True
 | `rollout.name` | `vllm` | 使用 vLLM Ascend rollout |
 | `free_cache_engine` | `True` | 训推切换时释放 KV cache |
 
-当前交付中的“算法优化实现”是 RLOO 参数组合和 Ascend 执行配置，不包含对 verl RLOO
-核心数学实现的改写。验收方若要求算法源码变更，应另行补充核心代码提交。
+新增 `patch/verl_rloo_vectorized.patch`，使用分组 scatter reduction 计算 leave-one-out
+baseline，保留原目标函数、单样本组行为和 response mask。应用方法见
+[`patch/README.md`](patch/README.md)，公式对照测试见 `tests/test_rloo_vectorized.py`。
+该补丁独立于模型配置补丁，运行训练前需要同时应用。
 
 ### 8. 实测结果
 
