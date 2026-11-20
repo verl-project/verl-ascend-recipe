@@ -32,7 +32,7 @@ bash /path/to/verl-ascend-recipe/DeepSeek-V4-Flash/patch/A3/install.sh
 - 不再单独安装 Triton-Ascend；Transformers 安装版本改为 `5.14.1`。
 - verl、MindSpeed、MindSpeed-LLM 在进入仓库目录后，先 checkout 官方分支，再 checkout 上表官方 commit。
 
-2026-11-17 已按当前 `code/` 中七个仓库的实际 HEAD 更新上表和安装脚本，并对每个仓库显式 checkout 完整 40 位 SHA。原有 33 个 A3 补丁、4 个严格断点续训补丁及 runtime-env 重建补丁合计 38 个。安装脚本通过 `bash -n`、checkout/patch 顺序和失败中止检查。另在干净 worktree 中执行与安装脚本等价的源码重建（跳过 pip 安装），包括 vLLM 的 `use_existing_torch.py --prefix`、MindSpeed-LLM model provider 复制及全部补丁；重建后的七仓 Git 可见源码改动在文件集合、类型、权限和内容上均与当前 `code/` 工作树一致。
+2026-11-17 已按当前 `code/` 中七个仓库的实际 HEAD 更新上表和安装脚本，并对每个仓库显式 checkout 完整 40 位 SHA。当前包含 33 个 A3 功能补丁和 4 个严格断点续训补丁，合计 37 个。安装脚本通过 `bash -n`、checkout/patch 顺序和失败中止检查。
 
 ## 严格断点续训补丁总览
 
@@ -305,7 +305,7 @@ done
 
 ## verl 补丁
 
-补丁位于 [verl/](verl/) 目录，按 **01 → 17** 顺序应用。每个补丁基于前面补丁应用后的代码，以下说明对应当前最终内容。
+补丁位于 [verl/](verl/) 目录，按 **01 → 16** 顺序应用。每个补丁基于前面补丁应用后的代码，以下说明对应当前最终内容。
 
 应用基线：`91c297dc8d9991b79c90cad5b50683a5d6d8c02b`。源仓库根目录是 `/opt/tiger/verl_npu`，其内部 HEAD 为 `08a8864c5888d140c9df9d0fa0f1ba01e3ed2d89`。补丁在目标仓库根目录应用。
 
@@ -331,7 +331,6 @@ done
 | [14-rollout-profiling-lifecycle.patch](verl/14-rollout-profiling-lifecycle.patch) | rollout profiler 启停与异常清理 |
 | [15-speculative-metrics-aggregation.patch](verl/15-speculative-metrics-aggregation.patch) | speculative decode 分段计数聚合 |
 | [16-strict-checkpoint-resume.patch](verl/16-strict-checkpoint-resume.patch) | checkpoint 原子发布、严格恢复、TransferQueue 状态和进程内 DCP writer |
-| [17-runtime-environment-packaging.patch](verl/17-runtime-environment-packaging.patch) | Ray py_modules 源码分发、上传排除项和当前 HCCL/vLLM 环境 |
 
 ### [01-mindspeed-model-config.patch](verl/01-mindspeed-model-config.patch)
 
@@ -551,18 +550,6 @@ done
 - async trainer 恢复在途 prompt 后跳过重复 warmup，并为 rollout 控制 RPC 保留额外 actor 并发余量。
 - checkpoint retention 只清理已经发布且不受当前恢复源保护的旧 step。
 
-### [17-runtime-environment-packaging.patch](verl/17-runtime-environment-packaging.patch)
-
-**目的**：重建当前 `code/verl/verl/trainer/runtime_env.yaml`，保证 Ray worker 使用当前 code 目录中的全部源码快照，而不是各节点可能过期的 editable checkout。
-
-- 通过 `py_modules` 分发 mbridge、Megatron-LM、MindSpeed、MindSpeed-LLM、vLLM 和 vLLM-Ascend 的 Python 包目录。
-- working-dir 继续上传 verl，并排除 Git 元数据、文档、测试、日志、缓存和 egg-info。
-- 固定 `HCCL_BUFFSIZE=250`、vLLM 0.30 runner 环境和 protobuf overlay。
-- socket interface/family 仅保留注释示例，不在 runtime-env 中强制覆盖，由 worker 节点基础环境选择。
-
-该补丁包含 `/opt/tiger/code-pt/code` 的绝对路径，只适用于当前目录布局；迁移安装目录时必须同步调整 `py_modules` 路径。
-
-
 ## A3 补丁应用与验证
 
 各目录编号独立，请分别在对应仓库的干净 checkout 中应用。先 checkout 该仓库上述基线 SHA，再将 `PATCH_DIR` 指向对应目录，例如在 verl 仓库根目录执行：
@@ -576,7 +563,7 @@ for patch in "$PATCH_DIR"/*.patch; do
 done
 ```
 
-verl 已按最终功能重新分组，功能补丁之间共享源码上下文；在上述基线上按 01–17 顺序应用整套。
+verl 已按最终功能重新分组，功能补丁之间共享源码上下文；在上述基线上按 01–16 顺序应用整套。
 
 原有 vLLM、vLLM-Ascend 和 verl 01–15 补丁均已在干净临时 checkout 中逐个验证 `git apply` 和 `git am`。新增的四份严格断点续训补丁在当前 A3 前序代码树上通过 `git apply --check`、实际应用、`git apply --reverse --check` 和 Python 语法检查；重命名后的 A3 文件与 `07_checkpoint_single_patch` 原文件逐字一致。
 

@@ -1,6 +1,6 @@
 # DeepSeek-V4-Flash on Atlas A3
 
-本目录提供 DeepSeek-V4-Flash 在 Atlas A3 上进行 RLHF 后训练所需的源码补丁和安装入口。当前补丁基于 `code/` 下已验证的七个源码仓库整理，共 38 个，详细功能和应用顺序见 [patch-read.md](./patch-read.md)。
+本目录提供 DeepSeek-V4-Flash 在 Atlas A3 上进行 RLHF 后训练所需的源码补丁和安装入口。当前补丁基于 `code/` 下已验证的七个源码仓库整理，共 37 个，详细功能和应用顺序见 [patch-read.md](./patch-read.md)。
 
 ## 环境版本
 
@@ -31,8 +31,6 @@ bash /path/to/verl-ascend-recipe/DeepSeek-V4-Flash/patch/A3/install.sh
 
 [install.sh](./install.sh) 会克隆并固定上表 commit，安装依赖，然后按编号应用各仓库补丁。每份补丁在应用前都会执行 `git apply --check`，任何一步失败都会立即停止。
 
-2026-11-17 已在干净 worktree 中执行与安装脚本等价的源码重建（跳过 pip 安装），包括 vLLM 的 `use_existing_torch.py --prefix`、MindSpeed-LLM model provider 复制以及全部 38 个补丁。重建后的七个仓库与当前 `code/` 工作树逐文件比较，文件集合、类型、权限和内容均一致。
-
 ## 权重下载与反量化
 
 1. 从 [Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base) 下载 DeepSeek-V4-Flash-Base 权重和配置。
@@ -54,22 +52,38 @@ bash /path/to/verl-ascend-recipe/DeepSeek-V4-Flash/patch/A3/install.sh
 
 ## 训练效果
 
-实验记录：[run_20261113_68293468](https://ml.bytedance.net/experiment/tracking/run_detail?ProjectId=project_20260820_e3257ed8&RunId=run_20261113_68293468&Color=0abde3)
 
-以下四项曲线需要从内网 Tracking 页面以原始分辨率导出。当前仓库暂不放置虚构或失真的占位图；导出后建议保存到 `images/` 目录并使用下列文件名。
+### 性能结果
 
-### Throughput
+#### 吞吐量、单步耗时与 token 数
 
-<!-- 导出为 ./images/throughput.png 后在此处添加：![Throughput](./images/throughput.png) -->
+<img src="./figure/perf.png" alt="吞吐量、单步耗时与 token 数" width="75%">
+
+#### 平均 prompt 长度
+
+<img src="./figure/prompt.png" alt="平均 prompt 长度" width="25%">
+
+#### 平均 response 长度
+
+<img src="./figure/response.png" alt="平均 response 长度" width="25%">
+
+#### 训练各阶段耗时
+
+![训练各阶段耗时](./figure/timing.png)
 
 ### Rewards
 
-<!-- 导出为 ./images/rewards.png 后在此处添加：![Rewards](./images/rewards.png) -->
+<img src="./figure/rewards.png" alt="训练奖励均值" width="25%">
 
-### LogP diff mean
 
-<!-- 导出为 ./images/logpdiffmean.png 后在此处添加：![LogP diff mean](./images/logpdiffmean.png) -->
+### 训推一致性
 
-### Pearson
+![训推概率一致性](./figure/logpdiff.png)
 
-<!-- 导出为 ./images/pearson.png 后在此处添加：![Pearson](./images/pearson.png) -->
+### 验证集准确率
+
+<img src="./figure/acc.png" alt="验证集准确率" width="25%">
+
+### DSpark 接受长度与接受率
+
+<img src="./figure/dspark.png" alt="DSpark 接受长度与接受率" width="50%">
