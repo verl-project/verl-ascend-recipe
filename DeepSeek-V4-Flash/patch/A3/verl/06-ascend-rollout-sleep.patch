@@ -1,0 +1,143 @@
+From 7e39877311c318c376b39f780bfbb46dcfdecd09 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:33 +0000
+Subject: [PATCH] fix: synchronize Ascend rollout sleep and resume
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: sleep
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/third_party/vllm/__init__.py             |  5 ++-
+ verl/utils/vllm/ascend_sleep.py               | 38 +++++++++++++++++++
+ verl/workers/engine_workers.py                |  2 +
+ verl/workers/rollout/vllm_rollout/utils.py    |  3 ++
+ .../rollout/vllm_rollout/vllm_async_server.py | 10 +++--
+ 5 files changed, 53 insertions(+), 5 deletions(-)
+ create mode 100644 verl/utils/vllm/ascend_sleep.py
+
+diff --git a/verl/third_party/vllm/__init__.py b/verl/third_party/vllm/__init__.py
+index 505c90228fde4fc95b770cd407cf30e36719a41e..1e3bbfc4863cf4e43e081caf51b2c973cfcab44b 100644
+--- a/verl/third_party/vllm/__init__.py
++++ b/verl/third_party/vllm/__init__.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
+ from importlib.metadata import PackageNotFoundError, version
+ 
+ from packaging import version as vs
+@@ -39,8 +40,8 @@ if package_version is None:
+             f"vllm versions are 0.18.0+"
+         )
+ elif is_npu_available:
+-    # sleep_mode=2 is not supported on vllm-ascend for now, will remove this restriction when this ability is ready.
+-    VLLM_SLEEP_LEVEL = 1
++    # sleep_mode=2 stays opt-in via VLLM_SLEEP_LEVEL (validated for DSV4 RL colocate).
++    VLLM_SLEEP_LEVEL = int(os.environ.get("VLLM_SLEEP_LEVEL", "1"))
+     from vllm import LLM
+     from vllm.distributed import parallel_state
+ elif vs.parse(package_version) >= vs.parse("0.18.0"):
+diff --git a/verl/utils/vllm/ascend_sleep.py b/verl/utils/vllm/ascend_sleep.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..19be985eab68df684202531a072d05e9dd4c48b8
+--- /dev/null
++++ b/verl/utils/vllm/ascend_sleep.py
+@@ -0,0 +1,38 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Synchronize Ascend work before sleep releases device memory mappings."""
++
++from functools import wraps
++
++
++def patch_ascend_allocator_sleep():
++    import torch
++    from vllm_ascend.device_allocator.camem import CaMemAllocator
++
++    original_sleep = CaMemAllocator.sleep
++    if getattr(original_sleep, "_verl_synchronize_before_sleep", False):
++        return
++
++    @wraps(original_sleep)
++    def synchronized_sleep(self, *args, **kwargs):
++        # CaMemAllocator unmaps weights/KV memory before empty_cache() performs
++        # its synchronization. Queued graph kernels can still use those mappings.
++        # Wait for all streams before the first unmap, including level 2 sleep
++        # which has no synchronous weight copies to the host.
++        torch.npu.synchronize()
++        return original_sleep(self, *args, **kwargs)
++
++    synchronized_sleep._verl_synchronize_before_sleep = True
++    CaMemAllocator.sleep = synchronized_sleep
+\ No newline at end of file
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index 697ccce269e62c5be3c60598bd03ae1704401719..6b102a01262cd631ae7f31fa88bd561918a7eea2 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -19,6 +19,7 @@ from copy import deepcopy
+ from functools import partial
+ from itertools import chain
+ from typing import Optional
++import asyncio
+ 
+ import psutil
+ import torch
+@@ -813,6 +814,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         # 4. resume kv_cache
+         if self.config.rollout.free_cache_engine:
++            await asyncio.to_thread(torch.distributed.barrier)
+             await self.rollout.resume(tags=["kv_cache"])
+         log_gpu_memory_usage("After resume kv_cache", logger=logger)
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 66228735155ff450e86d5dbbb58f318102aa8daa..587782e5c1d57ea6b244f96ee6a6377e97d0a77c 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -180,6 +180,9 @@ class vLLMColocateWorkerExtension:
+         # please remove the VLLM_ASCEND_REQUIRED_ENV_VARS variable replacement action.
+         # This is only a fix for vllm version < v0.13.0.
+         if is_npu_available:
++            from verl.utils.vllm.ascend_sleep import patch_ascend_allocator_sleep
++
++            patch_ascend_allocator_sleep()
+             for k in VLLM_ASCEND_REQUIRED_ENV_VARS:
+                 if k not in os.environ:
+                     os.environ[k] = VLLM_ASCEND_REQUIRED_ENV_VARS[k]
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 2ae2bd5e7ba3cddabc2bb1af4a6077279873a6f3..19581c9f003eadb878bdb40f4c2efdb3be0a84cc 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -1130,10 +1130,14 @@ class vLLMHttpServer:
+         )
+         # MTP drafter-only weights are initialized by vLLM and are not guaranteed
+         # to be restored by actor weight sync after level 2 sleep discards them.
+-        # lora only update adapter weights, so set sleep level to 1
+-        # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
+-        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
++        # lora only update adapter weights, so set sleep level to 1.
++        # On NPU the level is configurable via VLLM_SLEEP_LEVEL (default 1).
++        if mtp_rollout_enabled or self.lora_as_adapter:
+             sleep_level = 1
++        elif is_torch_npu_available(check_device=False):
++            from verl.third_party.vllm import VLLM_SLEEP_LEVEL
++
++            sleep_level = VLLM_SLEEP_LEVEL
+         else:
+             sleep_level = 2
+         await self.engine.sleep(level=sleep_level)

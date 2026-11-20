@@ -1,0 +1,118 @@
+diff --git a/mindspeed/core/megatron_basic/megatron_basic.py b/mindspeed/core/megatron_basic/megatron_basic.py
+index 0c5528b01610206c6b40412d83f8746ab7824b48..2119eaadde8baa5bd3bff81c3c8264d45ea6fef2 100644
+--- a/mindspeed/core/megatron_basic/megatron_basic.py
++++ b/mindspeed/core/megatron_basic/megatron_basic.py
+@@ -132,8 +132,7 @@ def get_device_arch_version():
+     return 8
+ 
+ 
+-@staticmethod
+-def preload_tensors(write_buckets, non_blocking=True):
++def preload_tensors(self, write_buckets, non_blocking=True):
+     """
+     Preloads tensors in `state_dict` to host memory via CPU memory.
+ 
+@@ -147,7 +146,7 @@ def preload_tensors(write_buckets, non_blocking=True):
+     for bucket in write_buckets:
+         file_name, storage_key, (bytes_data, tensor_data) = bucket
+         tensor_data = [
+-            (item, tensor.to("cpu", non_blocking=False) if not tensor.is_cpu else tensor.clone())
++            (item, tensor.to("cpu", non_blocking=False) if not tensor.is_cpu else tensor)
+             for item, tensor in tensor_data
+         ]
+         result.append((file_name, storage_key, (bytes_data, tensor_data)))
+diff --git a/mindspeed/core/optimizer/swap_optimizer/swap_optimizer.py b/mindspeed/core/optimizer/swap_optimizer/swap_optimizer.py
+index 86707db54fdf5b96645230092213d0396ed01503..524b17da24d6b5d029bd2af750712775ba115bd4 100644
+--- a/mindspeed/core/optimizer/swap_optimizer/swap_optimizer.py
++++ b/mindspeed/core/optimizer/swap_optimizer/swap_optimizer.py
+@@ -30,8 +30,75 @@ class SwapDistributedOptimizer(MegatronDistributedOptimizer):
+     # Cached swap_optimizer_times from args (set in __init__)
+     swap_optimizer_times = 16
+ 
++    def _rebuild_model_param_group_index_map(self):
++        rebuilt_map = {}
++        group_iter = zip(
++            self.model_fp32_groups,
++            self.shard_fp32_groups,
++            self.model_float16_groups,
++            self.shard_fp32_from_float16_groups,
++        )
++        for group_index, (
++            model_fp32_group,
++            shard_fp32_group,
++            model_float16_group,
++            shard_fp32_from_float16_group,
++        ) in enumerate(group_iter):
++            paired_params = [
++                *zip(model_fp32_group, shard_fp32_group),
++                *zip(model_float16_group, shard_fp32_from_float16_group),
++            ]
++            optimizer_params = self.optimizer.param_groups[group_index]['params']
++            if len(paired_params) != len(optimizer_params):
++                raise RuntimeError('Checkpoint model/main parameter count mismatch')
++            for group_order, (model_param, main_param) in enumerate(paired_params):
++                if optimizer_params[group_order] is not main_param:
++                    raise RuntimeError('Checkpoint model/main parameter pairing mismatch')
++                rebuilt_map[model_param] = (group_index, group_order)
++        if len(rebuilt_map) != len(self.model_param_group_index_map):
++            raise RuntimeError('Checkpoint model parameter map is incomplete')
++        self.model_param_group_index_map = rebuilt_map
++
++    def _get_main_param_and_optimizer_states(self, model_param):
++        if self.config.use_precision_aware_optimizer:
++            return super()._get_main_param_and_optimizer_states(model_param)
++        group_index, group_order = self.model_param_group_index_map[model_param]
++        main_param = self.optimizer.param_groups[group_index]['params'][group_order]
++        tensors = {'param': main_param, **self.optimizer.state[main_param]}
++        cpu_state = self.param_to_cpu_states_map.get(main_param)
++        if cpu_state is not None:
++            for key in ('param', *self.state_keys):
++                if cpu_state.get(key) is not None:
++                    tensors[key] = cpu_state[key]
++        return {key: value for key, value in tensors.items() if value is not None}
++
++    def sharded_param_state_fs_model_space(self, model_sharded_state_dict, is_loading=False):
++        torch.cuda.current_stream().synchronize()
++        for stream in (self.swap_to_device_stream, self.swap_to_host_stream):
++            if stream is not None:
++                stream.synchronize()
++        return super().sharded_param_state_fs_model_space(model_sharded_state_dict, is_loading)
++
++    def _set_main_param_and_optimizer_states(self, model_param, tensors):
++        group_index, group_order = self.model_param_group_index_map[model_param]
++        main_param = self.optimizer.param_groups[group_index]['params'][group_order]
++        cpu_state = self.param_to_cpu_states_map.get(main_param)
++        if not cpu_state:
++            # fp32 no-swap 参数的 device 状态是权威副本，走 MCore 默认实现。
++            return super()._set_main_param_and_optimizer_states(model_param, tensors)
++
++        # swap 优化器会把 main_param 及其状态换出到 host，换出后 device 张量
++        # storage 为 0（data pointer 为 NULL），直接 copy_ 会触发
++        # aclrtMemcpy "dst cannot be a NULL pointer"。加载结果写入 CPU 权威
++        # 副本，下一次 swap_to_device 再搬回 device。
++        for key, value in tensors.items():
++            target = cpu_state.get(key)
++            if target is not None:
++                target.copy_(value)
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
++        self._rebuild_model_param_group_index_map()
+         self.is_distributed_optimizer = hasattr(self, 'per_model_buffers')
+         self.optimizer.is_swap_optimizer = True
+         if SwapDistributedOptimizer.swap_to_device_stream is None:
+@@ -582,6 +649,14 @@ def swap_adamw_step(self, closure=None):
+         else:
+             group['step'] = torch.tensor(1, dtype=torch.int64, device=torch.cuda.current_device())
+ 
++    # torch Optimizer.load_state_dict 会用 ckpt 里的内容整体替换 param_groups 中的
++    # dict 对象，__init__ 里缓存的 param_to_group_map 仍指向旧 group（不含刚更新的
++    # 'step'），这里按当前 param_groups 重建，避免首次 step 读 group['step'] 时 KeyError。
++    self.param_to_group_map = {}
++    for group in self.param_groups:
++        for param in group['params']:
++            self.param_to_group_map[param] = group
++
+     swap_count = 0
+     params_list = list(self.param_to_group_map.keys())
+     if SwapDistributedOptimizer.swap_optimizer_times == 0:

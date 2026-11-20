@@ -1,0 +1,523 @@
+From 68e264303c2c8b4a51b18731d31f73505f1658a4 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:33 +0000
+Subject: [PATCH] fix: consolidate vLLM inference version compatibility
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: version
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/utils/vllm/ascend_moe.py                 |  81 +++++++++++++
+ verl/utils/vllm/npu_vllm_patch.py             | 113 +++++++++++++++++-
+ verl/utils/vllm/patch.py                      |  10 ++
+ verl/workers/engine_workers.py                |  13 ++
+ .../workers/rollout/vllm_rollout/async_llm.py |  73 +++++++++++
+ verl/workers/rollout/vllm_rollout/utils.py    |   4 +
+ .../rollout/vllm_rollout/vllm_async_server.py |  70 ++++++++---
+ 7 files changed, 342 insertions(+), 22 deletions(-)
+ create mode 100644 verl/utils/vllm/ascend_moe.py
+ create mode 100644 verl/workers/rollout/vllm_rollout/async_llm.py
+
+diff --git a/verl/utils/vllm/ascend_moe.py b/verl/utils/vllm/ascend_moe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..60576fce6c2687b4ca8d317174cb4ed5a9a574b7
+--- /dev/null
++++ b/verl/utils/vllm/ascend_moe.py
+@@ -0,0 +1,81 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Reload initialized Ascend BF16 experts without changing their inference layout."""
++
++import importlib
++from functools import wraps
++
++def _get_unquantized_fused_moe_method():
++    new_module_name = "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
++    try:
++        module = importlib.import_module(new_module_name)
++    except ModuleNotFoundError as error:
++        # Fall back only for vLLM versions predating the module split. Missing
++        # dependencies inside the new module must remain visible.
++        if error.name != new_module_name:
++            raise
++        module = importlib.import_module("vllm.model_executor.layers.fused_moe.layer")
++    return module.UnquantizedFusedMoEMethod
++
++def _transpose_weight_loader(weight_loader):
++    @wraps(weight_loader)
++    def load_weight(param, loaded_weight, *args, **kwargs):
++        # is_transposed tells vLLM to shard along the transposed intermediate
++        # dimension. Keep its expert mapping and TP slicing intact.
++        return weight_loader(param, loaded_weight.transpose(-1, -2).contiguous(), *args, **kwargs)
++
++    load_weight._verl_ascend_transposed = True
++    return load_weight
++
++
++def _keep_inference_layout(layer):
++    # Initial model loading has already padded/transposed these weights. Reloads
++    # write directly into that storage, including the storage captured by ACL graphs.
++    return None
++
++
++def patch_ascend_moe_weight_loading(model):
++    """Patch an *initialized* Ascend model for repeated unquantized MoE reloads.
++
++    Ascend's initial post-processing transposes w13/w2 from checkpoint layout
++    into the layout used by grouped matmul. vLLM's ordinary loader otherwise
++    writes subsequent HF weights into the wrong axes. In particular, square
++    w13 matrices can silently load incorrectly while rectangular w2 fails.
++
++    Call after the generic MoE loader patch, which can replace weight_loader.
++    Only the expert post-processing is skipped; linear/attention post-processing
++    must still run to refresh derived weights such as DeepSeek's FP32 copies.
++    """
++    unquantized_fused_moe_method = _get_unquantized_fused_moe_method()
++
++    for module in model.modules():
++        quant_method = getattr(module, "quant_method", None)
++        if not isinstance(quant_method, unquantized_fused_moe_method):
++            continue
++
++        # New vLLM keeps these on RoutedExperts under MoERunner. Inspect direct
++        # parameters so forwarded properties on the parent do not patch twice.
++        params = dict(module.named_parameters(recurse=False))
++        if not all(name in params for name in ("w13_weight", "w2_weight")):
++            continue
++
++        for name in ("w13_weight", "w2_weight"):
++            param = params[name]
++            weight_loader = getattr(param, "weight_loader", None) or module.weight_loader
++            if not getattr(weight_loader, "_verl_ascend_transposed", False):
++                param.weight_loader = _transpose_weight_loader(weight_loader)
++            param.is_transposed = True
++
++        quant_method.process_weights_after_loading = _keep_inference_layout
+diff --git a/verl/utils/vllm/npu_vllm_patch.py b/verl/utils/vllm/npu_vllm_patch.py
+index 7467fc370efca6e256dd7e184f67f4c6c4b886a5..f9df74c0421ba1eaf26f8f586ea5d83afe4a76d3 100644
+--- a/verl/utils/vllm/npu_vllm_patch.py
++++ b/verl/utils/vllm/npu_vllm_patch.py
+@@ -15,11 +15,108 @@
+ # limitations under the License.
+ 
+ 
++import importlib
++import logging
++import sys
++from contextlib import contextmanager
+ from functools import wraps
++from types import ModuleType
+ 
+ from verl.utils.device import is_torch_npu_available
+ 
+ 
++_QWEN35_WORKER_PATCH = "vllm_ascend.patch.worker.patch_qwen3_5"
++_ASCEND_GDN_OPS = "vllm_ascend.ops.gdn"
++logger = logging.getLogger(__name__)
++
++@contextmanager
++def _without_unavailable_gdn_imports():
++    """Let unrelated Ascend worker patches initialize without optional GDN."""
++    from vllm.model_executor.custom_op import op_registry_oot
++
++    missing = object()
++    previous_modules = {
++        name: sys.modules.get(name, missing) for name in (_QWEN35_WORKER_PATCH, _ASCEND_GDN_OPS)
++    }
++
++    qwen_patch_stub = ModuleType(_QWEN35_WORKER_PATCH)
++    gdn_stub = ModuleType(_ASCEND_GDN_OPS)
++    unavailable_gdn = type("_UnavailableQwen35GatedDeltaNetAttention", (), {})
++    gdn_stub.AscendGatedDeltaNetAttention = unavailable_gdn
++    sys.modules[_QWEN35_WORKER_PATCH] = qwen_patch_stub
++    sys.modules[_ASCEND_GDN_OPS] = gdn_stub
++
++    try:
++        yield
++    finally:
++        try:
++            import vllm_ascend.utils as ascend_utils
++
++            if ascend_utils.REGISTERED_ASCEND_OPS.get("GatedDeltaNetAttention") is unavailable_gdn:
++                ascend_utils.REGISTERED_ASCEND_OPS.pop("GatedDeltaNetAttention")
++        except (AttributeError, ImportError):
++            pass
++        if op_registry_oot.get("GatedDeltaNetAttention") is unavailable_gdn:
++            op_registry_oot.pop("GatedDeltaNetAttention")
++        for name, previous in previous_modules.items():
++            if previous is missing:
++                sys.modules.pop(name, None)
++            else:
++                sys.modules[name] = previous
++
++def patch_vllm_ascend_optional_gdn() -> bool:
++    """Warn and skip GDN registration when its optional dependencies are absent."""
++    import vllm_ascend.utils as ascend_utils
++
++    original_adapt_patch = ascend_utils.adapt_patch
++    if getattr(original_adapt_patch, "_verl_optional_gdn_patched", False):
++        return False
++
++    gdn_available = None
++
++    def has_gdn_support():
++        nonlocal gdn_available
++        if gdn_available is None:
++            try:
++                importlib.import_module(_ASCEND_GDN_OPS)
++                gdn_available = True
++            except ImportError as error:
++                gdn_available = False
++                logger.warning(
++                    "GDN support is unavailable (%s); skipping the Qwen3.5 GDN worker patch "
++                    "and GatedDeltaNetAttention registration.",
++                    error,
++                )
++        return gdn_available
++
++    @wraps(original_adapt_patch)
++    def adapt_patch(is_global_patch=False):
++        if is_global_patch or has_gdn_support():
++            return original_adapt_patch(is_global_patch=is_global_patch)
++        with _without_unavailable_gdn_imports():
++            return original_adapt_patch(is_global_patch=False)
++
++    original_register_customop = ascend_utils.register_ascend_customop
++
++    @wraps(original_register_customop)
++    def register_ascend_customop(vllm_config=None):
++        if has_gdn_support():
++            return original_register_customop(vllm_config)
++        with _without_unavailable_gdn_imports():
++            return original_register_customop(vllm_config)
++
++    adapt_patch._verl_optional_gdn_patched = True
++    register_ascend_customop._verl_optional_gdn_patched = True
++    ascend_utils.adapt_patch = adapt_patch
++    ascend_utils.register_ascend_customop = register_ascend_customop
++
++    # NPUWorker imports this function at module scope. Rebind the saved alias
++    # when vLLM resolved the worker class before importing VERL's extension.
++    worker_module = sys.modules.get("vllm_ascend.worker.worker")
++    if worker_module is not None:
++        worker_module.register_ascend_customop = register_ascend_customop
++    return True
++
+ def vllm_v013_weight_loader_method_wrapper(fn):
+     @wraps(fn)
+     def wrapper(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
+@@ -80,7 +177,17 @@ def apply_npu_vllm_patches() -> None:
+         return
+ 
+     # Disable flash_attn in RotaryEmbedding (NPU)
+-    from vllm.model_executor.layers.fused_moe import FusedMoE
+-
+     patch_vllm013_rotary_emb()
+-    _patch_legacy_fused_moe_weight_loader(FusedMoE)
++
++    # The FusedMoE transpose wrapper is only valid for legacy vLLM (<0.15);
++    # on newer vLLM it scrambles NPU MoE weights (train/rollout kl ~= 1.85 on DSV4).
++    import vllm
++    from packaging import version
++
++    if version.parse(vllm.__version__) >= version.parse("0.30.0"):
++        patch_vllm_ascend_optional_gdn()
++
++    if version.parse(vllm.__version__) < version.parse("0.15.0"):
++        from vllm.model_executor.layers.fused_moe import FusedMoE
++
++        _patch_legacy_fused_moe_weight_loader(FusedMoE)
+diff --git a/verl/utils/vllm/patch.py b/verl/utils/vllm/patch.py
+index 1e2224f643b570a0ea78995984f654dd5f5e3670..cfc66e0cab06ead17e7acdd8a879b9a2dd4e053a 100644
+--- a/verl/utils/vllm/patch.py
++++ b/verl/utils/vllm/patch.py
+@@ -73,6 +73,16 @@ try:
+ except ImportError:
+     pass
+ 
++try:
++    try:
++        from vllm_ascend.models.deepseek_v4 import AscendDeepseekV4ForCausalLM
++    except ImportError:
++        from vllm_ascend.models.deepseek_v4.model import AscendDeepseekV4ForCausalLM
++
++    SUPPORTED_MOE_MODELS.append(AscendDeepseekV4ForCausalLM)
++except ImportError:
++    pass
++
+ 
+ def patch_vllm_moe_model_weight_loader(model):
+     # this is a work around to load the weight of vllm fused moe model
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index 553b695e3ad3da26cea785539b2b0e5dc3941dd7..697ccce269e62c5be3c60598bd03ae1704401719 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -681,6 +681,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
+             )
+ 
++        # The rollout client imports vLLM-Ascend in this colocated process and
++        # may add its inference-only operator vendor. Keep that vendor in the
++        # separate vLLM server actor, while MindSpeed actor/ref use native CANN.
++        if get_device_name() == "npu" and self.config.actor.strategy == "mindspeed":
++            marker = "vllm_ascend/_cann_ops_custom"
++            for env_name in ("ASCEND_CUSTOM_OPP_PATH", "LD_LIBRARY_PATH"):
++                entries = os.environ.get(env_name, "").split(os.pathsep)
++                retained = [entry for entry in entries if entry and marker not in entry]
++                if retained:
++                    os.environ[env_name] = os.pathsep.join(retained)
++                else:
++                    os.environ.pop(env_name, None)
++
+         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
+         aggressive_empty_cache(force_sync=True)
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/async_llm.py b/verl/workers/rollout/vllm_rollout/async_llm.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a1c53ad7ec22d34e08f0058d395c358a5592a53
+--- /dev/null
++++ b/verl/workers/rollout/vllm_rollout/async_llm.py
+@@ -0,0 +1,73 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import asyncio
++
++from vllm.v1.engine.async_llm import AsyncLLM
++
++
++class PauseAwareAsyncLLM(AsyncLLM):
++    """Block request admission across rollout pause and weight updates.
++
++    Recent vLLM versions pause scheduling but still enqueue new requests.
++    Partial-rollout retries can then register requests after the abort and
++    restart the DP coordinator's running flag while the engines stay paused.
++    Serialize the short request submission with pause, keeping retries outside
++    both the output processor and EngineCore until generation resumes.
++    """
++
++    def __init__(self, *args, **kwargs):
++        self._admission_lock = asyncio.Lock()
++        self._generation_lifecycle_lock = asyncio.Lock()
++        self._generation_resumed = asyncio.Event()
++        self._generation_resumed.set()
++        self._pause_drained = False
++        super().__init__(*args, **kwargs)
++
++    async def _add_request(self, *args, **kwargs):
++        # Guard the point that registers output state and submits to EngineCore,
++        # including child requests and streaming input. Never hold this lock
++        # while waiting for generated tokens.
++        while True:
++            await self._generation_resumed.wait()
++            async with self._admission_lock:
++                # Pause may have closed admission while we waited for the lock.
++                if not self._generation_resumed.is_set():
++                    continue
++                return await super()._add_request(*args, **kwargs)
++
++    async def pause_generation(self, **kwargs):
++        """Close admission and wait for the engine's pause acknowledgement."""
++        async with self._generation_lifecycle_lock:
++            self._generation_resumed.clear()
++            self._pause_drained = False
++            async with self._admission_lock:
++                await super().pause_generation(**kwargs)
++                self._pause_drained = kwargs.get("mode", "abort") != "keep"
++
++    async def resume_generation(self):
++        """Reopen admission after the engine has resumed successfully."""
++        async with self._generation_lifecycle_lock:
++            await super().resume_generation()
++            self._pause_drained = False
++            self._generation_resumed.set()
++
++    async def wait_for_requests_to_drain(self, *args, **kwargs):
++        """Reuse a completed pause barrier or drain an unpaused engine."""
++        # A completed abort/wait pause is already a barrier across DP engines.
++        # The coordinator's asynchronous running flag can be stale; polling it
++        # again after pause adds no safety and can time out on idle engines.
++        if self._pause_drained:
++            return
++        await super().wait_for_requests_to_drain(*args, **kwargs)
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index a015e8fd0ae572cf0f1883db50d94b2e3a5f91b6..66228735155ff450e86d5dbbb58f318102aa8daa 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -276,6 +276,10 @@ class vLLMColocateWorkerExtension:
+             # TODO(wuxibin): not need anymore for newer vllm version.
+             for model in self._iter_all_models():
+                 patch_vllm_moe_model_weight_loader(model)
++                if is_npu_available:
++                    from verl.utils.vllm.ascend_moe import patch_ascend_moe_weight_loading
++
++                    patch_ascend_moe_weight_loading(model)
+ 
+         # =========================== step 2: receive weights and update ===========================
+         receiver = BucketedWeightReceiver(
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 55821b70d50ec7bfdce74bdca81c3383d1fb7617..2ae2bd5e7ba3cddabc2bb1af4a6077279873a6f3 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -53,6 +53,7 @@ from verl.workers.rollout.utils import (
+     qwen2_5_vl_dedup_image_tokens,
+     run_uvicorn,
+ )
++from verl.workers.rollout.vllm_rollout.async_llm import PauseAwareAsyncLLM
+ from verl.workers.rollout.vllm_rollout.utils import (
+     VLLM_LORA_INT_ID,
+     VLLM_LORA_NAME,
+@@ -64,7 +65,11 @@ from verl.workers.rollout.vllm_rollout.utils import (
+     get_vllm_max_lora_rank,
+ )
+ 
+-_VLLM_VERSION = version.parse(vllm.__version__)
++try:
++    _VLLM_VERSION = version.parse(vllm.__version__)
++except Exception:
++    # Custom vllm builds may have unparseable version strings.
++    _VLLM_VERSION = version.parse("0.23.0")
+ 
+ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
+     get_encoding()
+@@ -346,7 +351,18 @@ class vLLMHttpServer:
+             dp_args = {
+                 "data_parallel_size": self.config.data_parallel_size,
+                 "data_parallel_size_local": data_parallel_size_local,
+-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
++                # vLLM >= 0.30 interprets an explicit start rank on a
++                # non-headless API node (including rank 0) as hybrid DP load
++                # balancing.  This topology uses one API node with remote
++                # headless engines, so only the headless nodes need an
++                # explicit rank offset.  ``build_cli_args_from_config`` skips
++                # None and vLLM keeps the API node at rank 0. Older releases
++                # retain the explicit rank expected by their DP launcher.
++                "data_parallel_start_rank": (
++                    None
++                    if _VLLM_VERSION >= version.parse("0.30.0") and self.node_rank == 0
++                    else self.node_rank * data_parallel_size_local
++                ),
+                 "data_parallel_address": self._master_address,
+                 "data_parallel_rpc_port": self._dp_rpc_port,
+             }
+@@ -444,7 +460,9 @@ class vLLMHttpServer:
+         if "disable_log_stats" in fn_args:
+             kwargs["disable_log_stats"] = engine_args.disable_log_stats
+ 
+-        engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
++        engine_client = PauseAwareAsyncLLM.from_vllm_config(
++            vllm_config=vllm_config, usage_context=usage_context, **kwargs
++        )
+ 
+         # Don't keep the dummy data in memory
+         await engine_client.reset_mm_cache()
+@@ -674,18 +692,33 @@ class vLLMHttpServer:
+ 
+         # Re-key backend spec-decoding stats to the rollout-common names.
+         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+-            spec_decode_stats = getattr(final_res.metrics, "request_spec_decode_stats", None)
+-            if spec_decode_stats is None:
++            # vLLM 0.30 reports per-completion counters with a histogram of
++            # accepted draft tokens per verification step (including zero accepts).
++            spec_decode_metrics = getattr(final_res.outputs[0], "spec_decode_metrics", None)
++            num_draft_tokens = getattr(spec_decode_metrics, "num_draft_tokens", None)
++            histogram = getattr(spec_decode_metrics, "histogram", None)
++            num_accepted_tokens = num_verify_steps = None
++            if num_draft_tokens is not None and histogram is not None:
++                num_accepted_tokens = sum(i * count for i, count in enumerate(histogram))
++                num_verify_steps = sum(histogram)
++            else:
++                # Older backends attach already aggregated stats to RequestOutput.metrics.
++                spec_decode_stats = getattr(getattr(final_res, "metrics", None), "request_spec_decode_stats", None)
++                num_draft_tokens = getattr(spec_decode_stats, "num_draft_tokens", None)
++                num_accepted_tokens = getattr(spec_decode_stats, "num_accepted_tokens", None)
++                num_verify_steps = getattr(spec_decode_stats, "num_verify_steps", None)
++
++            if num_draft_tokens is None or num_accepted_tokens is None or num_verify_steps is None:
+                 if not self._warned_missing_spec_decode_stats:
+                     logger.warning(
+-                        "vLLM MTP rollout metrics do not include request_spec_decode_stats; "
++                        "vLLM MTP rollout metrics do not include complete per-request speculative decoding stats; "
+                         "speculative decoding acceptance metrics will be skipped."
+                     )
+                     self._warned_missing_spec_decode_stats = True
+             else:
+-                extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
+-                extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
+-                extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
++                extra_fields["spec_num_draft_tokens"] = num_draft_tokens
++                extra_fields["spec_num_accepted_tokens"] = num_accepted_tokens
++                extra_fields["spec_num_verify_steps"] = num_verify_steps
+         return TokenOutput(
+             token_ids=token_ids,
+             log_probs=log_probs,
+@@ -847,17 +880,16 @@ class vLLMHttpServer:
+         self.global_steps = global_steps
+ 
+     async def wait_for_requests_to_drain(self):
++        if self.node_rank != 0:
++            return
+         await self.engine.wait_for_requests_to_drain()
+ 
+     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
+         """Abort all ongoing generation requests.
+ 
+-        On vLLM >= 0.12.0, uses AsyncLLM.pause_generation() to abort in-flight
+-        requests, drain, and clear caches. The engine remains paused after this
+-        call — use resume_generation() to accept new requests (e.g. before
+-        validation).
+-
+-        On vLLM < 0.12.0, manually aborts each request and resets prefix cache.
++        Pause request admission before aborting in-flight requests, draining,
++        and clearing caches. The engine remains paused after this call; use
++        resume_generation() to accept new requests (e.g. before validation).
+ 
+         Returns:
+             dict[str, Any]: Dictionary containing:
+@@ -874,8 +906,8 @@ class vLLMHttpServer:
+             # Snapshot request IDs before pausing for reporting
+             request_ids = list(self.engine.output_processor.request_states.keys())
+ 
+-            # pause_generation with wait_for_inflight_requests=False will:
+-            # 1. Set engine to paused state (blocks new generate calls)
++            # PauseAwareAsyncLLM closes admission before pausing the scheduler:
++            # 1. Block new submissions, including partial-rollout retries
+             # 2. Abort all in-flight requests
+             # 3. Wait for requests to drain
+             # 4. Clear prefix and mm caches if clear_cache=True.
+@@ -893,8 +925,8 @@ class vLLMHttpServer:
+             return {"aborted_count": len(request_ids), "request_ids": request_ids}
+ 
+         except Exception as e:
+-            logger.error(f"Error aborting requests: {e}")
+-            return {"aborted_count": 0, "request_ids": [], "error": str(e)}
++            logger.exception(f"Error aborting requests: {e}")
++            raise
+ 
+     async def resume_generation(self):
+         """Resume generation after abort_all_requests (pause_generation)."""

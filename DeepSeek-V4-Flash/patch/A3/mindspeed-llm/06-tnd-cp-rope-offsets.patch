@@ -1,0 +1,94 @@
+From 255469de745bcff2f3b1d01e44d3cc6237e35337 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Thu, 22 Oct 2026 19:22:31 +0800
+Subject: [PATCH] Fix RoPE offsets for TP and continuous TND CP shards
+
+Advance CP offsets by the TP-gathered block length and apply TP offsets only when sequence parallelism is active.
+
+Source-commit: bb785ab6bbb588ad59ad6f01e1b03f4fbff2ce19
+---
+ .../tasks/models/transformer/deepseek4/csa.py | 28 +++++++++++--------
+ .../transformer/deepseek4/deepseek_utils.py   | 24 ++++++++++++++++
+ 2 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py b/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
+index 563ff3e46152a657e169531abdc14356c05cfdc0..0632eebf90526427ebaeac13c5702a0e0b46ff30 100644
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
+@@ -42,6 +42,7 @@ from mindspeed_llm.core.context_parallel.kvallgather_context_parallel import gat
+ from mindspeed_llm.tasks.models.transformer.deepseek4.deepseek_utils import (
+     apply_rotary_emb,
+     get_cmp_cu_seqlens,
++    get_csa_rope_range,
+     _compute_prefix_kv_cu_seqlens,
+     _rearrange_prefix_kv,
+ )
+@@ -348,18 +349,21 @@ class DeepSeek4SelfAttention(MegatronModule):
+     def get_freqs_cis(self, start_pos, local_seq_len, get_global=False):
+         tp_rank = parallel_state.get_tensor_model_parallel_rank()
+         tp_size = parallel_state.get_tensor_model_parallel_world_size()
+-        if self.tnd_continuous_shard:
+-            cp_rank = parallel_state.get_context_parallel_rank()
+-            cp_offset = local_seq_len * cp_rank
+-        else:
+-            cp_offset = 0
+-        if get_global:
+-            global_seq_len = local_seq_len * tp_size
+-            s = start_pos + cp_offset
+-            return self.freqs_cis[s : s + global_seq_len]
+-        else:
+-            s = start_pos + cp_offset + local_seq_len * tp_rank
+-            return self.freqs_cis[s : s + local_seq_len]
++        # ``local_seq_len`` is the TP sequence-parallel shard length. A CP
++        # rank owns the full TP-gathered block, so its global TND offset must
++        # advance by ``local_seq_len * tp_size`` rather than by one TP shard.
++        cp_rank = parallel_state.get_context_parallel_rank() if self.tnd_continuous_shard else 0
++        slice_start, slice_end = get_csa_rope_range(
++            start_pos=start_pos,
++            local_seq_len=local_seq_len,
++            tp_rank=tp_rank,
++            tp_size=tp_size,
++            cp_rank=cp_rank,
++            sequence_parallel=self.config.sequence_parallel,
++            tnd_continuous_shard=self.tnd_continuous_shard,
++            get_global=get_global,
++        )
++        return self.freqs_cis[slice_start:slice_end]
+ 
+     @staticmethod
+     def eager_sparse_attn(
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py b/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py
+index 2ea83876e71bda185b72f7a31e862bd91243d9ed..7911ad3d3d67f46d80448b206eec6d12d0252767 100644
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py
+@@ -9,6 +9,30 @@ import torch
+ from scipy.linalg import hadamard
+ 
+ 
++def get_csa_rope_range(
++    start_pos: int,
++    local_seq_len: int,
++    tp_rank: int,
++    tp_size: int,
++    cp_rank: int,
++    sequence_parallel: bool,
++    tnd_continuous_shard: bool,
++    get_global: bool,
++) -> tuple[int, int]:
++    """Return the DeepSeek4 CSA RoPE slice for one TP x CP rank.
++
++    ``local_seq_len`` is the TP sequence-parallel shard length. One CP rank
++    owns the TP-gathered block, therefore its offset advances by the full TP
++    block rather than by one TP shard.
++    """
++    full_local_seq_len = local_seq_len * tp_size if sequence_parallel else local_seq_len
++    cp_offset = full_local_seq_len * cp_rank if tnd_continuous_shard else 0
++    tp_offset = local_seq_len * tp_rank if sequence_parallel and not get_global else 0
++    slice_start = start_pos + cp_offset + tp_offset
++    slice_length = full_local_seq_len if get_global else local_seq_len
++    return slice_start, slice_start + slice_length
++
++
+ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+     """
+     Applies rotary positional embeddings to the input tensor.

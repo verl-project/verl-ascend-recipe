@@ -1,3 +1,4 @@
+
 pkill -9 python
 ray stop --force
 
@@ -5,17 +6,32 @@ ray stop --force
 CANN_DIR=/usr/local/Ascend
 source $CANN_DIR/ascend-toolkit/set_env.sh
 source $CANN_DIR/nnal/atb/set_env.sh
-export TRANSFORMERS_VERBOSITY=error
-export VLLM_ASCEND_TASK_QUEUE_ENABLE=0
-# vllm路径
+
+# vLLM 使用开头的环境配置及当前 Python 安装，避免旧路径抢占优先级。
 export PYTHONPATH="/workspace-verl/vllm:$PYTHONPATH"
 export PYTHONPATH="/workspace-verl/vllm-ascend:$PYTHONPATH"
 
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+#!/usr/bin/env bash
+export CPU_AFFINITY_CONF=1
+export HCCL_BUFFSIZE=150
+export HCCL_CONNECT_TIMEOUT=900
+export HCCL_EXEC_TIMEOUT=900
+export HCCL_HOST_SOCKET_PORT_RANGE=auto
+export HCCL_IF_BASE_PORT=48890
+export HCCL_NPU_SOCKET_PORT_RANGE=auto
+export HCCL_OP_EXPANSION_MODE=AIV
+export HYDRA_FULL_ERROR=1
+export MERLIN_ROBUST_ENFORCE=1
+export MULTI_STREAM_MEMORY_REUSE=2
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export TASK_QUEUE_ENABLE=1
+export TORCH_NCCL_USE_HIGH_PRIORITY_STREAM=0
+export TRANSFORMERS_VERBOSITY=error
 export VLLM_USE_V1=1
-export VLLM_VERSION=0.23.0
-export HCCL_BUFFSIZE=300
-export PYTORCH_NPU_ALLOC_CONF="max_split_size_mb:2048"
+export VLLM_VERSION=0.30.0
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export VLLM_USE_V2_MODEL_RUNNER=1
 
 # 修改为当前需要跑的用例路径
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
@@ -25,7 +41,7 @@ echo "Use $DEFAULT_SH"
 ulimit -n 32768
 mkdir logs
 
-NNODES=8
+NNODES=4
 NPUS_PER_NODE=16
 # 修改为对应主节点IP
 MASTER_ADDR="IP FOR MASTER NODE"

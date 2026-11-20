@@ -1,0 +1,120 @@
+From 2425bf8002bb13c82ebf4334862f0eb7a3f5a05a Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:35 +0000
+Subject: [PATCH] fix: serialize and shorten wandb tracking configuration
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: wandb
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/utils/tracking.py | 74 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/verl/utils/tracking.py b/verl/utils/tracking.py
+index 2db0caedcd0b1d5dd3d4157add858aa6a3fb7c97..de6057cb3b1b6edc4a869c5ca9417ea86ac7b1a0 100644
+--- a/verl/utils/tracking.py
++++ b/verl/utils/tracking.py
+@@ -17,6 +17,7 @@ A unified tracking interface that supports logging data to different backend
+ 
+ import dataclasses
+ import json
++import hashlib
+ import logging
+ import os
+ from contextlib import contextmanager
+@@ -33,6 +34,64 @@ logger = logging.getLogger(__name__)
+ MLFLOW_MAX_ATTEMPTS = 3
+ MLFLOW_SLEEP_SECONDS = 5
+ 
++_TRACKING_KEY_MAX_LEN = 64
++_KEY_ABBREV = {
++    "actor_rollout_ref": "arr",
++    "tool_config": "tc",
++    "global_profiler": "gp",
++    "global_tool_config": "gtc",
++    "teacher_models": "tms",
++    "teacher_model": "tm",
++    "engine_kwargs": "ek",
++    "compilation_config": "cc",
++    "checkpoint_engine": "ce",
++    "precision_debugger": "pd",
++    "torch_memory": "tmem",
++    "nsight_options": "nso",
++    "controller_nsight_options": "cnso",
++    "worker_nsight_options": "wnso",
++    "reward_model": "rm",
++    "disaggregation": "disagg",
++}
++def _sanitize_tracking_key(key: str) -> str:
++    original_key = key
++    original_key = key
++    parts = key.split(".")
++    while len(key) > _TRACKING_KEY_MAX_LEN:
++        cands = [(len(p), i) for i, p in enumerate(parts) if p in _KEY_ABBREV]
++        if not cands:
++            break
++        _, idx = max(cands)
++        parts[idx] = _KEY_ABBREV[parts[idx]]
++        key = ".".join(parts)
++    if len(key) > _TRACKING_KEY_MAX_LEN:
++        key = key[: _TRACKING_KEY_MAX_LEN - 7] + "~" + hashlib.md5(original_key.encode()).hexdigest()[:6]
++    return key
++def _flatten_tracking_config(raw: Any, prefix: str = "") -> dict[str, Any]:
++    if isinstance(raw, dict):
++        flattened = {}
++        for key, value in raw.items():
++            child_prefix = f"{prefix}.{key}" if prefix else str(key)
++            flattened.update(_flatten_tracking_config(value, child_prefix))
++        return flattened
++    return {prefix: raw} if prefix else {}
++def _dedupe_tracking_key(key: str, original_key: str, existing: dict[str, Any]) -> str:
++    if key not in existing:
++        return key
++    suffix = "~" + hashlib.md5(original_key.encode()).hexdigest()[:6]
++    return key[: _TRACKING_KEY_MAX_LEN - len(suffix)] + suffix
++def _sanitize_tracking_config(config):
++    """Shorten dotted keys before wandb sends them to Tracking."""
++    if config is None:
++        return {}
++    jsonable_config = _transform_params_to_json_serializable(config, convert_list_to_dict=False)
++    flattened_config = _flatten_tracking_config(jsonable_config)
++    out = {}
++    for k, v in flattened_config.items():
++        key = _sanitize_tracking_key(k)
++        key = _dedupe_tracking_key(key, k, out)
++        out[key] = v
++    return out
+ 
+ class Tracking:
+     """A unified tracking interface for logging experiment data to multiple backends.
+@@ -81,7 +140,13 @@ class Tracking:
+             if config and config["trainer"].get("wandb_proxy", None):
+                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+             entity = os.environ.get("WANDB_ENTITY", None)
+-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
++            wandb.init(
++                project=project_name,
++                name=experiment_name,
++                entity=entity,
++                config=_sanitize_tracking_config(config),
++                settings=settings,
++            )
+             self.logger["wandb"] = wandb
+ 
+         if "trackio" in default_backend:
+@@ -519,6 +584,13 @@ def _compute_mlflow_params_from_objects(params) -> dict[str, Any]:
+ def _transform_params_to_json_serializable(x, convert_list_to_dict: bool):
+     _transform = partial(_transform_params_to_json_serializable, convert_list_to_dict=convert_list_to_dict)
+ 
++    try:
++        from omegaconf import DictConfig, ListConfig, OmegaConf
++        if isinstance(x, (DictConfig, ListConfig)):
++            return _transform(OmegaConf.to_container(x, resolve=True))
++    except ImportError:
++        pass
++
+     if dataclasses.is_dataclass(x):
+         return _transform(dataclasses.asdict(x))
+     if isinstance(x, dict):

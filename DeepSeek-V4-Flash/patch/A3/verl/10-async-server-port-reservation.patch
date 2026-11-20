@@ -1,0 +1,90 @@
+From a77258faf2466e22ed3000d9252105b255e75ab2 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:34 +0000
+Subject: [PATCH] fix: reserve DP server ports across address families
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: network
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/utils/net_utils.py                       | 24 ++++++++++++++++++
+ .../rollout/vllm_rollout/vllm_async_server.py | 25 +++++++++++++++++--
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/verl/utils/net_utils.py b/verl/utils/net_utils.py
+index 0c6ee35d118c95d6cda4652a83c8a7d1b524b6fa..e5e2f8d87bdc055fe67b2ac845f5a71b87f83f9f 100644
+--- a/verl/utils/net_utils.py
++++ b/verl/utils/net_utils.py
+@@ -89,3 +89,27 @@ def get_free_port(address: str, with_alive_sock: bool = False) -> tuple[int, soc
+         return port, sock
+     sock.close()
+     return port, None
++
++
++def reserve_free_ports(address: str, count: int = 5) -> tuple[list[int], list[socket.socket]]:
++    """Reserve a local port pool on all interfaces of the address family.
++
++    IPv6 reservations also cover IPv4 so an IPv4-only port probe cannot select
++    a port that is unavailable to an IPv6 TCPStore. The caller must close the
++    returned sockets immediately before starting the services that bind them.
++    """
++    family = socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
++    bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
++    sockets = []
++    try:
++        for _ in range(count):
++            sock = socket.socket(family, socket.SOCK_STREAM)
++            sockets.append(sock)
++            if family == socket.AF_INET6:
++                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
++            sock.bind((bind_address, 0))
++        return [sock.getsockname()[1] for sock in sockets], sockets
++    except BaseException:
++        for sock in sockets:
++            sock.close()
++        raise
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index f2bda258da90903bce1c4742967de4b275ad82db..210ecd68066e1d422f25633050b5a52b8b6ca59b 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -40,7 +40,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
+ from verl.plugin.platform import get_platform
+ from verl.utils.config import omega_conf_to_dataclass
+ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
+-from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
++from verl.utils.net_utils import get_free_port, is_valid_ipv6_address, reserve_free_ports
+ from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
+ from verl.utils.tokenizer import normalize_token_ids
+ from verl.utils.tracking import RLInsightLogger
+@@ -451,7 +451,28 @@ class vLLMHttpServer:
+         engine_args = AsyncEngineArgs.from_cli_args(args)
+         usage_context = UsageContext.OPENAI_API_SERVER
+         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+-        vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
++        if vllm_config.parallel_config.data_parallel_size > 1:
++            # vLLM's default pool probes IPv4 ports, but our DP peers may use
++            # IPv6. An occupied IPv6 port makes TCPStore fall back to an IPv4
++            # listener while every peer keeps retrying its IPv6 address.
++            # Match vLLM's five-port pool, shared with headless engines through
++            # the startup handshake, using reservations on both families.
++            ports, reservations = reserve_free_ports(self._server_address)
++            try:
++                self._dp_master_port = ports[-1]
++                vllm_config.parallel_config.data_parallel_master_port = ports[-1]
++                vllm_config.parallel_config._data_parallel_master_port_list = ports[:-1]
++            finally:
++                for sock in reservations:
++                    sock.close()
++
++        # These sockets only reserve addresses during actor creation. Keeping
++        # them bound while the actual services start can prevent IPv6 binds.
++        for name in ("_master_sock", "_dp_rpc_sock", "_dp_master_sock"):
++            sock = getattr(self, name, None)
++            if sock is not None:
++                sock.close()
++                setattr(self, name, None)
+ 
+         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
+         kwargs = {}

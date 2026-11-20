@@ -1,0 +1,50 @@
+From cc09ddd0957ce8a482675d56e2f0a4795f515cf8 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:35 +0000
+Subject: [PATCH] feat: expose runtime logging
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: logging
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/trainer/constants_ppo.py      | 2 +-
+ verl/utils/profiler/performance.py | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/verl/trainer/constants_ppo.py b/verl/trainer/constants_ppo.py
+index bf853de4fb03490dc22c1858bb52b1fce6080419..f100543f407a0e77d2474784c963305260c689dc 100644
+--- a/verl/trainer/constants_ppo.py
++++ b/verl/trainer/constants_ppo.py
+@@ -74,7 +74,7 @@ PPO_RAY_RUNTIME_ENV = {
+     "env_vars": {
+         "TOKENIZERS_PARALLELISM": "true",
+         "NCCL_DEBUG": "WARN",
+-        "VLLM_LOGGING_LEVEL": "WARN",
++        "VLLM_LOGGING_LEVEL": "INFO",
+         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+         # TODO: disable compile cache due to cache corruption issue
+         # https://github.com/vllm-project/vllm/issues/31199
+diff --git a/verl/utils/profiler/performance.py b/verl/utils/profiler/performance.py
+index 35e51e270c84e011a092ccadea9dbef5ddfaeb92..8fbbd6462de12976d28225964a73f3fb52d53bb8 100644
+--- a/verl/utils/profiler/performance.py
++++ b/verl/utils/profiler/performance.py
+@@ -60,7 +60,7 @@ def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
+     return mem_allocated, mem_reserved, mem_used, mem_total
+ 
+ 
+-def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging.DEBUG, rank: int = 0):
++def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging.WARN, rank: int = 0):
+     """Log GPU memory usage information.
+ 
+     Args:
+@@ -75,7 +75,7 @@ def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging
+             f"{head}, memory allocated (GB): {mem_allocated}, memory reserved (GB): {mem_reserved}, "
+             f"device memory used/total (GB): {mem_used}/{mem_total}"
+         )
+-
++        print(message)
+         if logger is None:
+             print(message)
+         else:

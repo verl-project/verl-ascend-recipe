@@ -1,0 +1,157 @@
+From e9b9cd6bb69912b74b73539fe4941fc026d9ab21 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 10:16:37 +0000
+Subject: [PATCH] fix: align DeepSeek V4 RoPE with training
+
+Use extended context tables, compressed-layer YaRN parameters and CPU FP64 phases without multiplying the extended table length again.
+
+Source-base: 2df8721f4ed5d581136d7a5e3dd2487ef5036899
+Source-state: uncommitted tracked files
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ vllm_ascend/models/deepseek_v4/model.py | 10 ++-
+ vllm_ascend/ops/rope_dsv4.py            | 87 +++++++++----------------
+ 2 files changed, 39 insertions(+), 58 deletions(-)
+
+diff --git a/vllm_ascend/models/deepseek_v4/model.py b/vllm_ascend/models/deepseek_v4/model.py
+index f65af8f3c4755a55b43f5ed79c25ef200cc8492b..c322d1f594de2bbf629dd188fa3d5e79f6f8cc29 100644
+--- a/vllm_ascend/models/deepseek_v4/model.py
++++ b/vllm_ascend/models/deepseek_v4/model.py
+@@ -566,6 +566,12 @@ class DeepseekV4Attention(nn.Module):
+             base=rope_theta,
+             beta_fast=config.rope_parameters["beta_fast"],
+             beta_slow=config.rope_parameters["beta_slow"],
++            # original length drives the YaRN ramp. 0 skips YaRN, which is what
++            # uncompressed layers want; compressed layers keep the training ramp.
++            original_max_position_embeddings=(
++                config.rope_parameters["original_max_position_embeddings"] if self.compress_ratio > 1 else 0
++            ),
++            apply_yarn_scaling=self.compress_ratio > 1,
+             rope_groups=rope_groups,
+         )
+ 
+@@ -686,7 +692,9 @@ class DeepseekV4DecoderLayer(nn.Module):
+         parallel_config = vllm_config.parallel_config
+ 
+         self.hidden_size = config.hidden_size
+-        max_position_embeddings = config.rope_parameters["original_max_position_embeddings"]
++        # Table spans the full yarn-extended context. original_max_position_embeddings
++        # is passed separately and only selects the YaRN correction range.
++        max_position_embeddings = config.max_position_embeddings
+         # DecoderLayers are created with `make_layers` which passes the prefix
+         # with the layer's index.
+         layer_idx = int(prefix.split(sep=".")[-1])
+diff --git a/vllm_ascend/ops/rope_dsv4.py b/vllm_ascend/ops/rope_dsv4.py
+index fc213ad5d26706338cfb449c9e0dbe5bb7c6a839..3ba4b6823e81eb1461c23e426a2bd1361f426ad7 100644
+--- a/vllm_ascend/ops/rope_dsv4.py
++++ b/vllm_ascend/ops/rope_dsv4.py
+@@ -265,7 +265,7 @@ class ComplexExpRotaryEmbedding(nn.Module):
+             _ROPE_STATE.registry_summary[config_key].add(grp)
+ 
+         if config_key not in _ROPE_STATE.full_rope_cache:
+-            inv_freq = self.precompute_freqs_cis(
++            complex_cis = self.precompute_freqs_cis(
+                 rotary_dim,
+                 max_position_embeddings,
+                 original_seq_len,
+@@ -275,14 +275,9 @@ class ComplexExpRotaryEmbedding(nn.Module):
+                 beta_slow,
+                 apply_yarn_scaling=apply_yarn_scaling,
+             )
+-            t = torch.arange(
+-                max_position_embeddings * scaling_factor,
+-                device=current_platform.device_type,
+-                dtype=torch.float32,
+-            )
+-            freqs = torch.einsum("i,j -> ij", t, inv_freq)
+-            cos = freqs.cos().repeat_interleave(2, dim=-1)
+-            sin = freqs.sin().repeat_interleave(2, dim=-1)
++            # fp32 storage. The fp64 angles above are what stay aligned with training.
++            cos = complex_cis.real.float().repeat_interleave(2, dim=-1)
++            sin = complex_cis.imag.float().repeat_interleave(2, dim=-1)
+             cos = cos.to(current_platform.device_type)
+             sin = sin.to(current_platform.device_type)
+ 
+@@ -334,54 +329,32 @@ class ComplexExpRotaryEmbedding(nn.Module):
+     def precompute_freqs_cis(
+         dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow, *, apply_yarn_scaling=True
+     ):
+-        def yarn_find_correction_dim(
+-            num_rotations: int,
+-            dim: int,
+-            base: float = 10000,
+-            max_position_embeddings: int = 2048,
+-        ) -> float:
+-            return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+-
+-        # Find dim range bounds based on rotations
+-        def yarn_find_correction_range(
+-            low_rot: int,
+-            high_rot: int,
+-            dim: int,
+-            base: float = 10000,
+-            max_position_embeddings: int = 2048,
+-            truncate: bool = True,
+-        ) -> tuple[float | int, float | int]:
+-            low = yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+-            high = yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+-            if truncate:
+-                low = math.floor(low)
+-                high = math.ceil(high)
+-            return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+-
+-        def yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: torch.dtype) -> torch.Tensor:
+-            if low == high:
+-                high += 0.001  # Prevent singularity
+-
+-            linear_func = (torch.arange(dim, dtype=dtype) - low) / (high - low)
+-            ramp_func = torch.clamp(linear_func, 0, 1)
+-            return ramp_func
+-
+-        pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+-        inv_freq_extrapolation = 1.0 / pos_freqs
+-        if not apply_yarn_scaling:
+-            return inv_freq_extrapolation
+-        inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+-
+-        low, high = yarn_find_correction_range(
+-            beta_fast,
+-            beta_slow,
+-            dim,
+-            base,
+-            original_seq_len,
+-        )
+-        inv_freq_mask = (1 - yarn_linear_ramp_mask(low, high, dim // 2, dtype=torch.float32)) * 1
+-        inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+-        return inv_freq
++        def find_correction_dim(num_rotations, dim, base, max_seq_len):
++            return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
++
++        def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
++            low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
++            high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
++            return max(low, 0), min(high, dim - 1)
++
++        def linear_ramp_factor(min_, max_, dim):
++            if min_ == max_:
++                max_ += 0.001
++            linear_func = (torch.arange(dim, dtype=torch.float64, device="cpu") - min_) / (max_ - min_)
++            return torch.clamp(linear_func, 0, 1)
++
++        # fp64 on CPU. fp32 angle error grows linearly with position
++        # (~2.4e-2 rad at 1M) and no longer matches MindSpeed-LLM.
++        freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float64, device="cpu") / dim))
++        if apply_yarn_scaling and original_seq_len > 0:
++            low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
++            smooth = 1 - linear_ramp_factor(low, high, dim // 2)
++            freqs = freqs / factor * (1 - smooth) + freqs * smooth
++
++        # seqlen is already the extended context. Do not multiply by factor again.
++        t = torch.arange(seqlen, dtype=torch.float64, device="cpu")
++        freqs = torch.outer(t, freqs)
++        return torch.polar(torch.ones_like(freqs), freqs)
+ 
+     def forward(
+         self,

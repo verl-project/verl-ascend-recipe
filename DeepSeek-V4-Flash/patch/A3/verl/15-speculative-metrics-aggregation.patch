@@ -1,0 +1,45 @@
+From 7da38e99df14cc82703ef2bc1bd96c83c4d02498 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:36 +0000
+Subject: [PATCH] fix: aggregate speculative metrics across rollout resumes
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: metrics
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/trainer/ppo/v1/trainer_base.py | 2 +-
+ verl/workers/rollout/llm_server.py  | 6 ++++++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 097ac5b8c884ebe0c62ddff5e6e520d7e9d26357..659abfa8f044300e0de88519e0e9e15089b23dfe 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -1916,7 +1916,7 @@ class PPOTrainer(ABC):
+ 
+         # Only fetch speculative decoding stats when rollout writes them.
+         spec_drafts = spec_accepts = spec_verifies = None
+-        mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
++        mtp_config = getattr(self.config.actor_rollout_ref.rollout, "mtp", None)
+         if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
+             spec_data = tq.kv_batch_get(
+                 keys=batch.keys,
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index f4551117c7db6ad2cee1c9aa054e02faed9a771b..c13da2e6db79b1142627e05788d9498584e30002 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -554,6 +554,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+                 final_output.num_preempted += output.num_preempted
+             final_output.stop_reason = output.stop_reason
+ 
++            # Each resume is a new backend request with its own counters.
++            for key in ("spec_num_draft_tokens", "spec_num_accepted_tokens", "spec_num_verify_steps"):
++                value = output.extra_fields.get(key)
++                if value is not None:
++                    final_output.extra_fields[key] = final_output.extra_fields.get(key, 0) + int(value)
++
+             # update model weights version
+             global_steps = output.extra_fields.get("global_steps", None)
+             if min_global_steps is None:

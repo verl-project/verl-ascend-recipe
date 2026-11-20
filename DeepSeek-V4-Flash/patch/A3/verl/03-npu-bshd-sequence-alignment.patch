@@ -1,0 +1,29 @@
+From bfd55df6084a4037045962fb2faed03f89adf940 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:32 +0000
+Subject: [PATCH] fix: align NPU BSHD sequence lengths
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: bshd
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/models/mcore/util.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/verl/models/mcore/util.py b/verl/models/mcore/util.py
+index c62e34b4579cf1d15c64cafd15610ff602445ebe..ededd99d1abb6cdfe8216f3a12f355753624ba0c 100644
+--- a/verl/models/mcore/util.py
++++ b/verl/models/mcore/util.py
+@@ -683,6 +683,10 @@ def preprocess_bshd_engine(
+     dense_shape = tuple(input_ids.shape[2:])
+     seqlens_in_batch = input_ids.offsets().diff()
+     max_seqlen = forced_max_seqlen if forced_max_seqlen is not None else seqlens_in_batch.max().item()
++    if is_npu_available:
++        # NPU kernels need max_seqlen 1024-aligned, floor 2048.
++        align_value = 1024
++        max_seqlen = max(((max_seqlen + align_value - 1) // align_value) * align_value, 2048)
+     tp_size = mpu.get_tensor_model_parallel_world_size()
+     # For CP (zigzag), sequence length must be divisible by (2 * cp_size).
+     # After zigzag-CP split each rank holds s/cp_size tokens, which must also be
