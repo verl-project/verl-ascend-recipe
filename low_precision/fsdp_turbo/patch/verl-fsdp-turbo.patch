@@ -1,0 +1,229 @@
+# verl-fsdp-turbo.patch —— FSDPTurbo 链路 verl 侧专属补丁（fsdp 四段）
+# 适用基线：verl 官方仓 @ 07ba1a854（干净树）＋前置 low_precision/patch/verl.patch（上游 #169 原件，先应用）。
+# 本文件由下列四件按序合并而成（与逐件 apply 的最终树逐字节一致；两步 apply 终树与旧合一件单次 apply 逐字节一致，机器校验）：
+#   1. fsdp-rollout-quant：FSDP 引擎 set_rollout_weight_quantizer 接线
+#   2. vllm-translate-names：量化 refit 权重名映射 translate_weight_names_for_vllm
+#   3. gdn-repack：GDN conv 权重 refit 重打包（VERL_GDN_REPACK=0 可关）
+#   4. modelslim-export：ModelSlim 专家模板折叠＋R1 scale 语义
+# 用法：cd verl \
+#   && git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/patch/verl.patch \
+#   && git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/fsdp_turbo/patch/verl-fsdp-turbo.patch
+# 注意：说明注释集中在本头部（diff 段间无法插注释）；单项定位请按上方段序对文件名查找。
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -171,6 +171,9 @@
+         self._autocast_dtype = torch.bfloat16
+         self.scaler = None
+ 
++        # Trainer-side rollout weight quantizer, set via set_rollout_weight_quantizer.
++        self._rollout_weight_quantizer = None
++
+         if self.engine_config.entropy_from_logits_with_chunking:
+             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
+         else:
+@@ -972,9 +975,20 @@
+             )
+             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
+ 
++        if self._rollout_weight_quantizer is not None and not (peft_config is not None and base_sync_done):
++            # Skip the adapter-only LoRA stream: adapters stay in high precision.
++            refresh_scales = getattr(self._rollout_weight_quantizer, "refresh_input_global_scales", None)
++            if refresh_scales is not None:
++                refresh_scales(self.module)
++            per_tensor_param = self._rollout_weight_quantizer(per_tensor_param)
++
+         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
+         return per_tensor_param, peft_config_dict
+ 
++    def set_rollout_weight_quantizer(self, quantizer) -> None:
++        """See :meth:`BaseEngine.set_rollout_weight_quantizer`."""
++        self._rollout_weight_quantizer = quantizer
++
+     def _merged_lora_per_tensor_param(self):
+         """Stream merged (base + LoRA) weights for rollout weight sync.
+ 
+@@ -1010,7 +1024,13 @@
+         """Full HF-format weights for the checkpoint 'hf_model' export, with LoRA adapters merged."""
+         if self._is_lora:
+             return self._merged_lora_per_tensor_param(), None
+-        return self.get_per_tensor_param()
++        quantizer, self._rollout_weight_quantizer = self._rollout_weight_quantizer, None
++        try:
++            # Checkpoints keep the high-precision master weights; only the
++            # rollout sync consumes the quantized stream.
++            return self.get_per_tensor_param()
++        finally:
++            self._rollout_weight_quantizer = quantizer
+ 
+     def disable_adapter(self) -> ContextManager:
+         return self.module.disable_adapter()
+diff --git a/verl/utils/vllm/vllm_quant_utils.py b/verl/utils/vllm/vllm_quant_utils.py
+--- a/verl/utils/vllm/vllm_quant_utils.py
++++ b/verl/utils/vllm/vllm_quant_utils.py
+@@ -356,6 +356,31 @@
+             set_default_quant_scales(module, register_buffer=False)
+ 
+ 
++def translate_weight_names_for_vllm(weights, model):
++    """Map HF-checkpoint weight names to the vLLM module tree before loading.
++
++    vLLM VLM wrappers (e.g. Qwen3.5, Qwen2.5-VL) register the language model
++    under a vLLM-side prefix (``language_model.*``) while the RL actor state
++    dict uses HF names (``model.language_model.*``). The models expose the
++    mapping via ``hf_to_vllm_mapper``; without applying it here, every weight
++    lookup in ``get_module_from_param_name``/``model.load_weights`` fails and
++    the engine silently keeps its initial (dummy) weights.
++
++    Weights mapped to ``None`` are ignored by vLLM and dropped.
++
++    Ported from an earlier validated stack.
++    """
++    mapper = getattr(model, "hf_to_vllm_mapper", None)
++    if mapper is None or not hasattr(mapper, "_map_name"):
++        for name, tensor in weights:
++            yield name, tensor
++        return
++    for name, tensor in weights:
++        mapped_name = mapper._map_name(name)
++        if mapped_name is not None:
++            yield mapped_name, tensor
++
++
+ def load_quanted_weights(weights, model_runner, is_drafter=False):
+     if is_drafter:
+         drafter = getattr(model_runner, "drafter", None)
+@@ -367,6 +392,7 @@
+     else:
+         model = model_runner.model
+     weights = list(weights)
++    weights = list(translate_weight_names_for_vllm(weights, model))
+ 
+     # Monkey patch the param class to their subclass, as certain models
+     # will check the param type to call the proper weightloader
+--- a/verl/utils/vllm/vllm_quant_utils.py
++++ b/verl/utils/vllm/vllm_quant_utils.py
+@@ -280,6 +280,51 @@
+     # Last: the rebuild reads ``wo_a``, which is only back in its inference
+     # layout once the staged FP8 params above have been reinstated.
+     refresh_rocm_attention_weight_caches(model)
++    refresh_ascend_gdn_conv_weights(model)
++
++
++def refresh_ascend_gdn_conv_weights(model):
++    """Repack the GDN conv kernel-layout buffers after every refit.
++
++    ``load_format="dummy"`` fills every persistent tensor -- including the
++    vllm-ascend GDN derived buffer ``ascend_conv1d_weight`` -- with random
++    values. A refit rewrites the source parameters and reprocesses the
++    quantized modules listed above, but the GDN conv is an unquantized
++    layer: no refit step fires its packing hook, so the packed buffer keeps
++    the dummy values and prefill/decode consume them (gdn.py reads the
++    packed weight in every conv call). A native load stays correct only
++    because the initial model-wide processing runs the wrapped hook.
++    Refresh the pack from the already-loaded source weights here so every
++    sync wave ends with real packed conv weights.
++
++    GDN-REPACK: opt-out with ``VERL_GDN_REPACK=0``.
++    """
++    import os as _os
++    if _os.environ.get("VERL_GDN_REPACK", "1") == "0":
++        return
++    refreshed = 0
++    for module in model.modules():
++        pack = getattr(module, "_pack_conv_weights", None)
++        if pack is None:
++            continue
++        try:
++            pack()
++            refreshed += 1
++        except Exception as e:
++            logger.warning("[GDN-REPACK] %s repack failed: %s: %s",
++                           type(module).__name__, type(e).__name__,
++                           str(e)[:160])
++    if refreshed:
++        logger.info("[GDN-REPACK] refreshed %d GDN conv packs", refreshed)
++        return
++    # Negative sentinel: packed buffers exist but no hook matched. Loud,
++    # not silent -- a vllm-ascend version mismatch must not pass quietly.
++    packed = sum(1 for _n, _p in model.named_parameters()
++                 if _n.endswith("ascend_conv1d_weight"))
++    if packed:
++        logger.warning("[GDN-REPACK] %d packed conv buffers present but no "
++                       "_pack_conv_weights hook matched -- version mismatch? "
++                       "packs NOT refreshed", packed)
+ 
+ 
+ def reset_uncalibrated_kv_cache_scales(model):
+diff --git a/verl/utils/qat/ascend_modelslim.py b/verl/utils/qat/ascend_modelslim.py
+--- a/verl/utils/qat/ascend_modelslim.py
++++ b/verl/utils/qat/ascend_modelslim.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import json
++import re
+ from collections.abc import Iterable, Iterator, Mapping
+ from pathlib import Path
+ from typing import Any
+@@ -30,6 +31,26 @@
+     return detect_quantization_method(model_path) == "ascend"
+ 
+ 
++# Expert-index template fold, ported from the reference tree
++# (qat/ascend.py) for the rebuilt recipe tree.
++_EXPERT_INDEX_RE = re.compile(r"(\.experts\.)\d+(\.)")
++
++
++def _modelslim_template_key(name: str) -> str:
++    """Fold an expert index in a weight name to the description's template key.
++
++    ModelSlim descriptions store one template entry per layer (e.g.
++    ``...mlp.experts.0.gate_proj.weight``); vllm-ascend expands that entry to
++    every expert when it creates the engine parameters (modelslim_config
++    normalizes expert indices, vllm_ascend/quantization/configs/
++    modelslim_config.py:669-672). The export side must match that template
++    semantics, otherwise only expert 0 is quantized and the engine's scales
++    for the remaining experts stay at their ``torch.empty`` init. Literal
++    entries in the description still win over the template fallback.
++    """
++    return _EXPERT_INDEX_RE.sub(r"\g<1>0\g<2>", name, count=1)
++
++
+ class ModelSlimMxfp8WeightExporter:
+     """Export trainer weights using an existing ModelSlim MXFP8 recipe.
+ 
+@@ -60,10 +81,14 @@
+     def _export_weight(name: str, weight: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+         import torch_npu
+ 
+-        quantized, scale = torch_npu.npu_dynamic_mx_quant(weight, axis=-1, dst_type=torch.float8_e4m3fn)
+-        groups = (weight.shape[-1] + 31) // 32
++        # SCALEFIX-B: old-stack R1 chain semantics. Pre-cast
++        # to bf16 (the old stack quantized w.to(torch.bfloat16); pr8511 fed the
++        # raw dtype) and keep the operator's per-group scale grid via
++        # flatten+squeeze (R1 original) instead of the truncated slice.
++        w = weight.to(torch.bfloat16).contiguous()
++        quantized, scale = torch_npu.npu_dynamic_mx_quant(w, axis=-1, dst_type=torch.float8_e4m3fn)
+         yield name, quantized
+-        yield name + "_scale", scale.flatten(-2, -1)[..., :groups]
++        yield name + "_scale", scale.flatten(-2, -1).squeeze(-1)
+ 
+     def __call__(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
+         for name, tensor in weights:
+@@ -75,8 +100,14 @@
+                 yield from self._export_selected_weight(name, tensor)
+ 
+     def _export_selected_weight(self, name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
++        quant_type = self.quant_description.get(name)
++        if quant_type is None and ".experts." in name:
++            # Path A: literal miss -> fall back to the
++            # experts.0 template entry, matching the engine's parameter-creation
++            # semantics (see _modelslim_template_key).
++            quant_type = self.quant_description.get(_modelslim_template_key(name))
+         if (
+-            self.quant_description.get(name) != "W8A8_MXFP8"
++            quant_type != "W8A8_MXFP8"
+             or tensor.ndim != 2
+             or tensor.dtype not in _HIGH_PRECISION_DTYPES
+         ):
