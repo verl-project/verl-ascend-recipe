@@ -142,6 +142,61 @@ class CustomRowParallelOp(CustomLinearOp):
         return split_input[self.tp_rank].contiguous()
 
 
+
+class TrainingRowParallelOp(CustomRowParallelOp):
+    """Match TP2 training rounding without changing rollout weight sharding.
+
+    Gather operands, compute the same two BF16 partial products as the trainer,
+    then add them once in BF16. Weight gathering happens on every call, so an
+    online update cannot leave a stale gathered copy. This prioritizes exact
+    arithmetic over communication cost and currently requires eager execution.
+    """
+
+    requires_reduced_output = True
+
+    def __init__(self, layer):
+        super().__init__(layer)
+        import vllm.envs as envs
+        from vllm.config import get_current_vllm_config
+
+        config = get_current_vllm_config()
+        if not envs.VLLM_BATCH_INVARIANT or not config.model_config.enforce_eager:
+            raise ValueError("Training row reduction requires batch invariance and eager execution")
+        if config.parallel_config.prefill_context_parallel_size != 1:
+            raise ValueError("Training row reduction requires PCP=1")
+
+    def apply_impl(self, input_):
+        from vllm_ascend.ops.triton.batch_invariant.matmul import linear_persistent
+
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            raise ValueError("Training row reduction only supports unquantized linear weights")
+        if self.reduce_results != self.requires_reduced_output or self.bias is not None:
+            raise ValueError("Training row reduction received an unsupported output contract or bias")
+        local_input = self.get_input_parallel(input_)
+        if local_input.dtype != torch.bfloat16 or self.layer.weight.dtype != torch.bfloat16:
+            raise ValueError("Training row reduction currently requires BF16 operands")
+        full_input = self.comm_group.all_gather(local_input, dim=-1)
+        full_weight = self.comm_group.all_gather(self.layer.weight, dim=-1)
+        if full_input.shape[-1] % 2:
+            raise ValueError("The row input dimension must be divisible by training TP=2")
+        shape = full_input.shape
+        flat_input = full_input.reshape(-1, shape[-1])
+        left, right = flat_input.chunk(2, dim=-1)
+        left_weight, right_weight = full_weight.chunk(2, dim=-1)
+        output = linear_persistent(left, left_weight) + linear_persistent(right, right_weight)
+        return output.reshape(*shape[:-1], full_weight.shape[0]), None
+
+
+class TrainingSharedRowParallelOp(TrainingRowParallelOp):
+    """Return the complete TP2 arithmetic result before the shared expert gate.
+
+    The Qwen wrapper requests partial output, but training expert math handles
+    its reduction here and explicitly bypasses the runner's later reduction.
+    """
+
+    requires_reduced_output = False
+
+
 class CustomReplicatedOp(CustomLinearOp):
     def apply_impl(self, input_):
         bias = self.bias if not self.skip_bias_add else None
@@ -151,6 +206,20 @@ class CustomReplicatedOp(CustomLinearOp):
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias
+
+
+
+class TrainingRouterLinearOp(CustomReplicatedOp):
+    """Evaluate the replicated router in FP32 using its current BF16 weights."""
+
+    def apply_impl(self, input_):
+        from vllm_ascend.ops.triton.batch_invariant.matmul import linear_persistent
+
+        if not isinstance(self.quant_method, UnquantizedLinearMethod) or self.bias is not None:
+            raise ValueError("Training router math requires a bias-free unquantized gate")
+        shape = input_.shape
+        output = linear_persistent(input_.reshape(-1, shape[-1]).float(), self.layer.weight.float())
+        return output.reshape(*shape[:-1], self.layer.weight.shape[0]), None
 
 
 class KimiOProjMMReduceScatterOp(CustomRowParallelOp):
@@ -419,7 +488,18 @@ def _get_column_parallel_op(
     return None
 
 
-def _get_row_parallel_op(prefix, layer) -> MLPRowParallelOp | OProjRowParallelOp | DSV4OProjRowParallelOp | None:
+def _get_row_parallel_op(prefix, layer) -> MLPRowParallelOp | OProjRowParallelOp | DSV4OProjRowParallelOp | TrainingRowParallelOp | None:
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    rl_config = get_ascend_config().rl_config
+    if rl_config.training_expert_math and prefix.endswith(".shared_expert.down_proj"):
+        if rl_config.training_tensor_parallel_size != 2 or mlp_tp_enable() or oproj_tp_enable():
+            raise ValueError("Training shared experts require canonical TP2 and the standard TP group")
+        return TrainingSharedRowParallelOp(layer)
+    if rl_config.training_tensor_parallel_size and prefix.endswith((".out_proj", ".o_proj")):
+        if not rl_config.enabled or mlp_tp_enable() or oproj_tp_enable():
+            raise ValueError("Training row reduction requires RL mode and the standard TP group")
+        return TrainingRowParallelOp(layer)
     if "wo_b" in prefix and oproj_tp_enable():
         return DSV4OProjRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
@@ -443,6 +523,7 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
         MLPColumnParallelOp
         | DSV4OProjColumnParallelOp
         | MLPRowParallelOp
+        | TrainingRowParallelOp
         | OProjRowParallelOp
         | DSV4OProjRowParallelOp
         | ShardedCPColumnParallelOp
@@ -469,6 +550,15 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
 
 
 def get_replicated_op(disable_tp, prefix, layer) -> tuple[CustomReplicatedOp | None, int | None, int | None]:
+    from vllm.config import get_current_vllm_config
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    rl_config = get_ascend_config().rl_config
+    if rl_config.training_router_math and prefix.endswith(".mlp.gate"):
+        config = get_current_vllm_config()
+        if not rl_config.enabled or config.model_config.hf_text_config.model_type != "qwen3_5_moe_text":
+            raise ValueError("Training router math is verified for the Qwen3.5 MoE RL configuration")
+        return TrainingRouterLinearOp(layer), 0, 1
     if disable_tp:
         return None, None, None
 

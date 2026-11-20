@@ -61,6 +61,7 @@ class MoEAllToAllCombineMetadata:
     reversed_global_input_permutation_mapping: torch.Tensor | None
     hidden_shape: torch.Size
     hidden_shape_before_permute: torch.Size
+    training_topk_ids: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

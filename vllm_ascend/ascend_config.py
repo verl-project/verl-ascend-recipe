@@ -368,6 +368,16 @@ class RlConfig:
     """
 
     enabled: bool = False
+    # 0 keeps the normal rollout reduction. 2 matches a BF16 TP2 trainer's
+    # row projection rounding while retaining the rollout's actual TP size.
+    training_tensor_parallel_size: Literal[0, 2] = 0
+    # FP32 Qwen3.5 router projection, followed by top-k then softmax.
+    training_router_math: bool = False
+    # Keep expert dispatch/combine arithmetic independent of token count.
+    training_expert_math: bool = False
+    # Reuse the trainer FA kernel for eager causal attention over the live KV cache.
+    training_attention_math: bool = False
+    training_logprob_math: bool = False
     sleep_mode_extra_cleanup: bool = False
     enable_training_consistency: bool = False
     enable_batch_invariant: bool = False

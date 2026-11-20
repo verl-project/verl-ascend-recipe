@@ -504,6 +504,25 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             hidden_shape_before_permute,
         ) = self._dispatch_preprocess(hidden_states, topk_ids)
 
+        training_math = get_ascend_config().rl_config.training_expert_math
+        topk_scales = None
+        if training_math:
+            if token_dispatch_input.quant.is_quant or self.lora_context is not None:
+                raise ValueError("Training expert math requires unquantized experts without LoRA")
+            if token_dispatch_input.routing.apply_router_weight_on_input:
+                raise ValueError("Training expert math weights the SwiGLU output, not the input")
+            from vllm_ascend.ops.fused_moe.training_math import permute_router_weights
+
+            # Native Megatron dispatch casts the router probabilities to BF16
+            # before exchange, then multiplies the BF16 SwiGLU result by them.
+            local_scales = permute_router_weights(
+                topk_weights.to(hidden_states.dtype), reversed_local_input_permutation_mapping
+            )
+            _, topk_scales, scale_handle = async_all_to_all(
+                local_scales, output_splits, input_splits, self.ep_group
+            )
+            scale_handle.wait()
+
         dynamic_scale_after_all2all = None
         if with_quant:
             permutated_local_input_tokens, dynamic_scale = DeviceOperator.npu_dynamic_quant(
@@ -540,7 +559,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             )
         )
 
+        if topk_scales is not None and reversed_global_input_permutation_mapping is not None:
+            topk_scales = permute_router_weights(topk_scales, reversed_global_input_permutation_mapping)
+
         return MoETokenDispatchOutput(
+            topk_scales=topk_scales,
             hidden_states=global_input_tokens,
             dynamic_scale=dynamic_scale_final,
             group_list=tokens_per_expert,
@@ -553,6 +576,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 reversed_global_input_permutation_mapping=reversed_global_input_permutation_mapping,
                 hidden_shape=hidden_shape,
                 hidden_shape_before_permute=hidden_shape_before_permute,
+                training_topk_ids=topk_ids if training_math else None,
             ),
         )
 
@@ -712,6 +736,15 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         combine_metadata: MoEAllToAllCombineMetadata,
     ) -> torch.Tensor:
         # Unpermutation 1: AlltoAll output to output
+        if combine_metadata.training_topk_ids is not None:
+            from vllm_ascend.ops.fused_moe.training_math import combine_training_experts
+
+            return combine_training_experts(
+                permutated_local_input_tokens,
+                combine_metadata.reversed_local_input_permutation_mapping,
+                combine_metadata.training_topk_ids,
+                combine_metadata.hidden_shape_before_permute,
+            ).view(combine_metadata.hidden_shape)
         output = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=permutated_local_input_tokens,
             sorted_indices=combine_metadata.reversed_local_input_permutation_mapping.to(torch.int32),

@@ -19,6 +19,7 @@ from functools import lru_cache, wraps
 
 import torch
 import torch_npu
+import vllm.envs as vllm_envs
 from einops import rearrange
 from fla_npu.ops.ascendc import (
     causal_conv1d_fn,
@@ -449,6 +450,45 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             output[:num_tokens] = out
         return out
 
+    def _forward_batch_invariant_gdn(self, q, k, v, g, beta, metadata, ssm_state):
+        from vllm.config import get_current_vllm_config
+
+        from vllm_ascend.ops.gdn_batch_invariant import GDNChunkReplay, gdn_l2norm_training_math
+
+        config = get_current_vllm_config()
+        if not config.model_config.enforce_eager:
+            raise RuntimeError("GDN chunk replay currently requires enforce_eager=True")
+        if config.cache_config.enable_prefix_caching or get_pcp_group().world_size != 1:
+            raise RuntimeError("GDN chunk replay requires prefix caching off and PCP=1")
+        if metadata.spec_sequence_masks is not None:
+            raise RuntimeError("GDN chunk replay does not yet support speculative decoding")
+        boundaries = metadata.non_spec_query_start_loc.tolist()
+        slots = metadata.non_spec_state_indices_tensor.reshape(-1).tolist()
+        if len(slots) != len(boundaries) - 1:
+            raise RuntimeError("Unsupported GDN cache-slot layout for chunk replay")
+        pointer = ssm_state.data_ptr()
+        if getattr(self, "_gdn_replay_storage", None) != pointer:
+            self._gdn_replay_storage = pointer
+            self._gdn_replay_sequences = {}
+        flags = None if metadata.has_initial_state is None else metadata.has_initial_state.tolist()
+        q, k = gdn_l2norm_training_math(q.contiguous()), gdn_l2norm_training_math(k.contiguous())
+        output = torch.empty_like(v)
+        for seq, (slot, start, end) in enumerate(zip(slots, boundaries[:-1], boundaries[1:])):
+            if start == end:
+                continue
+            is_new = flags is not None and not flags[seq]
+            if is_new:
+                self._gdn_replay_sequences[slot] = GDNChunkReplay(scale=k.shape[-1] ** -0.5)
+            replay = self._gdn_replay_sequences.get(slot)
+            if replay is None:
+                raise RuntimeError("Missing GDN chunk history: unsupported cache restore or single-token initial prompt")
+            out, final_state = replay.append(
+                *(t[:, start:end].contiguous() for t in (q, k, v, g, beta))
+            )
+            output[:, start:end] = out
+            ssm_state[slot].copy_(final_state[0].transpose(-1, -2))
+        return output
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -677,7 +717,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        if vllm_envs.VLLM_BATCH_INVARIANT:
+            from vllm_ascend.ops.gdn_batch_invariant import gdn_gates_training_math
+
+            g, beta = gdn_gates_training_math(self.A_log, a, b, self.dt_bias)
+        else:
+            g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        if vllm_envs.VLLM_BATCH_INVARIANT:
+            if split_conv:
+                query_non_spec = torch.cat((decode_conv_qkv[0], query_non_spec), dim=1)
+                key_non_spec = torch.cat((decode_conv_qkv[1], key_non_spec), dim=1)
+                value_non_spec = torch.cat((decode_conv_qkv[2], value_non_spec), dim=1)
+            output = AscendGatedDeltaNetAttention._forward_batch_invariant_gdn(
+                self, query_non_spec, key_non_spec, value_non_spec, g, beta, attn_metadata, ssm_state
+            )
+            core_attn_out[:num_actual_tokens] = output.squeeze(0)
+            maybe_save_kv_layer_to_connector("", [])
+            return
+
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g

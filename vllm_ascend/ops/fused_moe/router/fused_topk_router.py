@@ -145,6 +145,21 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        if get_ascend_config().rl_config.training_router_math:
+            if (
+                self.scoring_func != "softmax" or not self.renormalize
+                or self.use_grouped_topk or self.e_score_correction_bias is not None
+                or self.bias_vl is not None or self.tid2eid is not None
+                or self.routed_scaling_factor != 1.0 or router_logits.dtype != torch.float32
+            ):
+                raise ValueError("Training router math requires ungrouped FP32 softmax top-k")
+            from vllm_ascend.ops.triton.batch_invariant.softmax import softmax_batch_invariant
+
+            scores, indices = torch.topk(router_logits, self.top_k, dim=-1, sorted=False)
+            weights = softmax_batch_invariant(scores, dim=-1)
+            return weights, indices.to(torch.int32 if indices_type is None else indices_type)
         if self.bias_vl is None and not self.is_fused_supported(hidden_states):
             return super()._compute_routing(
                 hidden_states=hidden_states,

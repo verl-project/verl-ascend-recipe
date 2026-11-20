@@ -130,6 +130,12 @@ class AscendSharedExperts:
         ascend_config = get_ascend_config()
         self.multistream_overlap = ascend_config.multistream_overlap_shared_expert
         self.weights_replicated = ascend_config.enable_shared_expert_dp
+        self.training_math = ascend_config.rl_config.training_expert_math
+        if self.training_math and (
+            self.multistream_overlap or self.weights_replicated or self.is_sequence_parallel
+            or self.quant_type != QuantType.NONE
+        ):
+            raise ValueError("Training shared experts require unquantized standard TP without overlap/SP")
 
         if self.multistream_overlap:
             # Wrap the quant_method's process_weights_after_loading to validate that
@@ -199,6 +205,9 @@ class AscendSharedExperts:
         return shared_gate_up
 
     def apply_activation(self, shared_gate_up: torch.Tensor):
+        if self.training_math:
+            gate, up = shared_gate_up.chunk(2, dim=-1)
+            return F.silu(gate) * up
         return self.layer.act_fn(shared_gate_up)  # type: ignore
 
     def part2(

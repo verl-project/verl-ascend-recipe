@@ -324,6 +324,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             or self._get_shared_expert_parallel_mode() is not SharedExpertParallelMode.TENSOR_PARALLEL
         ):
             return shared_output
+        if getattr(self.ascend_shared_experts, "training_math", False):
+            # TrainingSharedRowParallelOp already reduced before the gate.
+            return shared_output
         # The upstream boolean can be specialized during tracing. Only the
         # model-static early-reduction policy may be tested outside the op.
         if self._should_reduce_routed_before_combine():

@@ -44,6 +44,19 @@ def random_sample(
 
 class AscendSampler(Sampler):
     @staticmethod
+    def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        config = get_ascend_config().rl_config
+        if config.training_logprob_math:
+            if not config.enabled or not envs.VLLM_BATCH_INVARIANT or config.training_tensor_parallel_size != 2:
+                raise ValueError("Training logprobs require RL, BI and training TP2")
+            from vllm_ascend.ops.training_logprobs import training_logprobs_tp2
+
+            return training_logprobs_tp2(logits)
+        return Sampler.compute_logprobs(logits)
+
+    @staticmethod
     def apply_penalties(
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
@@ -71,6 +84,10 @@ class AscendSampler(Sampler):
 
     def __init__(self, logprobs_mode=DEFAULT_LOGPROBS_MODE):
         # TODO: support logprobs_mode in vllm-ascend
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        if get_ascend_config().rl_config.training_logprob_math and logprobs_mode != "raw_logprobs":
+            raise ValueError("Training logprob arithmetic currently supports raw_logprobs only")
         super().__init__(logprobs_mode=logprobs_mode)
         self.topk_topp_sampler = AscendTopKTopPSampler(logprobs_mode=logprobs_mode)
         logger.debug(

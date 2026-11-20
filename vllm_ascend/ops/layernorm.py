@@ -16,6 +16,7 @@
 
 
 import torch
+import vllm.envs as vllm_envs
 from torch import nn
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
@@ -86,6 +87,13 @@ class AscendRMSNorm(RMSNorm):
         import torch_npu
 
         if residual is not None:
+            if vllm_envs.VLLM_BATCH_INVARIANT:
+                from vllm_ascend.batch_invariant import add_rms_norm
+
+                x, _, residual = add_rms_norm(x, residual, self.weight, self.variance_epsilon)
+                if self.bias_loaded:
+                    x = x + self.bias
+                return x, residual
             import vllm_ascend.vllm_ascend_C  # type: ignore[import-untyped]  # noqa: F401, PLC0415
 
             enable_custom_op()
@@ -110,14 +118,21 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
         import torch_npu
 
         if residual is not None:
+            if vllm_envs.VLLM_BATCH_INVARIANT:
+                from vllm_ascend.batch_invariant import add_rms_norm
+
+                x, _, residual = add_rms_norm(x, residual, 1.0 + self.weight.float(), self.variance_epsilon)
+                return x, residual
             if enable_custom_op():
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, 1.0 + self.weight, None, self.variance_epsilon
                 )
             else:
-                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
+                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight.float(), self.variance_epsilon)
             return x, residual
 
+        if vllm_envs.VLLM_BATCH_INVARIANT:
+            return torch_npu.npu_rms_norm(x, 1.0 + self.weight.float(), self.variance_epsilon)[0]
         x = DeviceOperator.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
 
         return x

@@ -391,6 +391,19 @@ def select_moe_comm_method(
     if not is_moe_model(vllm_config):
         return None
 
+    if get_ascend_config().rl_config.training_expert_math:
+        from vllm import envs as vllm_envs
+        if (
+            not get_ascend_config().rl_config.enabled
+            or not vllm_envs.VLLM_BATCH_INVARIANT
+            or not vllm_config.model_config.enforce_eager
+            or not vllm_config.parallel_config.enable_expert_parallel
+            or vllm_config.parallel_config.data_parallel_size != 1
+            or vllm_config.model_config.hf_text_config.model_type != "qwen3_5_moe_text"
+        ):
+            raise ValueError("Training expert math requires eager Qwen3.5 MoE, RL, BI, EP and DP1")
+        return MoECommType.ALLTOALL
+
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     moe_comm_policy = get_current_hardware_profile().moe_comm_policy
     lora_config = getattr(vllm_config, "lora_config", None)

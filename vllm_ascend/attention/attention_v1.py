@@ -21,6 +21,7 @@ from typing import Any
 
 import torch
 import torch_npu
+from vllm_ascend.ascend_config import get_ascend_config
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
@@ -1326,6 +1327,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query, key, value, output_padded = self.reshape_and_cache(
                     query, key, value, kv_cache, attn_metadata, output
                 )
+        if get_ascend_config().rl_config.training_attention_math:
+            from vllm_ascend.ops.training_attention import training_causal_attention
+
+            if (
+                not get_ascend_config().rl_config.enabled
+                or not envs_vllm.VLLM_BATCH_INVARIANT
+                or not self.vllm_config.model_config.enforce_eager
+                or self.pcp_enabled or not attn_metadata.causal
+                or self.sliding_window is not None or self.sinks is not None
+                or self.vllm_config.model_config.hf_text_config.model_type != "qwen3_5_moe_text"
+            ):
+                raise ValueError("Training attention requires eager causal Qwen3.5 MoE, RL, BI and PCP1")
+            if not hasattr(self, "_training_causal_mask"):
+                self._training_causal_mask = torch.ones(2048, 2048, dtype=torch.bool, device=query.device).triu(1)
+            result = training_causal_attention(
+                query, key, value, self.key_cache, self.value_cache,
+                attn_metadata, self.scale, self._training_causal_mask,
+                envs_vllm.VLLM_KV_CACHE_LAYOUT,
+            )
+            output[:num_tokens] = result[:num_tokens]
+            return output
+
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)

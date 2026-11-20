@@ -20,6 +20,7 @@
 from functools import wraps
 
 import torch
+import vllm.envs as vllm_envs
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
@@ -51,7 +52,7 @@ def _uses_multimodal_rope(attention: Qwen3NextAttention) -> bool:
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, output: torch.Tensor = None):
         qkv, _ = self.qkv_proj(hidden_states)
-        if _uses_multimodal_rope(self):
+        if _uses_multimodal_rope(self) and not vllm_envs.VLLM_BATCH_INVARIANT:
             # MRV2 MTP uses 1D text positions; the fused kernel reads three planes.
             if positions.ndim == 1:
                 positions = positions.unsqueeze(0).expand(3, -1)
@@ -89,13 +90,31 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
             q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(-1, self.num_heads * self.head_dim)
             k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(-1, self.num_kv_heads * self.head_dim)
 
-            q, k = self.rotary_emb(positions, q, k)
+            if _uses_multimodal_rope(self) and vllm_envs.VLLM_BATCH_INVARIANT:
+                from vllm_ascend.ops.training_mrope import training_mrope
+
+                if not self.rotary_emb.mrope_interleaved:
+                    raise ValueError("Training Qwen MRoPE currently requires interleaved axes")
+                q, k = training_mrope(
+                    q.view(-1, self.num_heads, self.head_dim),
+                    k.view(-1, self.num_kv_heads, self.head_dim),
+                    positions,
+                    self.rotary_emb.rotary_dim,
+                    self.config.rope_parameters["rope_theta"],
+                    self.rotary_emb.mrope_section,
+                )
+                q, k = q.reshape(-1, self.q_size), k.reshape(-1, self.kv_size)
+            else:
+                q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if vllm_envs.VLLM_BATCH_INVARIANT:
+                attn_output = (attn_output * torch.sigmoid(gate.float())).to(attn_output.dtype)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         out, _ = self.o_proj(attn_output)
         if output is not None:
@@ -302,6 +321,10 @@ else:
     def _gdn_init_with_packed_weight(self, *args, **kwargs):
         _GDN_ORIGINAL_INIT(self, *args, **kwargs)
         initialize_packed_conv_weight(self)
+        if vllm_envs.VLLM_BATCH_INVARIANT:
+            from vllm_ascend.ops.gdn_batch_invariant import GDNTrainingRMSNorm
+
+            self.norm = GDNTrainingRMSNorm(self.norm)
 
     _GDN_PATCH_TARGET.__init__ = _gdn_init_with_packed_weight
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
