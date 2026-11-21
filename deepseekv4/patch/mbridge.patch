@@ -1,0 +1,419 @@
+diff --git a/mbridge/core/bridge.py b/mbridge/core/bridge.py
+index 031e922..cabf8f4 100644
+--- a/mbridge/core/bridge.py
++++ b/mbridge/core/bridge.py
+@@ -171,7 +171,7 @@ class Bridge(ABC):
+             # only tp_rank0/etp_rank0 load from disk, others load from tp_rank0/etp_rank0
+             to_load_from_disk = []
+             for local_name, hf_names in local_to_hf_map.items():
+-                if ".mlp.experts.linear_fc" in local_name:
++                if ".mlp.experts.local_experts" in local_name:
+                     if self.mpu.etp_rank == 0:
+                         to_load_from_disk.extend(hf_names)
+                 else:
+@@ -203,7 +203,7 @@ class Bridge(ABC):
+                     mcore_weight = self._weight_to_mcore_format(local_name, hf_weights)
+                 else:
+                     mcore_weight = None
+-                if hf_names[0] in {"lm_head.weight", "model.embed_tokens.weight"}:
++                if hf_names[0] in {"head.weight", "model.embed_tokens.weight"}:
+                     if param.shape[0] == 1 and (
+                         mcore_weight is None or mcore_weight.shape[0] != 1
+                     ):
+@@ -211,7 +211,7 @@ class Bridge(ABC):
+                         continue
+ 
+                 param_to_load = torch.empty_like(param)
+-                if ".mlp.experts.linear_fc" in local_name:
++                if ".mlp.experts.local_experts" in local_name:
+                     # split mcore weights across etp
+                     if self.mpu.etp_rank == 0:
+                         mcore_weights_tp_split = self._weight_split_across_tp(
+@@ -351,6 +351,8 @@ class Bridge(ABC):
+             if iter_pp_rank == self.mpu.pp_rank:
+                 try:
+                     name, param = next(model_chunk_generator)
++                    if "self_attention.attn_sink" in name:
++                        param.tensor_model_parallel=True
+                 except StopIteration:
+                     name, param = None, None
+                 name = local_to_global_map[iter_name]
+@@ -361,7 +363,7 @@ class Bridge(ABC):
+             broad_pp_param = broadcast_from_megatron_pp(param)
+ 
+             # EP
+-            if ".mlp.experts.linear_fc" in name and self.mpu.ep_size > 1:
++            if ".mlp.experts.local_experts" in name and self.mpu.ep_size > 1:
+                 num_experts = self.config.num_moe_experts
+                 num_experts_per_rank = num_experts // self.mpu.ep_size
+                 infer_params = [
+@@ -370,15 +372,15 @@ class Bridge(ABC):
+                 torch.distributed.all_gather(
+                     infer_params, broad_pp_param, group=self.mpu.ep_group
+                 )
+-
+-                name_prefix, local_expert_id = name.split(".weight")
++                name_left, name_right = name.split('.local_experts.')
++                local_expert_id, name_suffix = name_right.split('.', 1)
+                 local_expert_id = int(local_expert_id)
+                 global_expert_ids = [
+                     num_experts_per_rank * ep_rank + local_expert_id
+                     for ep_rank in range(self.mpu.ep_size)
+                 ]
+                 global_expert_names = [
+-                    f"{name_prefix}.weight{expert_id}"
++                    f"{name_left}.local_experts.{expert_id}.{name_suffix}"
+                     for expert_id in global_expert_ids
+                 ]
+ 
+@@ -512,12 +514,13 @@ class Bridge(ABC):
+             }
+             for k in ret.keys():
+                 v = ret[k]
+-                if ".mlp.experts.linear_fc" in v:
+-                    name_prefix, local_expert_id = v.split(".weight")
++                if ".mlp.experts.local_experts" in v:
++                    name_left, name_right = v.split('.local_experts.')
++                    local_expert_id, name_suffix = name_right.split('.', 1)
+                     global_expert_idx = local_expert_to_global_expert[
+                         int(local_expert_id)
+                     ]
+-                    ret[k] = f"{name_prefix}.weight{global_expert_idx}"
++                    ret[k] = f"{name_left}.local_experts.{global_expert_idx}.{name_suffix}"
+ 
+         return ret
+ 
+@@ -852,7 +855,7 @@ class Bridge(ABC):
+         if self.mpu.tp_size == 1:
+             assert len(mcore_weights) == 1
+             return mcore_weights[0]
+-        if "mlp.experts.linear_fc" in mcore_weights_name:
++        if "mlp.experts.local_experts" in mcore_weights_name:
+             assert len(mcore_weights) == self.mpu.etp_size
+         else:
+             assert len(mcore_weights) == self.mpu.tp_size
+@@ -880,7 +883,7 @@ class Bridge(ABC):
+             up = torch.cat(up_lst, dim=0)
+             ret = torch.cat((gate, up), dim=0)
+ 
+-        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
++        elif "linear_fc2.weight" in mcore_weights_name and "local_experts" in mcore_weights_name:  # moe
+             ret = torch.cat(mcore_weights, dim=1)
+         else:
+             assert (
+@@ -928,7 +931,7 @@ class Bridge(ABC):
+             gates = gate.chunk(tp_split_size)
+             ups = up.chunk(tp_split_size)
+             ret = [torch.cat([g, u], dim=0) for g, u in zip(gates, ups)]
+-        elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:  # moe
++        elif "linear_fc2.weight" in mcore_weights_name and "local_experts" in mcore_weights_name:  # moe
+             ret = mcore_weights.chunk(tp_split_size, dim=1)
+         else:
+             if param.shape == mcore_weights.shape:
+diff --git a/mbridge/core/llm_bridge.py b/mbridge/core/llm_bridge.py
+index a3667fe..441e98f 100644
+--- a/mbridge/core/llm_bridge.py
++++ b/mbridge/core/llm_bridge.py
+@@ -31,8 +31,8 @@ class LLMBridge(Bridge):
+         "hidden_size": "hidden_size",
+         "num_attention_heads": "num_attention_heads",
+         "num_query_groups": "num_key_value_heads",
+-        "ffn_hidden_size": "intermediate_size",
+-        "attention_dropout": "attention_dropout",
++        # "ffn_hidden_size": "intermediate_size",
++        # "attention_dropout": "attention_dropout",
+         "layernorm_epsilon": "rms_norm_eps",
+         "hidden_dropout": ("hidden_dropout", 0.0),
+         "kv_channels": ("head_dim", None),
+diff --git a/mbridge/models/deepseek_v3.py b/mbridge/models/deepseek_v3.py
+index 478798d..2189cf1 100644
+--- a/mbridge/models/deepseek_v3.py
++++ b/mbridge/models/deepseek_v3.py
+@@ -13,79 +13,125 @@ from megatron.core.transformer import MLATransformerConfig
+ from megatron.core.transformer.enums import AttnBackend
+ 
+ from ..core import LLMBridge, register_model
++import re
+ 
+-
+-@register_model("deepseek_v3")
++@register_model(["deepseek_v3", "deepseek_v4"])  
+ class DeepseekV3Bridge(LLMBridge):
+     """
+     Specific bridge implementation for DeepseekV3 models.
+     """
+-
++    # megatron to hf name
+     _DIRECT_MAPPING = {
+-        "embedding.word_embeddings.weight": "model.embed_tokens.weight",
+-        "decoder.final_layernorm.weight": "model.norm.weight",
+-        "output_layer.weight": "lm_head.weight",
++        "embedding.word_embeddings.weight": "embed.weight",
++        "final_layernorm.weight": "norm.weight",
++        "output_layer.weight": "head.weight",
++        "hc_head.hc_base": "hc_head_base",
++        "hc_head.hc_fn.weight": "hc_head_fn",
++        "hc_head.hc_scale": "hc_head_scale"
+     }
+     _MLP_MAPPING = {
+-        "mlp.linear_fc1.layer_norm_weight": [
+-            "model.layers.{layer_number}.post_attention_layernorm.weight"
+-        ],
+-        "mlp.linear_fc2.weight": ["model.layers.{layer_number}.mlp.down_proj.weight"],
+-        "mlp.shared_experts.linear_fc2.weight": [
+-            "model.layers.{layer_number}.mlp.shared_experts.down_proj.weight"
++        "pre_mlp_layernorm.weight":[
++            "layers.{layer_number}.ffn_norm.weight"
+         ],
+-        "mlp.linear_fc1.weight": [
+-            "model.layers.{layer_number}.mlp.gate_proj.weight",
+-            "model.layers.{layer_number}.mlp.up_proj.weight",
++        "mlp.router.tid2eid":[
++            "layers.{layer_number}.ffn.gate.tid2eid"
+         ],
+-        "mlp.shared_experts.linear_fc1.weight": [
+-            "model.layers.{layer_number}.mlp.shared_experts.gate_proj.weight",
+-            "model.layers.{layer_number}.mlp.shared_experts.up_proj.weight",
++        "mlp.shared_experts.linear_fc1.weight":[
++            "layers.{layer_number}.ffn.shared_experts.w1.weight",
++            "layers.{layer_number}.ffn.shared_experts.w3.weight"
+         ],
+-        "pre_mlp_layernorm.weight": [
+-            "model.layers.{layer_number}.post_attention_layernorm.weight"
++        "mlp.shared_experts.linear_fc2.weight":[
++            "layers.{layer_number}.ffn.shared_experts.w2.weight"
+         ],
+-        "mlp.router.weight": ["model.layers.{layer_number}.mlp.gate.weight"],
+-        "mlp.router.expert_bias": [
+-            "model.layers.{layer_number}.mlp.gate.e_score_correction_bias"
++        "mlp_mhc.hc_base":[
++           "layers.{layer_number}.hc_ffn_base"
++       ],
++        "mlp_mhc.hc_scale":[
++           "layers.{layer_number}.hc_ffn_scale"
++       ],
++       "mlp_mhc.hc_fn.weight":[
++           "layers.{layer_number}.hc_ffn_fn"],
++       r"mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight": [
++        "layers.{layer_number}.ffn.experts.{expert_id}.w1.weight",
++        "layers.{layer_number}.ffn.experts.{expert_id}.w3.weight"],
++       r"mlp\.experts\.local_experts\.(\d+)\.linear_fc2\.weight":[
++            "layers.{layer_number}.ffn.experts.{expert_id}.w2.weight"
+         ],
+-        "mlp.experts.linear_fc1.weight": [
+-            "model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
+-            "model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight",
+-        ],
+-        "mlp.experts.linear_fc2.weight": [
+-            "model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"
++        "mlp.router.weight":[
++            "layers.{layer_number}.ffn.gate.weight"
+         ],
++        "mlp.router.expert_bias":[
++            "layers.{layer_number}.ffn.gate.bias"
++        ]
+     }
+ 
+     _ATTENTION_MAPPING = {
+-        "input_layernorm.weight": [
+-            "model.layers.{layer_number}.input_layernorm.weight"
+-        ],
+-        "self_attention.linear_proj.weight": [
+-            "model.layers.{layer_number}.self_attn.o_proj.weight"
+-        ],
+-        "self_attention.linear_q_proj.weight": [
+-            "model.layers.{layer_number}.self_attn.q_proj.weight"
++        "input_layernorm.weight":[
++            "layers.{layer_number}.attn_norm.weight"
+         ],
+-        "self_attention.linear_kv_down_proj.weight": [
+-            "model.layers.{layer_number}.self_attn.kv_a_proj_with_mqa.weight"
++        "self_attention.attn_sink": [
++            "layers.{layer_number}.attn.attn_sink"
+         ],
+-        "self_attention.linear_kv_up_proj.layer_norm_weight": [
+-            "model.layers.{layer_number}.self_attn.kv_a_layernorm.weight"
++        "self_attention.kv_layernorm.weight": [
++            "layers.{layer_number}.attn.kv_norm.weight"
+         ],
+-        "self_attention.linear_kv_up_proj.weight": [
+-            "model.layers.{layer_number}.self_attn.kv_b_proj.weight"
++        "self_attention.q_layernorm.weight": [
++            "layers.{layer_number}.attn.q_norm.weight"
+         ],
+-        "self_attention.linear_q_down_proj.weight": [
+-            "model.layers.{layer_number}.self_attn.q_a_proj.weight"
++        "self_attention.linear_kv.weight": [
++            "layers.{layer_number}.attn.wkv.weight"
+         ],
+         "self_attention.linear_q_up_proj.weight": [
+-            "model.layers.{layer_number}.self_attn.q_b_proj.weight"
+-        ],
+-        "self_attention.linear_q_up_proj.layer_norm_weight": [
+-            "model.layers.{layer_number}.self_attn.q_a_layernorm.weight"
++            "layers.{layer_number}.attn.wq_b.weight"
+         ],
++        "self_attention.linear_q.weight": [
++           "layers.{layer_number}.attn.wq_a.weight"
++       ],
++        "self_attention.linear_o_down_proj.weight": [
++           "layers.{layer_number}.attn.wo_a.weight"
++       ],
++       "self_attention.linear_o_up_proj.weight":[
++           "layers.{layer_number}.attn.wo_b.weight"
++       ],
++       "attn_mhc.hc_base":[
++           "layers.{layer_number}.hc_attn_base"
++       ],
++        "attn_mhc.hc_scale":[
++           "layers.{layer_number}.hc_attn_scale"
++       ],
++       "attn_mhc.hc_fn.weight":[
++           "layers.{layer_number}.hc_attn_fn"
++       ],
++        "self_attention.compressor.ape": [
++           "layers.{layer_number}.attn.compressor.ape"
++       ],
++        "self_attention.compressor.wkv.weight": [
++           "layers.{layer_number}.attn.compressor.wkv.weight"
++       ],
++        "self_attention.compressor.wgate.weight": [
++           "layers.{layer_number}.attn.compressor.wgate.weight"
++       ],
++        "self_attention.compressor.norm.weight": [
++           "layers.{layer_number}.attn.compressor.norm.weight"
++       ],
++        "self_attention.indexer.wq_b.weight": [
++           "layers.{layer_number}.attn.indexer.wq_b.weight"
++       ],
++        "self_attention.indexer.kv_compressor.ape": [
++           "layers.{layer_number}.attn.indexer.compressor.ape"
++       ],
++        "self_attention.indexer.kv_compressor.wkv.weight": [
++           "layers.{layer_number}.attn.indexer.compressor.wkv.weight"
++       ],
++        "self_attention.indexer.kv_compressor.wgate.weight": [
++           "layers.{layer_number}.attn.indexer.compressor.wgate.weight"
++       ],
++        "self_attention.indexer.kv_compressor.norm.weight": [
++           "layers.{layer_number}.attn.indexer.compressor.norm.weight"
++       ],
++        "self_attention.indexer.weights_proj.weight": [
++           "layers.{layer_number}.attn.indexer.weights_proj.weight"
++       ]
+     }
+ 
+     _SHARED_STATE_DICT_MAPPING = {
+@@ -115,11 +161,6 @@ class DeepseekV3Bridge(LLMBridge):
+         if "rope_scaling" in hf_config and hf_config.rope_scaling is not None:
+             mla_rope_config.update(hf_config.rope_scaling)
+         moe_layer_freq = [1] * hf_config.num_hidden_layers
+-        for i in range(
+-            min(hf_config.first_k_dense_replace, hf_config.num_hidden_layers)
+-        ):
+-            moe_layer_freq[i] = 0
+-
+         mtp_args = {}
+         if "num_nextn_predict_layers" in hf_config:
+             mtp_args["mtp_num_layers"] = hf_config.num_nextn_predict_layers
+@@ -128,14 +169,14 @@ class DeepseekV3Bridge(LLMBridge):
+         return self._build_base_config(
+             attention_backend=AttnBackend.fused,
+             layernorm_epsilon=hf_config.rms_norm_eps,
+-            ffn_hidden_size=hf_config.intermediate_size,
++            # ffn_hidden_size=hf_config.intermediate_size,
+             qk_layernorm=True,
+             # moe specific
+             moe_ffn_hidden_size=hf_config.moe_intermediate_size,
+             moe_token_dispatcher_type="alltoall",
+             moe_router_bias_update_rate=0.001,
+             moe_router_enable_expert_bias=True,
+-            moe_router_topk=hf_config.num_experts_per_tok,
++            # moe_router_topk=hf_config.num_experts_per_tok,
+             num_moe_experts=hf_config.n_routed_experts,
+             moe_shared_expert_intermediate_size=hf_config.moe_intermediate_size
+             * hf_config.n_shared_experts,
+@@ -150,10 +191,10 @@ class DeepseekV3Bridge(LLMBridge):
+             moe_layer_freq=moe_layer_freq,
+             # MLA
+             q_lora_rank=hf_config.q_lora_rank,
+-            kv_lora_rank=hf_config.kv_lora_rank,
+-            qk_head_dim=hf_config.qk_nope_head_dim,
+-            qk_pos_emb_head_dim=hf_config.qk_rope_head_dim,
+-            v_head_dim=hf_config.v_head_dim,
++            # kv_lora_rank=hf_config.kv_lora_rank,
++            # qk_head_dim=hf_config.qk_nope_head_dim,
++            # qk_pos_emb_head_dim=hf_config.qk_rope_head_dim,
++            # v_head_dim=hf_config.v_head_dim,
+             rotary_base=hf_config.rope_theta,
+             rotary_scaling_factor=mla_rope_config["factor"],
+             rope_type=mla_rope_config["type"],
+@@ -288,6 +329,7 @@ class DeepseekV3Bridge(LLMBridge):
+         elif (
+             "self_attention" in mcore_weights_name
+             or "input_layernorm.weight" in mcore_weights_name
++            or "attn_mhc" in mcore_weights_name
+         ):
+             return self._weight_name_mapping_attention(mcore_weights_name)
+         elif "mlp" in mcore_weights_name:
+@@ -324,22 +366,22 @@ class DeepseekV3Bridge(LLMBridge):
+     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
+         layer_number = name.split(".")[2]
+         convert_names = []
+-        for keyword, mapping_names in self._MLP_MAPPING.items():
+-            if keyword in name:
+-                if "{expert_id}" in mapping_names[0]:
+-                    expert_id = name.split("weight")[-1]
+-                    convert_names.extend(
+-                        [
+-                            x.format(layer_number=layer_number, expert_id=expert_id)
+-                            for x in mapping_names
+-                        ]
+-                    )
+-                else:
+-                    convert_names.extend(
+-                        [x.format(layer_number=layer_number) for x in mapping_names]
+-                    )
+-                break
+-        if len(convert_names) == 0:
++        for pattern, mapping_names in self._MLP_MAPPING.items():
++            regex = re.compile(pattern)
++            match = regex.search(name)  
++            if match:
++                groups = match.groups()
++                for template in mapping_names:
++                    if "{expert_id}" in template:
++                        if not groups:
++                            raise ValueError(f"Pattern {pattern} matched but no capture group for expert_id")
++                        expert_id = groups[0]  # 
++                        convert_names.append(template.format(layer_number=layer_number, expert_id=expert_id))
++
++                    else:
++                        convert_names.append(template.format(layer_number=layer_number))
++                break 
++        if not convert_names:
+             raise NotImplementedError(f"Unsupported parameter name: {name}")
+         return convert_names
+ 
+diff --git a/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py b/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
+index 5012942..9942409 100644
+--- a/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
++++ b/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py
+@@ -31,7 +31,7 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
+             file_to_weight_map[filename].append(name)
+         for filename, weight_names in file_to_weight_map.items():
+             safetensor_file = os.path.join(hf_dir, filename)
+-            with safe_open(safetensor_file, framework="pt", device="cuda") as f:
++            with safe_open(safetensor_file, framework="pt", device="npu") as f:
+                 for name in weight_names:
+                     weight = f.get_tensor(name)
+                     scale_inv_name = f"{name}_scale_inv"
+@@ -48,7 +48,7 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
+                                         hf_dir, weight_to_file_map[scale_inv_name]
+                                     ),
+                                     framework="pt",
+-                                    device="cuda",
++                                    device="npu",
+                                 ) as f2:
+                                     scale_inv = f2.get_tensor(scale_inv_name)
+                             ret[name] = weight_dequant(weight, scale_inv)
