@@ -1,6 +1,6 @@
-# DeepSeek-V4-Flash on Atlas A3
+# DeepSeek-V4-Flash on Atlas A2
 
-本目录提供 DeepSeek-V4-Flash 在 Atlas A3 上进行 RLHF 后训练所需的源码补丁和安装入口。当前补丁基于 `code/` 下已验证的七个源码仓库整理，共 37 个，详细功能和应用顺序见 [patch-read.md](./patch-read.md)。
+本目录提供 DeepSeek-V4-Flash 在 Atlas 910b 上进行 RLHF 后训练所需的源码 patch 和安装入口。当前包含七个源码仓库的 37 个 patch，详细功能和应用顺序见 [patch-read.md](./patch-read.md)。
 
 ## 环境版本
 
@@ -26,10 +26,10 @@
 在用于保存七个源码仓库的父目录中执行：
 
 ```bash
-bash /path/to/verl-ascend-recipe/DeepSeek-V4-Flash/patch/A3/install.sh
+bash /path/to/verl-ascend-recipe/DeepSeek-V4-Flash/patch/A2/install.sh
 ```
 
-[install.sh](./install.sh) 会克隆并固定上表 commit，安装依赖，然后按编号应用各仓库补丁。每份补丁在应用前都会执行 `git apply --check`，任何一步失败都会立即停止。
+[install.sh](./install.sh) 会克隆并固定上表 commit，安装依赖，然后按编号应用各仓库 patch。每份 patch 在应用前都会执行 `git apply --check`，任何一步失败都会立即停止。
 
 ## 权重下载与反量化
 

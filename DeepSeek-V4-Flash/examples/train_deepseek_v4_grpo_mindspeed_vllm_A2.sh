@@ -11,7 +11,7 @@ set -euo pipefail
 
 # Project Configuration
 project_name='DeepSeekV4'
-trainer_logger='["console","wandb"]'
+trainer_logger='["console"]'
 
 # Node Info
 NNODES=4
@@ -203,7 +203,6 @@ ACTOR_CONFIG=(
     actor_rollout_ref.actor.mindspeed.router_replay.mode=R3
 
     # CPU optimizer 状态由 swap_optimizer 管理；optimizer_cpu_offload 保持关闭。
-
     ++actor_rollout_ref.actor.mindspeed.mcore_kwargs.swap_optimizer=${swap_optimizer}
     # DSA_ARGS
     ++actor_rollout_ref.actor.mindspeed.mcore_kwargs.enable_dsa_indexer=True
