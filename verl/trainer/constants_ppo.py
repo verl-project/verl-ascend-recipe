@@ -1,0 +1,221 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import logging
+import os
+from pathlib import Path
+
+import torch
+from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
+
+from verl.single_controller.ray.base import TRAINING_WORKER_OMP_NUM_THREADS_ENV
+from verl.utils.device import get_device_capability
+
+logger = logging.getLogger(__name__)
+
+_major, _ = get_device_capability()
+# Opt-in GB200 NCCL WAR: set TLLM_DISABLE_NVLS_MNNVL=1 in the launch shell to disable
+# both NCCL_NVLS_ENABLE and NCCL_MNNVL_ENABLE on Blackwell. Required by async-RL
+# Megatron on GB200 nodes without IMEX (weight export all_gather raises NCCL 801).
+_gb200_nccl_env = {}
+if (_major or 0) >= 10 and os.environ.get("TLLM_DISABLE_NVLS_MNNVL", "0") == "1":
+    _gb200_nccl_env = {"NCCL_NVLS_ENABLE": "0", "NCCL_MNNVL_ENABLE": "0"}
+
+# On ROCm, Ray 2.x force-clears accelerator visibility for num_gpus=0 actors
+# (e.g. the SGLang server actor), leaving them unable to see any GPU. Disable
+# that override so the actor keeps its HIP visibility. Scoped to ROCm to avoid
+# changing Ray's default behavior on other platforms.
+_rocm_ray_env = {}
+if torch.version.hip is not None:
+    _rocm_ray_env = {"RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0"}
+
+# CUDA_DEVICE_MAX_CONNECTIONS=1 is only needed by the Megatron engine on
+# pre-Blackwell Hopper/Ampere GPUs (compute capability 8.x/9.x) to serialize
+# kernel launches for TP/CP communication overlap. Blackwell/GB200 (>=10) does
+# not need it, and Torch-FSDP2 / Megatron-FSDP must NOT set it to 1. So we set
+# it conditionally at runtime (see get_ppo_ray_runtime_env), not unconditionally.
+#
+# https://github.com/NVIDIA/Megatron-LM/blob/core_v0.18.0/skills/mcore-run-on-slurm/SKILL.md#cuda_device_max_connections
+_is_hopper_or_ampere = (_major or 0) in (8, 9)
+
+
+def _uses_megatron(config) -> bool:
+    """Return True if any trainable engine in the config uses the Megatron strategy."""
+    if config is None:
+        return False
+    from omegaconf import OmegaConf
+
+    for key in ("actor_rollout_ref.actor.strategy", "critic.strategy"):
+        if OmegaConf.select(config, key, default=None) == "megatron":
+            return True
+    return False
+
+
+def _uses_torch_profiler(config) -> bool:
+    """Return True if the run collects traces with the torch profiler."""
+    if config is None:
+        return False
+    from omegaconf import OmegaConf
+
+    return OmegaConf.select(config, "global_profiler.tool", default=None) == "torch"
+
+
+# CUPTI only accepts one subscriber per process. Some CUDA images install a startup hook that
+# points this variable at libcupti.so, which makes the first NVTX range in a process load libcupti
+# as the NVTX handler and claim that slot. Kineto then fails to subscribe with
+# CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED and silently drops every CUDA activity, so torch
+# traces come out with CPU ops only and no GPU kernels. verl emits NVTX ranges itself (see
+# marked_timer), so disabling NCCL's NVTX ranges alone does not avoid it.
+NVTX_INJECTION_ENV = "NVTX_INJECTION64_PATH"
+# Deliberately non-empty and unloadable: NVTX injection stays a no-op, and startup hooks that only
+# fill the variable in when it is unset will not put libcupti back.
+_NVTX_INJECTION_DISABLED = "/nonexistent/verl-disabled-nvtx-injection.so"
+
+
+def available_physical_cores() -> int:
+    """Return the number of physical CPU cores available to this process."""
+    try:
+        available_cpus = os.sched_getaffinity(0)
+    except AttributeError:
+        return os.cpu_count() or 1
+
+    physical_cores = set()
+    for cpu in available_cpus:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package_id = (topology / "physical_package_id").read_text().strip()
+            core_id = (topology / "core_id").read_text().strip()
+        except OSError:
+            return len(available_cpus)
+        physical_cores.add((package_id, core_id))
+    return len(physical_cores) or 1
+
+
+def _default_omp_num_threads(config) -> int:
+    from omegaconf import OmegaConf
+
+    n_gpus_per_node = OmegaConf.select(config, "trainer.n_gpus_per_node", default=1) if config is not None else 1
+    n_gpus_per_node = max(int(n_gpus_per_node or 1), 1)
+    return max(available_physical_cores() // n_gpus_per_node, 1)
+
+
+# The process-level part of vLLM's batch invariance that the actor forward needs: the cuBLAS workspace
+# pair enable_batch_invariant_mode() sets on SM90/SM100, where cuBLAS is the only matmul path, plus the
+# vLLM switches. cuBLAS reads its workspace config when it initializes, so this is exported before the
+# workers start. vLLM's NCCL profile is not forwarded: the rollout process writes it itself from
+# VLLM_BATCH_INVARIANT, and it would throttle the training collectives.
+BATCH_INVARIANT_ENV = {
+    "VLLM_BATCH_INVARIANT": "1",
+    "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+    "VLLM_USE_AOT_COMPILE": "0",
+    "CUBLAS_WORKSPACE_CONFIG": ":16:8",
+    "CUBLASLT_WORKSPACE_SIZE": "1",
+}
+
+
+def export_batch_invariant_env():
+    """Export BATCH_INVARIANT_ENV into this process so get_ppo_ray_runtime_env() forwards it."""
+    os.environ.update(BATCH_INVARIANT_ENV)
+
+
+def batch_invariant_requested(config) -> bool:
+    """Whether any FSDP engine in the resolved config sets ``batch_invariant``.
+
+    The flag lives on the shared FSDP engine schema, so the critic and the ref expose it too; every
+    worker that installs the overrides needs the cuBLAS env exported before it starts.
+    """
+    engine_configs = (
+        config.actor_rollout_ref.actor.get("fsdp_config"),
+        config.actor_rollout_ref.ref.get("fsdp_config"),
+        config.critic.get("fsdp"),
+    )
+    return any(
+        engine_config is not None and engine_config.get("batch_invariant", False) for engine_config in engine_configs
+    )
+
+
+PPO_RAY_RUNTIME_ENV = {
+    "env_vars": {
+        "TOKENIZERS_PARALLELISM": "true",
+        "NCCL_DEBUG": "WARN",
+        "VLLM_LOGGING_LEVEL": "WARN",
+        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+        # Needed for multi-processes colocated on same NPU device
+        # https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/maintenref/envvar/envref_07_0143.html
+        "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+        "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+        "HSA_NO_SCRATCH_RECLAIM": "1",
+        **_gb200_nccl_env,
+        **_rocm_ray_env,
+    },
+}
+
+
+def get_ppo_ray_runtime_env(config=None):
+    """
+    A filter function to return the PPO Ray runtime environment.
+    To avoid repeat of some environment variables that are already set.
+
+    Args:
+        config: Optional training config. When the engine strategy is Megatron
+            and the GPU is Hopper/Ampere, CUDA_DEVICE_MAX_CONNECTIONS=1 is set.
+    """
+    job_runtime_env = json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}")).get("runtime_env", {})
+    working_dir = job_runtime_env.get("working_dir", None)
+
+    runtime_env = {
+        "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
+        **({"working_dir": None} if working_dir is None else {}),
+    }
+    # Only Megatron on Hopper/Ampere needs CUDA_DEVICE_MAX_CONNECTIONS=1.
+    if _is_hopper_or_ampere and _uses_megatron(config):
+        runtime_env["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    for key in list(runtime_env["env_vars"].keys()):
+        if os.environ.get(key) is not None:
+            runtime_env["env_vars"].pop(key, None)
+    # With CPU offload the training workers run gradient accumulation and the optimizer step on the
+    # host, so they get the large thread count. Nobody else does: set job-wide it also reaches rollout
+    # servers and agent loop workers, whose many small tensor ops then oversubscribe the node.
+    if os.environ.get("OMP_NUM_THREADS") is None and "OMP_NUM_THREADS" not in job_runtime_env.get("env_vars", {}):
+        runtime_env["env_vars"][TRAINING_WORKER_OMP_NUM_THREADS_ENV] = str(_default_omp_num_threads(config))
+    # Set after the loop above on purpose: the point is to override an inherited value, so it must
+    # survive the "already set in the launching shell" filter.
+    if _uses_torch_profiler(config) and os.environ.get("VERL_KEEP_NVTX_INJECTION", "0") != "1":
+        runtime_env["env_vars"][NVTX_INJECTION_ENV] = _NVTX_INJECTION_DISABLED
+        logger.warning(
+            "global_profiler.tool=torch: setting %s=%s for all workers so Kineto can subscribe to "
+            "CUPTI and record GPU kernels. Set VERL_KEEP_NVTX_INJECTION=1 to keep the inherited "
+            "value (%s), at the cost of traces without CUDA activity.",
+            NVTX_INJECTION_ENV,
+            _NVTX_INJECTION_DISABLED,
+            os.environ.get(NVTX_INJECTION_ENV) or "unset",
+        )
+    # Always forward these at call-time, not import-time.
+    for key in ("VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
+        runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    # Forward only when set: empty string breaks vLLM ParallelConfig int parsing.
+    for key in (
+        "VLLM_DISABLE_COMPILE_CACHE",
+        "PYTHONHASHSEED",
+        "CUBLAS_WORKSPACE_CONFIG",
+        "FLASH_ATTENTION_DETERMINISTIC",
+        "NCCL_DETERMINISTIC",
+        "NCCL_ALGO",
+        *BATCH_INVARIANT_ENV,
+    ):
+        val = os.environ.get(key)
+        if val is not None:
+            runtime_env["env_vars"][key] = val
+    return runtime_env

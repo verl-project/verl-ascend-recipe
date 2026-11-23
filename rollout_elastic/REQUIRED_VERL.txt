@@ -1,9 +1,0 @@
-# rollout_elastic adaptation baseline: verl 0.9.0
-UPSTREAM=https://github.com/verl-project/verl.git
-MODE=pinned_tag
-TAG=v0.9.0
-COMMIT=483b8a009ba3a97563edee3a19887e4862b8094a
-PIP_INSTALL=pip install verl==0.9.0
-GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout v0.9.0 && pip install -e .
-RECIPE_FOLDER=rollout_elastic
-NOTES=This recipe targets verl 0.9.0. Install platform-specific training and inference dependencies separately. Revalidate patches before upgrading verl.

@@ -1,9 +1,0 @@
-# true_on_policy — Ascend NPU train-infer consistency (GRPO / GSPO / DAPO)
-UPSTREAM=https://github.com/verl-project/verl.git
-MODE=pinned_tag
-TAG=release/v0.8.0
-PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@release/v0.8.0
-GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout release/v0.8.0 && git submodule update --init --recursive recipe && mkdir -p verl_ascend_recipe && cp -r ../verl-ascend-recipe/true_on_policy verl_ascend_recipe/ && pip install -e .
-RECIPE_FOLDER=true_on_policy
-NOTES=Verl source patches are selected by version at import time (VERL_USE_EXTERNAL_MODULES=verl_ascend_recipe.true_on_policy.patch): release/v0.8.x uses verl_npu_pp_per_request_seed_v0.8.0.patch, main uses verl_npu_pp_per_request_seed_main.patch (NPU PP + per-request seed), plus verl_mindspeed_batch_invariant.patch when not upstream. Copy this recipe into verl/verl_ascend_recipe/true_on_policy. Additional stack pins are in README.md.
-REFRESH=When NPU PP and per-request seed land in release/v0.8.0/main, remove obsolete patch files and selector branches; update TAG/COMMIT and PIP_INSTALL. From verl-ascend-recipe root: ./install_verl.sh --recipe true_on_policy --method git --show
