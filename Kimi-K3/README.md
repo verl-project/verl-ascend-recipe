@@ -82,11 +82,13 @@ git -C "$WORK/vllm" checkout --detach ced6857afa0ea7b2e3f0846a62e1394e90f15607
 git -C "$WORK/vllm-ascend" checkout --detach cb629ea1925a280d57b41b48416a85097f6cdb6b
 
 # 应用Patch
-PATCH_DIR="$WORK/verl-ascend-recipe/Kimi-K3/patch"
-git -C "$WORK/verl" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/verl.patch"
-git -C "$WORK/FSDPTurbo" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/fsdpturbo.patch"
-git -C "$WORK/vllm-ascend" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/vllm-ascend.patch"
-git -C "$WORK/vllm-ascend" submodule update --init --recursive
+cd verl
+git am --keep ../verl-ascend-recipe/Kimi-K3/patch/verl.patch
+cd ../FSDPTurbo
+git am --keep ../verl-ascend-recipe/Kimi-K3/patch/fsdpturbo.patch
+cd ../vllm-ascend
+git am --keep ../verl-ascend-recipe/Kimi-K3/patch/vllm-ascend.patch
+git submodule update --init --recursive
 
 cp "$WORK/verl-ascend-recipe/Kimi-K3/examples/ray_start_4nodes_a3.sh" "$WORK/"
 # 脚本若经 Windows 下载或复制，统一为 Unix LF 换行。
@@ -114,30 +116,15 @@ COMPILE_CUSTOM_KERNELS=1 SOC_VERSION=ascend910_9392 MAX_JOBS=32 \
 cd "$WORK"
 ```
 
-四个容器全部安装完成后，分别执行以下启动命令；节点 IP、网卡名、模型和数据路径按实际环境设置，四个容器使用同一个 `VERL_RUN_NAME`。
+在 `ray_start_4nodes_a3.sh` 顶部配置 `MASTER_ADDR`（Head 通信网卡的 IPv4 地址）、`RAY_PORT` 和 `NNODES`（含 Head，默认 4）。路径区的 `ROOT` 指向框架工作目录（如/mnt/share/kimi-k3-a3），`MODEL_PATH_DIR` 指向模型目录，`DATASET_DIR` 指向包含 `train_448.parquet` 的目录。
+
+每个容器执行同一脚本。脚本从 `HCCL_SOCKET_IFNAME`（默认 `enp48s3u1u1`）读取本机 IPv4，与 `MASTER_ADDR` 相同的节点启动 Head，其余节点加入 Ray。网卡名不同时可在对应容器覆盖此变量。Head 等到指定数量的节点就绪、每节点 16 张 NPU 可用后启动训练。训练步数由 `VERL_TOTAL_TRAINING_STEPS` 控制，默认训练 200 步并保存 rollout。
 
 ```bash
-# 启动训练（四个容器分别执行）
-export KIMI_RELEASE_ROOT=/mnt/share/kimi-k3-a3
-export MASTER_ADDR=192.168.0.4
-export KIMI_NODE_IPS='192.168.0.1 192.168.0.2 192.168.0.3 192.168.0.4'
-export HCCL_SOCKET_IFNAME=enp48s3u1u1
-export GLOO_SOCKET_IFNAME="$HCCL_SOCKET_IFNAME"
-export RAY_PORT=6788
-# 本次验证运行 10 个训练步骤，可按实验需要调整。
-export VERL_TOTAL_TRAINING_STEPS=10
-export MODEL_PATH=/mnt/share/models/K3-top16-pruned_bf16_countbench_128_n4
-export TRAIN_FILE=/mnt/share/datasets/countbenchqa_lite/train_448.parquet
-export VERL_RUN_NAME=kimi_k3_a3_release_run01
-export VERL_EXPERIMENT_NAME="$VERL_RUN_NAME"
-export VERL_SAVE_ROLLOUT=true
-export HYDRA_FULL_ERROR=1
-cd "$KIMI_RELEASE_ROOT"
-
-mkdir -p "runs/$VERL_RUN_NAME"
-nohup bash ray_start_4nodes_a3.sh \
-  > "runs/$VERL_RUN_NAME/launcher.$(hostname -s).log" 2>&1 < /dev/null &
+# 四个容器分别执行（按实际共享目录调整脚本路径）
+bash /mnt/share/kimi-k3-a3/ray_start_4nodes_a3.sh
 ```
+
 ## 3. A5 四节点环境部署与启动
 ```
 # A5镜像
