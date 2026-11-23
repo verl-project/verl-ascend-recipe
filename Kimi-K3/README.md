@@ -114,30 +114,26 @@ COMPILE_CUSTOM_KERNELS=1 SOC_VERSION=ascend910_9392 MAX_JOBS=32 \
 cd "$WORK"
 ```
 
-四个容器全部安装完成后，分别执行以下启动命令；节点 IP、网卡名、模型和数据路径按实际环境设置，四个容器使用同一个 `VERL_RUN_NAME`。
+在 `ray_start_4nodes_a3.sh` 顶部配置 `MASTER_ADDR`（Head 通信网卡的 IPv4 地址）、`RAY_PORT` 和 `NNODES`（含 Head，默认 4）。路径区的 `ROOT` 指向框架工作目录（如/mnt/share/kimi-k3-a3），`MODEL_PATH_DIR` 指向模型目录，`DATASET_DIR` 指向包含 `train_448.parquet` 的目录。
+
+每个容器执行同一脚本。脚本从 `HCCL_SOCKET_IFNAME`（默认 `enp48s3u1u1`）读取本机 IPv4，与 `MASTER_ADDR` 相同的节点启动 Head，其余节点加入 Ray。网卡名不同时可在对应容器覆盖此变量。Head 等到指定数量的节点就绪、每节点 16 张 NPU 可用后启动训练。训练步数由 `VERL_TOTAL_TRAINING_STEPS` 控制，默认训练 200 步并保存 rollout。
 
 ```bash
-# 启动训练（四个容器分别执行）
-export KIMI_RELEASE_ROOT=/mnt/share/kimi-k3-a3
-export MASTER_ADDR=192.168.0.4
-export KIMI_NODE_IPS='192.168.0.1 192.168.0.2 192.168.0.3 192.168.0.4'
-export HCCL_SOCKET_IFNAME=enp48s3u1u1
-export GLOO_SOCKET_IFNAME="$HCCL_SOCKET_IFNAME"
-export RAY_PORT=6788
-# 本次验证运行 10 个训练步骤，可按实验需要调整。
-export VERL_TOTAL_TRAINING_STEPS=10
-export MODEL_PATH=/mnt/share/models/K3-top16-pruned_bf16_countbench_128_n4
-export TRAIN_FILE=/mnt/share/datasets/countbenchqa_lite/train_448.parquet
-export VERL_RUN_NAME=kimi_k3_a3_release_run01
-export VERL_EXPERIMENT_NAME="$VERL_RUN_NAME"
-export VERL_SAVE_ROLLOUT=true
-export HYDRA_FULL_ERROR=1
-cd "$KIMI_RELEASE_ROOT"
-
-mkdir -p "runs/$VERL_RUN_NAME"
-nohup bash ray_start_4nodes_a3.sh \
-  > "runs/$VERL_RUN_NAME/launcher.$(hostname -s).log" 2>&1 < /dev/null &
+# 四个容器分别执行（按实际共享目录调整脚本路径）
+bash /mnt/share/kimi-k3-a3/ray_start_4nodes_a3.sh
 ```
+
+单机验证时，将脚本中的 `NNODES` 设为 `1`，`MASTER_ADDR` 设为本机通信网卡的 IPv4，`MODEL_PATH_DIR` 指向已准备好的 12 层模型。用以下命令校验配置后执行 2 步功能验证。`KIMI_EXPECTED_MODEL_LAYERS` 只检查模型层数，不会裁剪模型；默认值仍为 93。单机由训练脚本创建本地 Ray，多机由启动脚本创建或加入 Ray 集群。
+
+```bash
+KIMI_EXPECTED_MODEL_LAYERS=12 VERL_TOTAL_TRAINING_STEPS=2 \
+  bash /mnt/share/kimi-k3-a3/ray_start_4nodes_a3.sh --dry-run
+KIMI_EXPECTED_MODEL_LAYERS=12 VERL_TOTAL_TRAINING_STEPS=2 \
+  bash /mnt/share/kimi-k3-a3/ray_start_4nodes_a3.sh
+```
+
+镜像预设的 `PYTHONPATH=/vllm` 可能使独立导入检查仍加载镜像源码；检查时需将本次工作目录中的框架源码放在 `PYTHONPATH` 前面，并核对各模块的 `__file__`。训练脚本会设置自己的源码路径。
+
 ## 3. A5 四节点环境部署与启动
 ```
 # A5镜像
