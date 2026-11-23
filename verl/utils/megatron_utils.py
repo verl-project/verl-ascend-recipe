@@ -353,6 +353,13 @@ def make_megatron_module(
             ddp_config = DistributedDataParallelConfig(**ddp_config_dict)
             ddp_config.finalize()
 
+    # Select the wrapper before DDP constructs dtype-specific parameter buffers.
+    precision_kwargs = {}
+    if override_model_config.get("preserve_gdn_a_log_fp32", False):
+        from verl.models.mcore.npu_precision import GDNFloat16Module
+
+        precision_kwargs["mixed_precision_wrapper"] = GDNFloat16Module
+
     # Now call provide_distributed_model with all hooks registered
     # Hooks will be applied automatically before DDP wrapping
     model = provider.provide_distributed_model(
@@ -361,6 +368,7 @@ def make_megatron_module(
         fp16=provider.fp16,
         bf16=provider.bf16,
         use_megatron_fsdp=wrap_config.use_megatron_fsdp,
+        **precision_kwargs,
     )
 
     if layer_wise_ddp:

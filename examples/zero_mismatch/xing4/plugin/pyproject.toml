@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verl-xing4-zero-mismatch"
+version = "0.1.0"
+description = "Explicit entry point for the pinned Xing4 Ascend numerical recipe"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+xing4_zero_mismatch = "xing_zero_mismatch:register"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xing_zero_mismatch*"]

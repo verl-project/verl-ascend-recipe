@@ -203,10 +203,17 @@ def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.
     return (sum_exp_squared / sum_exp.pow(2)).squeeze(dim=-1)
 
 
-def vocab_parallel_log_probs_from_logits(logits, labels):
+def vocab_parallel_log_probs_from_logits(logits, labels, npu_batch_invariant_reduction=False):
     """TODO(zhangchi.usc1992): We may change the implementation later"""
     from megatron.core import tensor_parallel
 
+    if npu_batch_invariant_reduction:
+        if logits.device.type != "npu":
+            raise ValueError("npu_batch_invariant_reduction requires NPU logits")
+        from verl.utils.kernel.npu.vocab_reduction import NpuVocabReductionMode
+
+        with NpuVocabReductionMode(logits.shape[-1]):
+            return -tensor_parallel.vocab_parallel_cross_entropy(vocab_parallel_logits=logits, target=labels)
     return -tensor_parallel.vocab_parallel_cross_entropy(vocab_parallel_logits=logits, target=labels)
 
 

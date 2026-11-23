@@ -32,6 +32,15 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def weight_sync_zmq_handle(job_id, replica_rank, local_rank) -> str:
+    """Use a shared, configurable IPC directory on trainer and rollout workers."""
+    directory = os.environ.get("VERL_WEIGHT_SYNC_IPC_DIR", "/tmp")
+    if not os.path.isabs(directory):
+        raise ValueError("VERL_WEIGHT_SYNC_IPC_DIR must be an absolute directory")
+    filename = f"rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{local_rank}.sock"
+    return "ipc://" + os.path.join(directory, filename)
+
+
 class TensorMetadata(TypedDict):
     name: str
     shape: torch.Size

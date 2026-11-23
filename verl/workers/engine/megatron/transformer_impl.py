@@ -546,6 +546,20 @@ class MegatronEngine(BaseEngine):
 
     def initialize(self):
         self._hf_export_tasks = None
+        self._fla_registration = None
+        if get_device_name() == "npu" and self.engine_config.override_transformer_config.get("use_ascend_gdn", False):
+            from verl.utils.kernel.npu.fla_compat import register_fla_legacy_ops
+
+            self._fla_registration, registered_ops = register_fla_legacy_ops()
+            if registered_ops:
+                logger.info("Registered split FLA compatibility operators: %s", registered_ops)
+        self._batch_invariant_registration = None
+        if self.engine_config.override_mcore_model_config.get("npu_batch_invariant_matmul", False):
+            if get_device_name() != "npu":
+                raise ValueError("npu_batch_invariant_matmul requires the NPU backend")
+            from verl.utils.kernel.npu.batch_invariant import enable_batch_invariant_matmul
+
+            self._batch_invariant_registration = enable_batch_invariant_matmul()
         self._build_tf_config()
         _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
 
@@ -1021,6 +1035,12 @@ class MegatronEngine(BaseEngine):
             return None
         if self._hf_export_tasks is None:
             self._hf_export_tasks = self.bridge.get_conversion_tasks(self.module)
+            if self.engine_config.override_mcore_model_config.get("preserve_gdn_norm_export_fp32", False):
+                if get_device_name() != "npu":
+                    raise ValueError("preserve_gdn_norm_export_fp32 requires the NPU backend")
+                from verl.models.mcore.npu_weight_export import preserve_gdn_norm_export_fp32
+
+                self._hf_export_tasks = preserve_gdn_norm_export_fp32(self._hf_export_tasks)
         return self._hf_export_tasks
 
     def get_per_tensor_param(self, base_sync_done=False, **kwargs):
@@ -1245,7 +1265,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if not distillation_only:
             # the cross entropy shifts fp32 logits in place; the score centering hook re-reads them in backward
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(
-                logits_bak.clone() if score_centering else logits_bak, label
+                logits_bak.clone() if score_centering else logits_bak,
+                label,
+                npu_batch_invariant_reduction=self.engine_config.override_mcore_model_config.get(
+                    "npu_batch_invariant_reduction", False
+                ),
             )
 
         return ret

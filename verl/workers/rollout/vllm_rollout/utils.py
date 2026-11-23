@@ -41,7 +41,7 @@ from verl.utils.vllm.vllm_quant_utils import (
     process_quanted_weights_after_loading,
 )
 from verl.utils.vllm.vllm_unquant_utils import fold_unquantized_moe_params, stage_unquantized_moe_params
-from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver, weight_sync_zmq_handle
 from verl.workers.rollout.vllm_rollout.weight_update_utils import (
     apply_buffer_updates,
     drop_tied_alias_updates,
@@ -462,7 +462,7 @@ class vLLMColocateWorkerExtension:
         local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)
         trainer_rank_base = os.environ.get("VERL_ZMQ_BASE_TRAINER_RANK")
         trainer_rank = int(trainer_rank_base) + local_rank if trainer_rank_base is not None else local_rank
-        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
+        return weight_sync_zmq_handle(job_id, replica_rank, trainer_rank)
 
     def update_verl_delta_weights(self, update_info: dict) -> None:
         """Add this worker's IPC endpoint and forward the delta update to vLLM."""

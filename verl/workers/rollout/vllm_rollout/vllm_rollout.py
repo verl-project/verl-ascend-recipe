@@ -40,7 +40,7 @@ from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender, weight_sync_zmq_handle
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -138,7 +138,7 @@ class ServerAdapter(BaseRollout):
         # stale socket file) cannot collide on the shared /tmp namespace.
         local_rank = self.rollout_rank % local_world_size
         job_id = ray.get_runtime_context().get_job_id()
-        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        self.zmq_handle = weight_sync_zmq_handle(job_id, self.replica_rank, local_rank)
 
         self.use_shm = not is_support_ipc()
         self._delta_weight_transfer_engine_initialized = False
