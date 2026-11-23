@@ -42,7 +42,7 @@ docker pull quay.io/ascend/verl:latest-vllm-a3-ubuntu
 git clone https://github.com/verl-project/verl-ascend-recipe.git
 
 # 然后执行安装步骤
-bash verl-ascend-recipe/low_precision/Qwen3-30B-A3B/install.sh
+bash verl-ascend-recipe/low_precision/megatron/install.sh
 ```
 
 ### 权重下载与quant_model_description.json文件生成
@@ -66,5 +66,5 @@ python /verl-ascend-recipe/low_precision/tool/smart_create_quant_weight_dir.py /
 
 ```bash
 cd /verl
-bash ../verl-ascend-recipe/low_precision/Qwen3-30B-A3B/examples/ray_start.sh
+bash ../verl-ascend-recipe/low_precision/megatron/examples/ray_start.sh
 ```
