@@ -1,9 +1,45 @@
 #!/usr/bin/env bash
-# A3 release run: 4x16 NPUs, rollout TP/EP=16, no checkpoint save/resume.
-# Run on all four nodes with the same VERL_RUN_NAME; --dry-run only resolves config.
+# A3 release run: 16 NPUs per node, rollout TP/EP=16, no checkpoint save/resume.
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-ROOT="${KIMI_RELEASE_ROOT:-$SCRIPT_DIR}"
+
+# ==================== 只修改这三个参数 ====================
+MASTER_ADDR=xxx.xxx.xxx.xxx
+RAY_PORT=xxxx
+NNODES=4
+
+# ==================== 路径配置 ====================
+ROOT=/path/to/root
+MODEL_PATH_DIR=/path/to/model/weight
+DATASET_DIR=/path/to/dataset
+
+export VERL_RUN_NAME="kimi_k3_200steps_20261109"
+export RAY_ADDRESS="$MASTER_ADDR:$RAY_PORT"
+
+export MASTER_ADDR RAY_PORT NNODES
+export KIMI_RELEASE_ROOT="$ROOT" MODEL_PATH="$MODEL_PATH_DIR"
+export TRAIN_FILE="$DATASET_DIR"
+if [[ -d "$TRAIN_FILE" ]]; then TRAIN_FILE="${TRAIN_FILE%/}/train_448.parquet"; fi
+export TEST_FILE="$TRAIN_FILE"
+
+# ==================== 训练配置 ====================
+export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-enp48s3u1u1}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$HCCL_SOCKET_IFNAME}"
+export VERL_EXPERIMENT_NAME="${VERL_EXPERIMENT_NAME:-$VERL_RUN_NAME}"
+export VERL_TOTAL_TRAINING_STEPS="${VERL_TOTAL_TRAINING_STEPS:-200}"
+export KIMI_EXPECTED_MODEL_LAYERS="${KIMI_EXPECTED_MODEL_LAYERS:-93}"
+export VERL_SAVE_ROLLOUT="${VERL_SAVE_ROLLOUT:-true}"
+export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
+
+[[ "$NNODES" =~ ^[1-9][0-9]*$ ]] || { echo 'NNODES must be a positive integer' >&2; exit 1; }
+[[ "$RAY_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( RAY_PORT <= 65535 )) || { echo 'Invalid RAY_PORT' >&2; exit 1; }
+[[ "$VERL_RUN_NAME" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'Invalid VERL_RUN_NAME' >&2; exit 1; }
+cd "$ROOT"
+RUN_DIR="$ROOT/runs/$VERL_RUN_NAME"
+mkdir -p "$RUN_DIR"
+if [[ "${1:-}" == --log ]]; then
+    shift
+    exec >>"$RUN_DIR/launcher.$(hostname -s).log" 2>&1
+fi
 TRAINER="$ROOT/verl/examples/ascend_extras/grpo_trainer/run_kimi_k3_fsdpturbo.sh"
 [[ -f "$TRAINER" ]] || { echo "Missing trainer: $TRAINER" >&2; exit 1; }
 DRY_RUN=false
@@ -40,35 +76,18 @@ fi
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib/aarch64-linux-gnu:/usr/lib64:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:${LD_LIBRARY_PATH:-}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 RAY_DEDUP_LOGS=0 RAY_USAGE_STATS_ENABLED=0
-export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-enp48s3u1u1}"
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$HCCL_SOCKET_IFNAME}"
 export HCCL_HOST_SOCKET_PORT_RANGE=30000-30999 HCCL_NPU_SOCKET_PORT_RANGE=31000-31999 HCCL_IF_BASE_PORT=30000
 export HCCL_CONNECT_TIMEOUT=1500 HCCL_EXEC_TIMEOUT=17340 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=256
 export OMP_NUM_THREADS=10 OMP_PROC_BIND=false VLLM_USE_V1=1 VLLM_USE_V2_MODEL_RUNNER=1
 export TASK_QUEUE_ENABLE=1 STREAMS_PER_DEVICE=32 CUDA_DEVICE_MAX_CONNECTIONS=1 TORCHDYNAMO_DISABLE=1
 unset VLLM_KV_CACHE_LAYOUT
 ulimit -n 65536
-cd "$ROOT"
 
-MASTER_ADDR="${MASTER_ADDR:?Set MASTER_ADDR to the Ray head IP}"
-read -r -a NODES <<< "${KIMI_NODE_IPS:?Set KIMI_NODE_IPS to all four node IPs}"
-[[ ${#NODES[@]} -eq 4 ]] || { echo 'Expected four node IPs' >&2; exit 1; }
-[[ " ${NODES[*]} " == *" $MASTER_ADDR "* ]] || { echo 'MASTER_ADDR must be in KIMI_NODE_IPS' >&2; exit 1; }
-[[ $(printf '%s\n' "${NODES[@]}" | sort -u | wc -l) -eq 4 ]] || { echo 'Node IPs must be unique' >&2; exit 1; }
-RAY_PORT="${RAY_PORT:-6788}"
-export NNODES=${#NODES[@]} NPUS_PER_NODE=16 KIMI_RUN_MODE=multinode
+export NPUS_PER_NODE=16 KIMI_RUN_MODE=multinode
+if (( NNODES == 1 )); then export KIMI_RUN_MODE=single; fi
 export ASCEND_RT_VISIBLE_DEVICES="$(seq -s, 0 $((NPUS_PER_NODE - 1)))"
-export RAY_ADDRESS="$MASTER_ADDR:$RAY_PORT"
-export VERL_RUN_NAME="${VERL_RUN_NAME:-kimi_k3_release64_$(date +%Y%m%d)}"
-[[ "$VERL_RUN_NAME" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'Invalid VERL_RUN_NAME' >&2; exit 1; }
-RUN_DIR="$ROOT/runs/$VERL_RUN_NAME"
-mkdir -p "$RUN_DIR"
 export VERL_PROJECT_NAME=Kimi-K3-release
-export VERL_EXPERIMENT_NAME="${VERL_EXPERIMENT_NAME:-${VERL_RUN_NAME}_$(date +%Y%m%d_%H%M%S)}"
-export MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the full 93-layer model directory}"
-export TRAIN_FILE="${TRAIN_FILE:?Set TRAIN_FILE to the prepared CountBenchQA parquet}"
-export TEST_FILE="$TRAIN_FILE"
-export VERL_TOTAL_TRAINING_STEPS="${VERL_TOTAL_TRAINING_STEPS:-200}" VERL_SAVE_FREQ=-1 VERL_RESUME_MODE=disable
+export VERL_SAVE_FREQ=-1 VERL_RESUME_MODE=disable
 unset VERL_RESUME_FROM_PATH VERL_CHECKPOINT_DIR VERL_MAX_ACTOR_CKPT_TO_KEEP KIMI_RESUME_STEP
 export TRAIN_BATCH_SIZE=16 ROLLOUT_N=4 PPO_MINI_BATCH_SIZE=16
 export ROLLOUT_TP=16 ROLLOUT_DP=1 TURBO_EP_SIZE=16 TURBO_CP_SIZE=1
@@ -76,25 +95,35 @@ export VLLM_ASCEND_ENABLE_MC2_HIERARCHY_COMM=False
 export VERL_MAX_RESPONSE_LENGTH=2048 VERL_VLLM_MAX_NUM_SEQS=64 VERL_VLLM_MAX_NUM_BATCHED_TOKENS=8192
 export VERL_VLLM_ENFORCE_EAGER=False VERL_VLLM_MULTIMODAL_TOKEN_MARGIN=16384 VERL_VLLM_MAX_MODEL_LEN=19456
 export VERL_ROLLOUT_DATA_DIR="$RUN_DIR/rollout_dump"
-case "${VERL_SAVE_ROLLOUT:-false}" in
+case "$VERL_SAVE_ROLLOUT" in
     true) ROLLOUT_DATA_DIR="$VERL_ROLLOUT_DATA_DIR" ;;
     false) ROLLOUT_DATA_DIR=null ;;
     *) echo 'VERL_SAVE_ROLLOUT must be true or false' >&2; exit 1 ;;
 esac
-NODE_IP=$("$PYTHON_BIN" - "$HCCL_SOCKET_IFNAME" <<'PY'
-import fcntl, socket, struct, sys
+NODE_IP=$("$PYTHON_BIN" - "$HCCL_SOCKET_IFNAME" "$MASTER_ADDR" <<'PY'
+import fcntl, ipaddress, socket, struct, sys
+try:
+    ipaddress.IPv4Address(sys.argv[2])
+except ValueError:
+    raise SystemExit(f'MASTER_ADDR must be the IPv4 address of the Ray head: {sys.argv[2]}')
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
-    address = fcntl.ioctl(connection.fileno(), 0x8915, struct.pack('256s', sys.argv[1].encode()[:15]))
+    try:
+        address = fcntl.ioctl(connection.fileno(), 0x8915, struct.pack('256s', sys.argv[1].encode()[:15]))
+    except OSError as exc:
+        raise SystemExit(f'Cannot read IPv4 on {sys.argv[1]}: {exc}. Check HCCL_SOCKET_IFNAME.')
     print(socket.inet_ntoa(address[20:24]))
 PY
 )
 export NODE_IP
-[[ " ${NODES[*]} " == *" $NODE_IP "* ]] || { echo "Unexpected node: $NODE_IP" >&2; exit 1; }
+printf 'Node IP: %s (%s), Ray head: %s, expected nodes: %s\n' "$NODE_IP" "$HCCL_SOCKET_IFNAME" "$RAY_ADDRESS" "$NNODES"
+[[ -f "$TRAIN_FILE" ]] || { echo "Missing training dataset: $TRAIN_FILE" >&2; exit 1; }
 "$PYTHON_BIN" - "$MODEL_PATH/config.json" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 config = json.loads(pathlib.Path(sys.argv[1]).read_text())
-if config.get('text_config', config).get('num_hidden_layers') != 93:
-    raise SystemExit('Expected the full 93-layer model')
+expected = int(os.environ['KIMI_EXPECTED_MODEL_LAYERS'])
+actual = config.get('text_config', config).get('num_hidden_layers')
+if expected < 1 or actual != expected:
+    raise SystemExit(f'Expected {expected} model layers, found {actual}')
 PY
 
 node_registered() {
@@ -130,30 +159,40 @@ if "$DRY_RUN"; then
 else
     exec 9>"$RUN_DIR/head.lock"
     flock -n 9 || { echo 'A release launcher is already running'; exit 1; }
-    if ! node_registered; then
-        ray start --head --port "$RAY_PORT" "${RAY_ARGS[@]}" \
-            --dashboard-host 127.0.0.1 --dashboard-port 8260 --temp-dir /tmp/ray_k3_release64
-    fi
-    "$PYTHON_BIN" - "${NODES[@]}" <<'PY'
-import os, sys, time, ray
+    if (( NNODES > 1 )); then
+        if ! node_registered; then
+            ray start --head --port "$RAY_PORT" "${RAY_ARGS[@]}" \
+                --dashboard-host 127.0.0.1 --dashboard-port 8260 --temp-dir /tmp/ray_k3_release64
+        fi
+        "$PYTHON_BIN" - <<'PY'
+import os, time, ray
 ray.init(address=os.environ['RAY_ADDRESS'])
-expected, per_node = set(sys.argv[1:]), int(os.environ['NPUS_PER_NODE'])
+expected, per_node = int(os.environ['NNODES']), int(os.environ['NPUS_PER_NODE'])
 deadline = time.monotonic() + 1800
 while time.monotonic() < deadline:
     nodes = {n['NodeManagerAddress']: n for n in ray.nodes() if n['Alive']}
     counts = {ip: n['Resources'].get('NPU', 0) for ip, n in nodes.items()}
     print(f'Ray resources: {counts}', flush=True)
-    if set(nodes) == expected and all(counts[ip] == per_node for ip in expected):
+    if len(nodes) > expected:
+        raise SystemExit(f'Expected {expected} Ray nodes, found {sorted(nodes)}')
+    if len(nodes) == expected and os.environ['MASTER_ADDR'] in nodes and all(n == per_node for n in counts.values()):
+        allowed = os.environ.get('KIMI_NODE_IPS', '').split()
+        if allowed and set(nodes) != set(allowed):
+            raise SystemExit(f'Registered nodes differ from the supplied KIMI_NODE_IPS: {sorted(nodes)}')
         if not all(n['Resources'].get('kimi_release64') == 1 for n in nodes.values()):
             raise SystemExit('Unexpected Ray cluster owner')
-        if ray.available_resources().get('NPU', 0) != len(expected) * per_node:
+        if ray.available_resources().get('NPU', 0) != expected * per_node:
             raise SystemExit('The release cluster already has allocated NPUs')
         break
     time.sleep(5)
 else:
-    raise SystemExit('Four-node/64-NPU Ray cluster did not become ready')
+    raise SystemExit(f'Ray cluster did not become ready: expected {expected} nodes with {per_node} NPUs each')
 ray.shutdown()
 PY
+    else
+        [[ "$NODE_IP" == "$MASTER_ADDR" ]] || { echo "Single-node MASTER_ADDR must match local node" >&2; exit 1; }
+        echo "Single-node mode: source trainer starts the local Ray runtime"
+    fi
     rm -f "$RUN_DIR/training_exit_code.txt"
 fi
 EXTRA_ENV=("++ray_kwargs.ray_init.runtime_env.env_vars.LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
