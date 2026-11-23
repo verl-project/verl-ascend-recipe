@@ -2,7 +2,7 @@
 
 基于 Qwen3.5-35B-A3B 在昇腾 NPU 上进行 GRPO MXFP8 后训练的样例：**FSDPTurbo（训练侧动态 MXFP8）＋ vLLM-Ascend（推理侧 MXFP8 权重加载）**。实测于 1 × Atlas A5（8 × Ascend950DT 96G）。
 
-> 📌 **代码源口径**：全部依赖基于官方仓 commit——verl @ `07ba1a854`、vLLM @ `ced6857`、vLLM-Ascend @ `59ebc4384`、FSDPTurbo（gitcode）@ `db33a840`（官方 main，2026-11-20 tip；NPU 走 AscendC 真核路径、head_first 由 chunk_gdn_ascendc 原生接参处理，不依赖未合入的 MR #367）；未合入上游的其余修正以 patch 随本仓携带（见文末「patch 清单」），本地 patch 不推送到任何仓、进官方的唯一路径是上游 PR。缺失这些 patch 时链路**不报错而是静默产出错误结果**（权重名映射失败 → rollout 输出乱码），因此 `install.sh` 末尾自检为硬性失败。
+> 📌 **代码源口径**：全部依赖基于官方仓 commit——verl @ `07ba1a854`、vLLM @ `ced6857`、vLLM-Ascend @ `59ebc4384`、FSDPTurbo（gitcode）@ `db33a840`；未合入上游的其余修正以 patch 随本仓携带（见文末「patch 清单」），本地 patch 不推送到任何仓、进官方的唯一路径是上游 PR。缺失这些 patch 时链路**不报错而是静默产出错误结果**（权重名映射失败 → rollout 输出乱码），因此 `install.sh` 末尾自检为硬性失败。
 
 ## 环境版本
 
@@ -13,7 +13,7 @@
 | verl | 官方 `07ba1a854` ＋ patch 层 |
 | vLLM | 0.30.0+empty（官方 `ced6857`） |
 | vLLM-Ascend | 官方 `59ebc4384`（v0.30.0）＋ patch 层 |
-| FSDPTurbo | `db33a840`（gitcode 官方 main，2026-11-20 tip） |
+| FSDPTurbo | `db33a840` |
 | triton_ascend | 3.6.0.post2 |
 | transformers | 5.22.2 |
 | flash-linear-attention（＋fla-core） | 0.5.2 |
@@ -58,44 +58,12 @@ cd verl
 bash ../verl-ascend-recipe/low_precision/fsdp_turbo/examples/Qwen3.5-35B-A3B/run_qwen3_5_35b_fsdp_turbo_mxfp8.sh
 ```
 
-**E 六参（`MODEL_NAME=qwen3_5_moe`＋`use_fused_causal_conv1d`／`use_fused_gdn` × actor/ref）已烙进两份 launcher**——外部点火脚本不要再追加这六参，撞已烙印 launcher 的 `+` 键会在 hydra config append 处直接报错（fail-fast）。
 
-**推理侧在线量化激活（低精件，勿漏）**：`run_qwen3_5_35b_fsdp_turbo_mxfp8.sh` 已内置 `VLLM_ASCEND_ONLINE_WEIGHT_QUANT=1`（user-adjustable 段可调，npu 块显式 export）——这是 `vllm-ascend-scalefix.patch` 的 env 门，不设时 bf16 盘上权重的在线量化**静默不发生**（scalefix 装了但门关着）。机器适配项 `weight_nz_mode=0` 已烙进 npu 块（rollout 追加段，与高精件同款），无需点火口令再传。
 
-量化三件齐＝launcher 内置 env 门 ＋ npu 块内置 `weight_nz_mode=0` ＋ launcher 内置 `rollout.quantization=ascend`（`QUANT_MODE`），点火口令无需再补任何量化项。
 
-> **日志可见性提醒**：勿设 `VLLM_LOGGING_LEVEL=WARNING`。`[SCALEFIX]` 在线量化生效判据行走 vLLM root logger、受该 env 控制，压到 WARNING 后判据行不可见（vLLM 默认 INFO 即含）；排查在线量化是否生效时保持默认或显式 `VLLM_LOGGING_LEVEL=INFO`。
 
-## bf16 双侧高精对照臂（复现 run67）
 
-同底盘只摘量化面，用同一个低精 launcher 复现纯 bf16 对照臂（同 commit、同配置 A/B）。三处联动缺一不可：
 
-- `MXFP8=0`：跳过训练侧量化块（actor/ref 回 bf16）；
-- `QUANT_MODE=`（显式置空）：条件门省略 `rollout.quantization` 行，引擎不挂 W8A8_MXFP8，裸 bf16 权重目录无需 `quant_model_description.json`；
-- `VLLM_ASCEND_ONLINE_WEIGHT_QUANT=0`：在线量化门显式关断（scalefix 判定为 `== "1"`，`"0"` 即 off；不设会回落 launcher 默认 1）。
-
-```bash
-# env.local.sh（或点火环境）先设（已设优先于 launcher 默认）：
-#   MODEL_PATH=/model/Qwen3.5-35B-A3B          # 裸 bf16 原版目录
-#   VLLM_ASCEND_ONLINE_WEIGHT_QUANT=0
-MXFP8=0 QUANT_MODE= bash ../verl-ascend-recipe/low_precision/fsdp_turbo/examples/Qwen3.5-35B-A3B/run_qwen3_5_35b_fsdp_turbo_mxfp8.sh \
-    trainer.total_training_steps=200 trainer.save_freq=50
-```
-
-存档节奏与总步数不进代码默认（对照两臂实跑取值不同：mxfp8 臂 `save_freq=100`、bf16 臂 `save_freq=50`），一律经 launcher 末尾 `"$@"` 追加复现——低精臂（run66 型）即默认全开，追加 `trainer.total_training_steps=200 trainer.save_freq=100` 即可。
-
-## 为什么必须排除 linear_attn（重要）
-
-Qwen3.5-35B-A3B 的 30 层 gated delta net（`linear_attn`）中，`in_proj_qkv` / `in_proj_z` / `out_proj` 三个投影（共 90 项）对 MXFP8 量化异常敏感：递归式线性注意力的投影误差沿序列递归累积放大，这是 softmax 注意力没有的特性。
-
-验证实验（GRPO、geo3k 数据集、step0 验证集、温度 0 贪心）表明：全量 MXFP8 相对 bf16 出现明显验证精度下降；两侧（训练+推理）同时排除 linear_attn 后，验证精度回到 bf16 水平，训推一致性指标（`rollout_probs_diff_mean`、`rollout_corr/kl`）同向改善，训练动态无伤。
-
-**两侧必须同时排除**：
-
-- 推理侧：上一步 `--exclude_pattern`（json 中 `FLOAT` 即跳过该 shard 量化，是唯一生效的推理侧排除机制）；
-- 训练侧：launcher 已固化 `QUANT_IGNORED_MODULES="['model.language_model.layers.{*}.linear_attn.*']"`（actor 与 ref 各一条）。
-
-> `quant_ignored_modules` 对 MoE experts 静默不生效（`fsdp_turbo/quantization/utils.py` 的 `moe_filter_fn` 不接收 ignored 列表），对普通线性层生效；如需排除专家请走 json/权重侧手段。
 
 ## patch 清单（fsdp_turbo）
 
