@@ -1,0 +1,27 @@
+{
+  "passed": true,
+  "real_updates": 30,
+  "weight_versions": 31,
+  "comparison_groups": 155,
+  "compared_elements": 15872,
+  "bit_mismatch": 0,
+  "max_abs": 0.0,
+  "all_finite": true,
+  "source_snapshot_files_verified": 51,
+  "live_source_changes": [],
+  "result_keys": [
+    "scope",
+    "requested_steps",
+    "started_at_unix",
+    "phases",
+    "optimizer_steps",
+    "resident_initial",
+    "initial_weight_sync",
+    "initial_weight_changes",
+    "updated_at_unix",
+    "completed",
+    "nonzero_versions",
+    "passed",
+    "finished_at_unix"
+  ]
+}

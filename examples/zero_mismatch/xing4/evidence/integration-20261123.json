@@ -1,0 +1,22 @@
+{
+  "date": "2026-11-23",
+  "timezone": "Asia/Shanghai",
+  "status": "server_execution_stopped_at_user_request",
+  "observation_source": "Captured tool output from the integration session; raw unit log is not included",
+  "unit_tests": {
+    "passed": 18,
+    "xing4_cases": 16,
+    "verl_cases": 2,
+    "elapsed_seconds": 57.49,
+    "warnings": 18
+  },
+  "full_model_smoke": {
+    "status": "interrupted",
+    "passed": null,
+    "completed_optimizer_updates_verified": null
+  },
+  "final_launcher_followup": "stopped_without_completed_validation",
+  "static_checks_observed": ["Ruff", "format checks", "git diff --check"],
+  "format_sh_ci": "could not start locally because pre-commit was not installed",
+  "new_launchers_and_offline_verifier_executed_for_evidence_publication": false
+}

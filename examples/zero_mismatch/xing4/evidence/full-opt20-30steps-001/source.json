@@ -1,0 +1,72 @@
+{
+  "recorded_at": "2026-11-20T08:57:11.203923+00:00",
+  "image": "sha256:bdc20cc234a54139fe8b66c871e7b7c625bf0288b783c77a01ec14b00a269c6c",
+  "repos": {
+    "/home/w00848261/verl": {
+      "commit": "6b4e86ccc4d30996620bd694daa7c2cbbd7135bb",
+      "status": "?? .codex/handoffs/\n?? .xing_diff0/\n?? models/\n"
+    },
+    "/vllm": {
+      "commit": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+      "status": ""
+    },
+    "/vllm-ascend": {
+      "commit": "0c002b4b44cd2e7e12a094e6f778b62ed793afba",
+      "status": " M vllm_ascend/ascend_config.py\n M vllm_ascend/ascend_forward_context.py\n M vllm_ascend/attention/attention_v1.py\n M vllm_ascend/ops/fused_moe/dataclass/token_dispatcher.py\n M vllm_ascend/ops/fused_moe/fused_moe.py\n M vllm_ascend/ops/fused_moe/router/fused_topk_router.py\n M vllm_ascend/ops/fused_moe/shared_experts.py\n M vllm_ascend/ops/fused_moe/token_dispatcher.py\n M vllm_ascend/ops/gdn.py\n M vllm_ascend/ops/layernorm.py\n M vllm_ascend/ops/linear_op.py\n M vllm_ascend/patch/worker/patch_qwen3_5.py\n M vllm_ascend/sample/sampler.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_gdn_l2norm_training_math.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_gdn_norm_training_math.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_gdn_training_math.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_residual_norm_batch_invariant.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_attention.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_expert_math.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_logprobs.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_mrope.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_reduction.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_router_math.py\n?? tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_row_parallel.py\n?? vllm_ascend/ops/fused_moe/training_math.py\n?? vllm_ascend/ops/gdn_batch_invariant.py\n?? vllm_ascend/ops/training_attention.py\n?? vllm_ascend/ops/training_logprobs.py\n?? vllm_ascend/ops/training_mrope.py\n?? vllm_ascend/ops/training_reduction.py\n"
+    }
+  },
+  "files": {
+    "/home/w00848261/verl/.xing_diff0/full_acceptance_30.py": "d1fd097a7eb0f4c9a75b63ef12af596ea8d4a4e67767534554c5d936b71ae093",
+    "/home/w00848261/verl/.xing_diff0/online_worker_008.py": "e2ef800e2a464001ef6221f7bf5f95018ca2f42f48df975d2b518b8796fddaf5",
+    "/home/w00848261/verl/.xing_diff0/weight_audit_007.py": "0be0a53cffd6ab67c8854efc102f3302451511a0e02bd3c578d168604b4b7ab9",
+    "/home/w00848261/verl/.xing_diff0/case_manifest_full_dataset.json": "6b01c648bdabe62086e3cb3154cadc56ef8afd8784e4d8e2c1b1aa0e46dedd5f",
+    "/home/w00848261/verl/.xing_diff0/env.sh": "f2073cae4fbdf9bf17efcf0950d2f8a6548ec30f3869effac133ee44366e67ca",
+    "/home/w00848261/verl/.xing_diff0/perf20/run_acceptance.sh": "71dcc44fd525039e84b5ba20e29565453986d6769b986b6f290ef6161f0801d3",
+    "/home/w00848261/verl/.xing_diff0/audit_continuous.py": "bdf1897d1f69efa10d295e38d6ddb705bc91246fc4108e45ba925f26a57ce7d7",
+    "/home/w00848261/verl/.xing_diff0/audit_full_geometry.py": "963d5ed19752f368ac2bf03d32e19726e1e31d9656de5896f4a3c84e2384c7b5",
+    "/home/w00848261/verl/.xing_diff0/perf20/optimized/mhc_candidate.py": "ca0962341b7082b8e0f56c5d1a3b91ecd7dd98da1de7daccbdda91d7c6eb5946",
+    "/home/w00848261/verl/.xing_diff0/perf20/optimized/mhc_kernels.py": "2242fd5aa91322c14791e0c5f3ea48631f1db7e45b91795856a554621a374176",
+    "/home/w00848261/verl/.xing_diff0/perf20/optimized/sinkhorn_kernel.py": "d2635b9157c7b3ac0f4392c8fd117ec29b685ebf08ce632a4fc8a59e88a304e6",
+    "/home/w00848261/verl/.xing_diff0/perf20/optimized/xing_bridge.py": "db25871522c5fb41ed3a968760bf58a1e035eb5978f9de846567773a7f6b092d",
+    "/home/w00848261/verl/.xing_diff0/activation_candidate.py": "c0004b88e2b2acde429337f4b3f7b6e47191682ef46107f92baa5f83ed0631b1",
+    "/home/w00848261/verl/.xing_diff0/attention_candidate.py": "63b41593767432ac1d9a3ff153940f5f0ab11e680d5e0488493077b98fc1fa21",
+    "/home/w00848261/verl/.xing_diff0/linear_candidate.py": "7fba3fea2b5a7c37d6de37afd4ce99147a1604d9beac969faa856a0c97e230fd",
+    "/home/w00848261/verl/.xing_diff0/mhc_candidate.py": "71e9db70c939e4cad4af405d611777a85d1bad4a282650b064c6f891909869ba",
+    "/home/w00848261/verl/.xing_diff0/moe_candidate.py": "c94e7963734a286bc8059814cc8d5649e0cc31f7e4a403ceca8f9c3319ec5b34",
+    "/home/w00848261/verl/.xing_diff0/rope_candidate.py": "58dd897c0258555baf163879acd9955a87599e2293b29fabb96fb3cc9d9f6a71",
+    "/home/w00848261/verl/.xing_diff0/router_candidate.py": "514b67515d7bb30b953acdd2c1e07d15c1d8ca503fa54a9cacd4b8707d716a4c",
+    "/home/w00848261/verl/.xing_diff0/vendor/xing4-vllm-plugin/src/vllm_xing4_0_plugin/__init__.py": "447ff910385c970dd3d2498d1f183076329c8dc3bf78c590894bee2e5904d1fc",
+    "/home/w00848261/verl/.xing_diff0/stamp_run.py": "367be373d278c841de7ef11e1351fec8054a0975216a941f81cd4d650081af74",
+    "/vllm-ascend/vllm_ascend/ascend_config.py": "821a2b7d1077fefe94de4a1352ad88506421df19b4107b25b849b4d1e2a4b0c9",
+    "/vllm-ascend/vllm_ascend/ascend_forward_context.py": "7dd0dfc67154c51e6c7fab0d7de84f1651356a2806bbff0a2c9661b11c7a0015",
+    "/vllm-ascend/vllm_ascend/attention/attention_v1.py": "be7660992c8b55dda8ccb1f3ce8c0cb8053c4744e7a8cdf3162cd33af97bb28f",
+    "/vllm-ascend/vllm_ascend/ops/fused_moe/dataclass/token_dispatcher.py": "ee6e8160553c9295a2831a4e4c37127ec5d1834811de3168c06b6298f048f3b9",
+    "/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py": "d5850bcd554ebcb7e329b9819e0f2ebbc6352260efc6210ac44879205b40c0a8",
+    "/vllm-ascend/vllm_ascend/ops/fused_moe/router/fused_topk_router.py": "fee4a24c9b9ccf21a9d83b333e06f10fb7be321102718663b10e90a768914542",
+    "/vllm-ascend/vllm_ascend/ops/fused_moe/shared_experts.py": "2d95a02c60ebc57a0f0cb44b3a6a6a62af5d9f658631631c252563676df8b035",
+    "/vllm-ascend/vllm_ascend/ops/fused_moe/token_dispatcher.py": "9bb740a3408d13d7d592023d5f348a368fbe843174dfb0406d6d42684c4528f2",
+    "/vllm-ascend/vllm_ascend/ops/gdn.py": "aa72fa81a83729dd7c36fefb3f69dc01d4972fb3716ee578871a197c7ab231d2",
+    "/vllm-ascend/vllm_ascend/ops/layernorm.py": "ad6c55ee973a52e1c7da00da094eab7a98cdb72318c77e5598e351bab26ec286",
+    "/vllm-ascend/vllm_ascend/ops/linear_op.py": "7b95f3803f9e427bad4b4238c40926e349098bce25f8ba187d024b162724d82b",
+    "/vllm-ascend/vllm_ascend/patch/worker/patch_qwen3_5.py": "ae6a18a3809b3e0a415129dfd752a08272fe9e7f44cca2a0f36cf7fa73ab1a9f",
+    "/vllm-ascend/vllm_ascend/sample/sampler.py": "985d795447a86694dbddbc0761ebe292afc9a7aa92d752759d3f8b621c68c427",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_gdn_l2norm_training_math.py": "4e39737c338cbc194939fd8bb17ee1542353bfe8e5555966d4d4c04a564a5434",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_gdn_norm_training_math.py": "e0e1d49e216344fcbf5b0714dfdaf8935f8802d565fd2e2bc8c565c5cba27179",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_gdn_training_math.py": "76f2c7c8f3a2505ba545f55a7023e3ee793c0608e1c5a17f6c5e2eeb590009f9",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_residual_norm_batch_invariant.py": "6e11b314d870bf8f766d762bbd6b772af48326f7f2ddb3c9d71cf1ffe290a4c0",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_attention.py": "e327c3d2dc6fc0a20800d03a62a09f5a34228df6c974c8c34cc154c903ead50b",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_expert_math.py": "50a58f9320585f1cdf3ba8eb6149718df3e682ba800bfcc60df563b14d3fa95d",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_logprobs.py": "58288cb8db2649f5ae5bf5e14e1af53be8898c4fd0d7eede93179a06b44b6bfb",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_mrope.py": "20029443c8f73059d60960c0f6e65326c49b7b18f1bffa87fdb2c4059e004fd4",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_reduction.py": "5ddd8b236ad4d2a239744e99724d2f73987b9a4970517a3fc3773f244b32bb38",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_router_math.py": "4a015a1a687f35c46b48ffca4f343b9caf13d910cb0ef801b2493c7f3e58d6eb",
+    "/vllm-ascend/tests/e2e/nightly/single_node/ops/singlecard_ops/test_training_row_parallel.py": "57dd8986cab8c1925751182e38d6588c7ea1f4ac81913accd27c3eafd5d3c173",
+    "/vllm-ascend/vllm_ascend/ops/fused_moe/training_math.py": "204a254703e37a5f6478ac59b2602a8c84c4a9ac05b6be3aefb9b1bf00f794e6",
+    "/vllm-ascend/vllm_ascend/ops/gdn_batch_invariant.py": "afb981790e7abb52192e4a0a84171559aafe2ce44a93e35dfe209c95081d2e60",
+    "/vllm-ascend/vllm_ascend/ops/training_attention.py": "0b5a5097265543ef54b8b1c4ce0b46a5fb271fd8ccc2533d597c6e9bcf5859a0",
+    "/vllm-ascend/vllm_ascend/ops/training_logprobs.py": "433c49940ebf49642ff260125b7818d3fd2d77d316b93f0d7b5db012a475199f",
+    "/vllm-ascend/vllm_ascend/ops/training_mrope.py": "60fbe73c75ad2d6859ea6df108b3a7f4a9220aa5f270a8dd6a931490838007dc",
+    "/vllm-ascend/vllm_ascend/ops/training_reduction.py": "d6f4dc4eb1091f45032aac76f20c32f8e9d00eb06ea8236bc8f96ff2b10cef9e"
+  },
+  "note": "Source snapshot at record time; consult launch log for execution timestamps."
+}

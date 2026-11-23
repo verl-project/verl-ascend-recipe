@@ -70,6 +70,13 @@ historically tested token sequences of lengths 65 / 129 / 257 / 513.
 
 ## Evidence and limits
 
+Published reports, all 31 versions of raw FP32 data, CSV tables and an offline
+verification entry point are indexed in [evidence/README.md](evidence/README.md).
+Use `run_unit_tests.sh /path/to/vllm-ascend-tree` for the 18-case NPU regression
+invocation; `run_acceptance.sh RUN_NAME 1` and `run_acceptance.sh RUN_NAME 30`
+select smoke and full continuous acceptance respectively. These launchers were
+not executed for the evidence publication, per the user's stop instruction.
+
 The historical `full-opt20-30steps-001` implementation passed 30 true optimizer
 updates / 31 weight versions, with 155 raw comparison groups, 15,872 FP32 elements,
 zero bit mismatches, and finite outputs throughout. This publication relocates

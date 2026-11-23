@@ -26,3 +26,7 @@ was not installed on the local machine. The separate Ruff checks passed. The
 historical 30-update evidence described in the Xing README remains historical.
 
 AI assistance was used to organize the code. No upstream pull request was opened.
+
+Historical reports, CSV tables and all 62 raw log-probability files are now
+published under `xing4/evidence/`; see its README for provenance and the offline
+verifier. Publication did not start any server job or execute the new launchers.

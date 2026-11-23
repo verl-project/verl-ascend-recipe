@@ -1,0 +1,83 @@
+{
+  "reviewed_at": "2026-11-21T14:54:22.809503+00:00",
+  "provenance": "Recovered experiments executed 2026-11-20; CPU raw audits rerun 2026-11-21. No new training run in this review.",
+  "optimization": "Fuse 20 Sinkhorn iterations while preserving balanced row sums, sequential column sums and disabling FP fusion. Previous batched mHC post kernel retained. Native training bridge unchanged.",
+  "rows": [
+    {
+      "workload": "inference_batch4_output16",
+      "original_strict_seconds": 15.87689951993525,
+      "previous_optimized_seconds": 9.465065289987251,
+      "sinkhorn_optimized_seconds": 7.196945189964026,
+      "regular_seconds": 6.013994890032336,
+      "reduction_vs_previous_percent": 23.963068722014913,
+      "overhead_vs_regular_percent": 19.669958514469734
+    },
+    {
+      "workload": "inference_batch4_output64",
+      "original_strict_seconds": 41.799025129992515,
+      "previous_optimized_seconds": 33.03760901989881,
+      "sinkhorn_optimized_seconds": 25.507488279952668,
+      "regular_seconds": 22.299978649942204,
+      "reduction_vs_previous_percent": 22.792571748792987,
+      "overhead_vs_regular_percent": 14.383465026406107
+    },
+    {
+      "workload": "native_infer_seconds",
+      "original_strict_seconds": 4.810454519931227,
+      "previous_optimized_seconds": 1.4313195899594575,
+      "sinkhorn_optimized_seconds": 1.3656031299615279,
+      "regular_seconds": 1.3099168299231678,
+      "reduction_vs_previous_percent": 4.591319818363626,
+      "overhead_vs_regular_percent": 4.251132496833887
+    },
+    {
+      "workload": "native_train_update_seconds",
+      "original_strict_seconds": 9.33482584997546,
+      "previous_optimized_seconds": 6.716649769921787,
+      "sinkhorn_optimized_seconds": 5.580143260071054,
+      "regular_seconds": 5.6601874300977215,
+      "reduction_vs_previous_percent": 16.92073502090563,
+      "overhead_vs_regular_percent": -1.4141611212561078
+    },
+    {
+      "workload": "native_total_seconds",
+      "original_strict_seconds": 14.296280839946121,
+      "previous_optimized_seconds": 8.210149109829217,
+      "sinkhorn_optimized_seconds": 6.884147220058367,
+      "regular_seconds": 6.970104260020889,
+      "reduction_vs_previous_percent": 16.150765010873634,
+      "overhead_vs_regular_percent": -1.2332245940072206
+    }
+  ],
+  "acceptance": {
+    "passed": true,
+    "real_updates": 30,
+    "weight_versions": 31,
+    "comparison_groups": 155,
+    "compared_elements": 15872,
+    "bit_mismatch": 0,
+    "max_abs": 0.0,
+    "all_finite": true,
+    "source_snapshot_files_verified": 51,
+    "live_source_changes": [],
+    "result_keys": [
+      "scope",
+      "requested_steps",
+      "started_at_unix",
+      "phases",
+      "optimizer_steps",
+      "resident_initial",
+      "initial_weight_sync",
+      "initial_weight_changes",
+      "updated_at_unix",
+      "completed",
+      "nonzero_versions",
+      "passed",
+      "finished_at_unix"
+    ]
+  },
+  "limitations": "Pinned full40 BF16 eager topology; four fixed prompts lengths65/129/257/513; 16-token acceptance; inference benchmark16/64 with warmup and 3 measured repeats. 16-token sample includes13.36s outlier. Historical, not interleaved A/B; training timing differences cannot be causally attributed to inference-only Sinkhorn change.",
+  "reproduce_cwd": "/home/w00848261/verl",
+  "reproduce_acceptance": "bash .xing_diff0/perf20/run_acceptance.sh full-opt20-30steps-002",
+  "benchmark_launcher": "run_pipeline.sh uses existing fixed run names; copy with fresh run names before rerun."
+}
