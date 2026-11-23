@@ -16,3 +16,14 @@ The generic Qwen numerical source already present on this branch was checked
 against the recovered server source and matched. This integration adds only the
 explicit Xing adapter package, its regression test and documentation. It excludes
 the later, incompletely validated performance experiments.
+
+The explicit NPU test launcher is `bash scripts/run_xing4_zero_mismatch_tests.sh`.
+It was added without executing it after the user's stop instruction.
+
+The companion verl branch publishes the full historical audit, performance/step
+CSV tables and all 62 raw log-probability files, with a SHA256 manifest and a CPU
+verification entry point:
+[saved evidence](https://github.com/verl-project/verl-ascend-recipe/tree/rl-zero-mismatch-verl/examples/zero_mismatch/xing4/evidence).
+The companion recipe's `run_unit_tests.sh` combines the 16 Xing cases with the two
+verl regression cases. These artifacts describe the historical accepted run and
+do not claim completion of the interrupted integration smoke test.
