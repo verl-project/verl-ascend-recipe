@@ -1,105 +1,152 @@
-#!/bin/bash
-# Qwen3.5-35B-A3B MXFP8 GRPO（FSDPTurbo 链路）环境安装脚本
-# 用法：在 recipe 仓的父目录执行（依赖仓克隆到当前目录；目录布局与成因说明见 install-guide.md）
-set -ex
+#!/usr/bin/env bash
+# Install the FSDPTurbo MXFP8 recipe on Ascend A5.
+set -Eeuo pipefail
 
-echo "0. mirrors (opt-in: USE_CN_MIRROR=1)"
-if [ "${USE_CN_MIRROR:-0}" = "1" ]; then
-  export GIT_CONFIG_COUNT=1
-  export GIT_CONFIG_KEY_0="url.https://ghfast.top/https://github.com/.insteadOf"
-  export GIT_CONFIG_VALUE_0="https://github.com/"
-  export PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple/}"
-  export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:-https://triton-ascend.osinfra.cn/pypi/simple/}"
+recipe_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+work_dir=${WORK_DIR:-"$recipe_dir/../../.."}
+phase=preflight
+trap 'printf "Installation failed during %s (line %s).\n" "$phase" "$LINENO" >&2' ERR
+
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+step() { phase=$1; printf '\n== %s ==\n' "$phase"; }
+
+cann_env=${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}
+atb_env=${ATB_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}
+python_bin=${PYTHON_BIN:-python3.12}
+[[ -r $cann_env ]] || fail "CANN setup script is missing: $cann_env. Set CANN_ENV to its full path."
+for tool in git gcc g++; do
+    command -v "$tool" >/dev/null || fail "Required build tool is missing: $tool"
+done
+command -v "$python_bin" >/dev/null || fail "Python 3.12 is required. Set PYTHON_BIN to its full path."
+"$python_bin" -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+mkdir -p -- "$work_dir"
+cd -- "$work_dir"
+work_dir=$PWD
+venv_dir=${VENV_DIR:-${VIRTUAL_ENV:-"$work_dir/.venv"}}
+[[ $venv_dir = /* ]] || fail "VENV_DIR must be an absolute path."
+if [[ ! -x $venv_dir/bin/python ]]; then
+    "$python_bin" -m venv "$venv_dir"
 fi
-FSDPTURBO_URL="${FSDPTURBO_URL:-https://gitcode.com/Ascend/FSDPTurbo.git}"
-
-echo "1. vllm-ascend requirements"
-git clone https://github.com/vllm-project/vllm-ascend.git
-cd vllm-ascend
-git checkout 59ebc4384b340065127e9b1e1bb73a257c51895e
-pip install -r requirements.txt
-pip install "setuptools-rust>=1.9.0"
-cd ..
-
-echo "2. vllm editable + runtime deps (conflict-driven)"
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout ced6857
-VLLM_TARGET_DEVICE=empty pip install -e . --no-build-isolation
-
-pip install --no-deps "fastapi==0.123.10" "starlette==0.50.0" "prometheus-fastapi-instrumentator==8.1.0" "numpy==1.26.4"
-python -c "import numpy; assert numpy.__version__ == '1.26.4', 'numpy face drifted: ' + numpy.__version__; print('numpy face OK:', numpy.__version__)"
-cd ..
-
-echo "3. vllm-ascend (patch + editable)"
-cd vllm-ascend
-git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/patch/vllm-ascend-attention.patch
-git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/fsdp_turbo/patch/vllm-ascend-scalefix.patch
-export COMPILE_CUSTOM_KERNELS=1
-pip install -e . --no-deps --no-build-isolation
-cd ..
-
-echo "4. FSDPTurbo"
-git clone "$FSDPTURBO_URL"
-cd FSDPTurbo
-# db33a840 = 官方 main（2026-11-20 tip）；NPU 走 AscendC 真核路径，head_first 由 chunk_gdn_ascendc 原生接参处理，不依赖未合入的 GDN MR #367
-git checkout db33a84024bc263bb95f06e1353caf992060d4fe
-pip install -e .
-cd ..
-
-echo "5. verl"
-git clone https://github.com/verl-project/verl.git
-cd verl
-git checkout 07ba1a854
-sed -i '/^triton-ascend==/ s/^/# /' requirements-npu.txt
-pip install -r requirements-npu.txt
-pip install -e . --no-deps
-cd ..
-
-echo "6. verl patches"
-cd verl
-git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/patch/verl.patch
-git apply --whitespace=nowarn ../verl-ascend-recipe/low_precision/fsdp_turbo/patch/verl-fsdp-turbo.patch
-cd ..
-
-echo "7. triton-ascend && transformers"
-pip install transformers==5.22.2
-pip install triton-ascend==3.6.0.post2 --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple/ --trusted-host triton-ascend.osinfra.cn
-
-echo "8. NPU kernel-layer deps (fla / fla_npu / torchao / torchao_npu / mindspeed_ops)"
-pip install "fla-core==0.5.2" "flash-linear-attention==0.5.2"
-pip install "flash-linear-attention-npu-a5==26.9.1" --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
-pip install "torchao==0.18.0" --no-deps
-git clone https://gitcode.com/Ascend/torchao-ascend.git
-cd torchao-ascend
-git checkout a92753dee6e6cc625eca1f5943f0ec07459bfab0
-pip install -e . --no-deps
-cd ..
-git clone https://gitcode.com/ascend/MindSpeed-Ops.git
-cd MindSpeed-Ops
-git checkout b1ef3adcfc2f0a2932d6b2eb831f275fe1daacfb
-pip install -e . --no-deps --no-build-isolation
-cd ..
-
-echo "9. check required features (hard fail)"
-fail=0
-if ! grep -rq --exclude-dir=.git "translate_weight_names_for_vllm" verl/; then
-    echo "ERROR: 未在 verl 中找到 translate_weight_names_for_vllm（量化权重名映射失效）"
-    fail=1
+export PYTHONNOUSERSITE=1
+set +u
+source "$cann_env"
+if [[ -n ${ATB_ENV:-} || -r $atb_env ]]; then
+    source "$atb_env"
 fi
-if ! grep -rq --exclude-dir=.git "quant_ignored_modules" FSDPTurbo/; then
-    echo "ERROR: 未在 FSDPTurbo 中找到 quant_ignored_modules（linear_attn 排除不生效）"
-    fail=1
-fi
-if [ "$fail" -ne 0 ]; then
-    echo "install 自检失败，已中止（版本核对见 readme.md「版本依赖」节）。"
-    exit 1
-fi
-echo "自检通过：translate_weight_names_for_vllm / quant_ignored_modules 均在位。"
+source "$venv_dir/bin/activate"
+set -u
+cd -- "$work_dir"
+python -c 'import sys; assert sys.version_info[:2] == (3, 12) and sys.prefix != sys.base_prefix, sys.executable'
 
-SMOKE_DIR=$(mktemp -d)
-trap 'rm -rf "$SMOKE_DIR"' EXIT
-(cd "$SMOKE_DIR" && python -c "import vllm; print('vllm import smoke OK:', vllm.__version__)")
+triton_index=https://triton-ascend.osinfra.cn/pypi/simple/
+export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:+$PIP_EXTRA_INDEX_URL }$triton_index"
 
-echo "10. done"
-echo "训练启动前：export PYTHONPATH=\$PWD/FSDPTurbo:\$PYTHONPATH（追加式）"
+clone_at() {
+    local name=$1 url=$2 rev=$3
+    if [[ ! -d $name/.git ]]; then
+        git clone "$url" "$name"
+        git -C "$name" checkout --detach "$rev"
+    else
+        [[ $(git -C "$name" config --get remote.origin.url) == "$url" &&
+           $(git -C "$name" rev-parse HEAD) == "$rev" ]] ||
+            fail "$work_dir/$name already exists with a different origin or revision. Choose a fresh WORK_DIR."
+    fi
+}
+
+apply_recipe_patches() {
+    local repo=$1 patch
+    shift
+    # The last patch can modify hunks from preceding patches.
+    if git -C "$repo" apply --reverse --check "${!#}" 2>/dev/null; then
+        return
+    fi
+    for patch in "$@"; do
+        if ! git -C "$repo" apply --reverse --check "$patch" 2>/dev/null; then
+            git -C "$repo" apply --whitespace=nowarn "$patch"
+        fi
+    done
+}
+
+step "Prepare Python build dependencies"
+python -m pip install --upgrade pip packaging 'setuptools==80.10.2'
+python -m pip install 'cmake>=3.26.1' ninja 'setuptools-scm>=8' 'setuptools-rust>=1.9' wheel jinja2 'torch==2.10.0'
+
+step "Install vLLM"
+clone_at vllm https://github.com/vllm-project/vllm.git ced6857afa0ea7b2e3f0846a62e1394e90f15607
+# The recipe uses torch 2.10. The upstream isolated build requests torch 2.13.
+VLLM_TARGET_DEVICE=empty python -m pip install --no-build-isolation -e "$work_dir/vllm"
+
+step "Install vLLM-Ascend requirements and build the extension"
+clone_at vllm-ascend https://github.com/vllm-project/vllm-ascend.git 59ebc4384b340065127e9b1e1bb73a257c51895e
+python -m pip install -r vllm-ascend/requirements.txt
+apply_recipe_patches vllm-ascend "$recipe_dir/../patch/vllm-ascend-attention.patch" "$recipe_dir/patch/vllm-ascend-scalefix.patch"
+COMPILE_CUSTOM_KERNELS=1 python -m pip install --no-build-isolation --no-deps -e "$work_dir/vllm-ascend"
+
+step "Install FSDPTurbo, verl and training extensions"
+clone_at FSDPTurbo "${FSDPTURBO_URL:-https://gitcode.com/Ascend/FSDPTurbo.git}" db33a84024bc263bb95f06e1353caf992060d4fe
+python -m pip install -e "$work_dir/FSDPTurbo"
+
+clone_at verl https://github.com/verl-project/verl.git 07ba1a854e57356ccf1c9d604898607a88e3da3e
+apply_recipe_patches verl "$recipe_dir/../patch/verl.patch" "$recipe_dir/patch/verl-fsdp-turbo.patch"
+# Use the vLLM-Ascend Triton version instead of verl's shared NPU pin.
+python -m pip install -r <(sed '/^triton-ascend==/d' verl/requirements-npu.txt)
+python -m pip install --no-deps -e "$work_dir/verl"
+
+clone_at torchao-ascend https://gitcode.com/Ascend/torchao-ascend.git a92753dee6e6cc625eca1f5943f0ec07459bfab0
+python -m pip install --no-deps 'torchao==0.18.0' -e "$work_dir/torchao-ascend"
+clone_at MindSpeed-Ops https://gitcode.com/ascend/MindSpeed-Ops.git b1ef3adcfc2f0a2932d6b2eb831f275fe1daacfb
+python -m pip install --no-build-isolation --no-deps -e "$work_dir/MindSpeed-Ops"
+
+step "Restore the recipe runtime versions"
+python -m pip install 'torch-npu==2.10.0.post7' 'transformers==5.22.2' 'triton-ascend==3.6.0.post2' 'xgrammar>=0.2.1,<1.0.0'
+python -m pip install 'fla-core==0.5.2' 'flash-linear-attention==0.5.2'
+PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL https://mirrors.huaweicloud.com/ascend/repos/pypi" \
+    python -m pip install --no-deps 'flash-linear-attention-npu-a5==26.9.1'
+# These runtime pins deliberately span incompatible metadata from the two vLLM repositories.
+python -m pip install --no-deps 'fastapi==0.123.10' 'starlette==0.50.0' \
+    'prometheus-fastapi-instrumentator==8.1.0' 'numpy==1.26.4'
+
+step "Verify patches, installed versions and imports"
+grep -rq --include="*.py" "def translate_weight_names_for_vllm" "$work_dir/verl/verl"
+git -C FSDPTurbo grep -q quant_ignored_modules -- fsdp_turbo/
+# Starting from the dependency root can shadow the installed vLLM module.
+cd -- "$VIRTUAL_ENV"
+export PYTHONPATH="$work_dir/FSDPTurbo${PYTHONPATH:+:$PYTHONPATH}"
+python - <<'PYTHON'
+from importlib.metadata import version
+
+expected = {
+    "torch": "2.10.0",
+    "torch-npu": "2.10.0.post7",
+    "transformers": "5.22.2",
+    "triton-ascend": "3.6.0.post2",
+    "numpy": "1.26.4",
+    "fla-core": "0.5.2",
+    "flash-linear-attention": "0.5.2",
+    "flash-linear-attention-npu-a5": "26.9.1",
+    "torchao": "0.18.0",
+    "fastapi": "0.123.10",
+    "starlette": "0.50.0",
+    "prometheus-fastapi-instrumentator": "8.1.0",
+}
+for package, expected_version in expected.items():
+    installed = version(package)
+    assert installed.split("+")[0] == expected_version, (package, installed, expected_version)
+
+import acl
+import cachetools
+import fastapi
+import fla
+import fla_npu
+import mindspeed_ops
+import prometheus_client
+import starlette
+import torchao
+import torchao_npu
+import verl
+import vllm
+from fsdp_turbo.models.utils import get_model_by_name
+
+assert vllm.__version__.split("+")[0] == "0.30.0", vllm.__version__
+print(f"FSDPTurbo recipe imports OK (vLLM {vllm.__version__}).")
+PYTHON
