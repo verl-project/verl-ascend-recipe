@@ -82,11 +82,13 @@ git -C "$WORK/vllm" checkout --detach ced6857afa0ea7b2e3f0846a62e1394e90f15607
 git -C "$WORK/vllm-ascend" checkout --detach cb629ea1925a280d57b41b48416a85097f6cdb6b
 
 # 应用Patch
-PATCH_DIR="$WORK/verl-ascend-recipe/Kimi-K3/patch"
-git -C "$WORK/verl" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/verl.patch"
-git -C "$WORK/FSDPTurbo" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/fsdpturbo.patch"
-git -C "$WORK/vllm-ascend" -c user.name='A3 setup' -c user.email='a3-setup@localhost' am --keep "$PATCH_DIR/vllm-ascend.patch"
-git -C "$WORK/vllm-ascend" submodule update --init --recursive
+cd verl
+git am --keep ../verl-ascend-recipe/Kimi-K3/patch/verl.patch
+cd ../FSDPTurbo
+git am --keep ../verl-ascend-recipe/Kimi-K3/patch/fsdpturbo.patch
+cd ../vllm-ascend
+git am --keep ../verl-ascend-recipe/Kimi-K3/patch/vllm-ascend.patch
+git submodule update --init --recursive
 
 cp "$WORK/verl-ascend-recipe/Kimi-K3/examples/ray_start_4nodes_a3.sh" "$WORK/"
 # 脚本若经 Windows 下载或复制，统一为 Unix LF 换行。
@@ -122,17 +124,6 @@ cd "$WORK"
 # 四个容器分别执行（按实际共享目录调整脚本路径）
 bash /mnt/share/kimi-k3-a3/ray_start_4nodes_a3.sh
 ```
-
-单机验证时，将脚本中的 `NNODES` 设为 `1`，`MASTER_ADDR` 设为本机通信网卡的 IPv4，`MODEL_PATH_DIR` 指向已准备好的 12 层模型。用以下命令校验配置后执行 2 步功能验证。`KIMI_EXPECTED_MODEL_LAYERS` 只检查模型层数，不会裁剪模型；默认值仍为 93。单机由训练脚本创建本地 Ray，多机由启动脚本创建或加入 Ray 集群。
-
-```bash
-KIMI_EXPECTED_MODEL_LAYERS=12 VERL_TOTAL_TRAINING_STEPS=2 \
-  bash /mnt/share/kimi-k3-a3/ray_start_4nodes_a3.sh --dry-run
-KIMI_EXPECTED_MODEL_LAYERS=12 VERL_TOTAL_TRAINING_STEPS=2 \
-  bash /mnt/share/kimi-k3-a3/ray_start_4nodes_a3.sh
-```
-
-镜像预设的 `PYTHONPATH=/vllm` 可能使独立导入检查仍加载镜像源码；检查时需将本次工作目录中的框架源码放在 `PYTHONPATH` 前面，并核对各模块的 `__file__`。训练脚本会设置自己的源码路径。
 
 ## 3. A5 四节点环境部署与启动
 ```
