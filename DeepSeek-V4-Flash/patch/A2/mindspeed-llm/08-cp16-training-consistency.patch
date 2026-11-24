@@ -1,0 +1,128 @@
+From 747d6585b2ed223e5970bc5fb5849689dfa4a48c Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Tue, 27 Oct 2026 20:03:58 +0800
+Subject: [PATCH] fix cp16 training consistency
+
+---
+ .../models/transformer/deepseek4/compressor.py     |   18 +++++++++++++
+ .../tasks/models/transformer/deepseek4/csa.py      |    4 ++-
+ .../tasks/models/transformer/dsa_indexer.py        |   27 ++++++++++----------
+ 3 files changed, 35 insertions(+), 14 deletions(-)
+
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py b/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
+index 01551ddac63a7c27cb27c6615d3f8172e847df23..093069376847e18ead2b4b3d5f8c33fa05dd3ff9 100644
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/compressor.py
+@@ -106,6 +106,12 @@ class Compressor(MegatronModule):
+         tensor = tensor[:, rank * local_len : (rank + 1) * local_len, :]
+         return tensor
+ 
++    def _gather_bsh_from_sp_cp(self, tensor: torch.Tensor) -> torch.Tensor:
++        """Gather BSH (seq on dim 1) into global causal order."""
++        tensor = tensor.transpose(0, 1)  # BSH --> SBH
++        tensor = gather_from_sp_cp(tensor)
++        return tensor.transpose(0, 1)  # SBH --> BSH
++
+     @staticmethod
+     def _float_input(x):
+         return x.float()
+@@ -309,6 +315,7 @@ class Compressor(MegatronModule):
+         return kv
+ 
+     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, packed_seq_params=None):
++        self._last_fwd_gathered = False
+         if getattr(get_args(), 'use_fused_compressor', False):
+             if start_pos != 0:
+                 raise ValueError("--use-fused-compressor currently supports prefill/training with start_pos == 0 only.")
+@@ -345,6 +352,17 @@ class Compressor(MegatronModule):
+             self.x_float_checkpoint = None
+         kv = self.wkv(x)
+         score = self.wgate(x)
++        if start_pos == 0 and not overlap and mpu.get_tensor_and_context_parallel_world_size() > 1:
++            # ratio!=4 (non-overlap) compresses the local CP/SP shard directly; when
++            # seqlen % ratio != 0 the remainder is dropped and permute_cp_shard then
++            # maps the surviving blocks to wrong global indices. Gather first so the
++            # compression window is aligned to the global causal sequence.
++            kv = self._gather_bsh_from_sp_cp(kv)
++            score = self._gather_bsh_from_sp_cp(score)
++            if freqs_cis is not None:
++                freqs_cis = gather_from_sp_cp(freqs_cis)
++            seqlen = kv.size(1)
++            self._last_fwd_gathered = True
+         if start_pos == 0:
+             should_compress = seqlen >= ratio
+             remainder = seqlen % ratio
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py b/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
+index 2cb6e2946052f58c8154ba106b001f351e9a2d87..106586e39f16b0539168f07d9b0aed7ae1843a5c 100644
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
+@@ -1010,7 +1010,9 @@ class DeepSeek4SelfAttention(MegatronModule):
+                 kv_compress = self.compressor(hidden_states, start_pos, local_freqs_cis, packed_seq_params)
+             if kv_compress is not None:
+                 if packed_seq_params is None:
+-                    if self.config.sequence_parallel or self.kv_allgather:
++                    # ratio!=4 gather-before-compress already returns global causal compressed KV.
++                    already_gathered = getattr(self.compressor, "_last_fwd_gathered", False)
++                    if (self.config.sequence_parallel or self.kv_allgather) and not already_gathered:
+                         kv_compress = gather_from_sp_cp(kv_compress, tnd=False)
+                 elif cu_seqlens_cmp_kv is not None:
+                     assert kv_compress.shape[0] == cu_seqlens_cmp_kv[-1]
+diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
+index 2ce2c3a4252d0390e2729f98821d609b35eefe25..f40b02f28098d37a2433511949c74f6f96b29682 100644
+--- a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
++++ b/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
+@@ -1539,9 +1539,11 @@ def _fused_sparse_attn_shared_kv_bsnd(
+     k_chunks = [ori_kv[:end_idx_0, ...], ori_kv[:end_idx_1, ...]]
+ 
+     if cmp_kv is not None:
+-        chunk_size_cmp = chunk_size // cmp_ratio
+-        end_idx_0_cmp = (cp_rank + 1) * chunk_size_cmp
+-        end_idx_1_cmp = (2 * cp_size - cp_rank) * chunk_size_cmp
++        # Causal prefix length must be floor(T/cmp_ratio) where T is the chunk
++        # end in TOKENS. X * (chunk_size // cmp_ratio) drops (chunk_size % cmp_ratio)
++        # per rank when chunk_size % cmp_ratio != 0 (e.g. CP16: 704 % 128 = 64).
++        end_idx_0_cmp = (cp_rank + 1) * chunk_size // cmp_ratio
++        end_idx_1_cmp = (2 * cp_size - cp_rank) * chunk_size // cmp_ratio
+         cmp_k_chunks = [cmp_kv[:end_idx_0_cmp, ...], cmp_kv[:end_idx_1_cmp, ...]]
+     else:
+         cmp_k_chunks = [None, None]
+@@ -1653,9 +1655,9 @@ def _fused_lightning_indexer_with_compress_bsnd(
+     else:
+         weights_chunks = [None, None]
+ 
+-    chunk_size_k = chunk_size_q // compress_ratio
+-    end_idx_0_k = (cp_rank + 1) * chunk_size_k
+-    end_idx_1_k = (2 * cp_size - cp_rank) * chunk_size_k
++    # Same floor(T/ratio) fix as in _fused_sparse_attn_shared_kv_bsnd.
++    end_idx_0_k = (cp_rank + 1) * chunk_size_q // compress_ratio
++    end_idx_1_k = (2 * cp_size - cp_rank) * chunk_size_q // compress_ratio
+     k_chunks = [k[:end_idx_0_k, ...], k[:end_idx_1_k, ...]]
+ 
+     topk_idxs_list = []
+@@ -1776,10 +1778,9 @@ def fused_ms_sparse_lightning_indexer_kl_loss_kvallgather(
+         topk_idx_chunks = [None, None]
+ 
+     # kv_compress, key_index: [S_k, B, N, D]
+-    chunk_size_k = chunk_size_q // cmp_ratio
+-
+-    end_idx_0_k = (cp_rank + 1) * chunk_size_k
+-    end_idx_1_k = (2 * cp_size - cp_rank) * chunk_size_k
++    # Same floor(T/ratio) fix as in _fused_sparse_attn_shared_kv_bsnd.
++    end_idx_0_k = (cp_rank + 1) * chunk_size_q // cmp_ratio
++    end_idx_1_k = (2 * cp_size - cp_rank) * chunk_size_q // cmp_ratio
+ 
+     k_chunks = [kv_compress[:end_idx_0_k, ...], kv_compress[:end_idx_1_k, ...]]
+ 
+@@ -1889,9 +1890,9 @@ def _fused_sparse_flash_mla_with_indexer_loss_bsnd(
+     k_chunks = [ori_kv[:end_idx_0, ...], ori_kv[:end_idx_1, ...]]
+ 
+     if cmp_kv is not None:
+-        chunk_size_cmp = chunk_size // cmp_ratio
+-        end_idx_0_cmp = (cp_rank + 1) * chunk_size_cmp
+-        end_idx_1_cmp = (2 * cp_size - cp_rank) * chunk_size_cmp
++        # Same floor(T/ratio) fix as in _fused_sparse_attn_shared_kv_bsnd.
++        end_idx_0_cmp = (cp_rank + 1) * chunk_size // cmp_ratio
++        end_idx_1_cmp = (2 * cp_size - cp_rank) * chunk_size // cmp_ratio
+         cmp_k_chunks = [cmp_kv[:end_idx_0_cmp, ...], cmp_kv[:end_idx_1_cmp, ...]]
+     else:
+         cmp_k_chunks = [None, None]

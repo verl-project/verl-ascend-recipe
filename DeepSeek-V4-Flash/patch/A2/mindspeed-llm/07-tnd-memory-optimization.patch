@@ -1,0 +1,222 @@
+From 8cc43ab9fe2c6ec4f966e207371234ed244c9eea Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Thu, 22 Oct 2026 19:22:31 +0800
+Subject: [PATCH] Reduce TND indexer and compressor memory usage
+
+Reuse prefix gathers, avoid complete-prefix copies, suppress unused indexer scores and gradients, and release unused intermediate tensors.
+
+Source-commit: bb785ab6bbb588ad59ad6f01e1b03f4fbff2ce19
+---
+ mindspeed_llm/ops/npu_lightning_indexer.py    |  3 +-
+ .../tasks/models/transformer/deepseek4/csa.py | 68 ++++++++++++++-----
+ .../transformer/deepseek4/deepseek_utils.py   |  6 ++
+ .../tasks/models/transformer/dsa_indexer.py   | 17 ++++-
+ 4 files changed, 73 insertions(+), 21 deletions(-)
+
+diff --git a/mindspeed_llm/ops/npu_lightning_indexer.py b/mindspeed_llm/ops/npu_lightning_indexer.py
+index 07578fc336436b78725113c615279604b1987730..11d9f76305a0c5adb960654c2d822c2f6a57926b 100644
+--- a/mindspeed_llm/ops/npu_lightning_indexer.py
++++ b/mindspeed_llm/ops/npu_lightning_indexer.py
+@@ -67,6 +67,7 @@ def npu_lightning_indexer(
+     max_seqlen_k=None,
+     sparse_mode=3,
+     cmp_ratio=4,
++    return_value=True,
+ ):
+     if _custom_ops() is None:
+         raise Exception("Package custom_ops is not available while fused custom ops enabled.")
+@@ -147,7 +148,7 @@ def npu_lightning_indexer(
+         layout_k=layout,
+         mask_mode=sparse_mode,
+         cmp_ratio=cmp_ratio,
+-        return_value=1,
++        return_value=int(return_value),
+     )
+ 
+     return sparse_indices, sparse_values
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py b/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
+index 0632eebf90526427ebaeac13c5702a0e0b46ff30..2cb6e2946052f58c8154ba106b001f351e9a2d87 100644
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/csa.py
+@@ -864,6 +864,20 @@ class DeepSeek4SelfAttention(MegatronModule):
+         compress_topk_score = None
+         query_index = key_index = weights = None
+         empty_indexer_anchor = None
++        shared_prefix_hidden_states = None
++        if (
++            self.mode == LayerCompressMode.INDEXER
++            and packed_seq_params is not None
++            and pre_gather_len is not None
++            and not recompute_csa_attention
++        ):
++            # The indexer only reads this tensor and intentionally detaches it,
++            # while the compressor needs the differentiable gather. Gather once
++            # in the differentiable direction and hand a detached view to the
++            # indexer, avoiding a second full TPxCP hidden-state allocation and
++            # collective on every ratio-4 layer.
++            _hs_gathered = gather_from_sp_cp(hidden_states, tnd=True)
++            shared_prefix_hidden_states = _rearrange_prefix_kv(_hs_gathered, _fix_prefix_kv_segments)
+         if self.mode != LayerCompressMode.NO_COMPRESS:
+             offset = 0 if self.use_sparse_flash_attn else kv.size(0)
+             if self.indexer is not None:
+@@ -873,6 +887,7 @@ class DeepSeek4SelfAttention(MegatronModule):
+                 _local_freqs_for_indexer = local_freqs_cis
+                 _freqs_cis_for_kv = _prefix_freqs_cis
+                 base_attention_mask = attention_mask
++                needs_indexer_loss = args.indexer_loss_coeff > 0 and self.training and torch.is_grad_enabled()
+ 
+                 def indexer_forward(x_, q_compressed_, local_freqs_, *optional_attention_mask):
+                     indexer_attention_mask = (
+@@ -882,26 +897,33 @@ class DeepSeek4SelfAttention(MegatronModule):
+                     x_local_for_weights = x_.detach()
+                     x_for_indexer = x_local_for_weights
+                     if packed_seq_params is not None and pre_gather_len is not None:
+-                        x_for_indexer = gather_from_sp_cp(x_for_indexer, tnd=True)
+-                        x_for_indexer = _rearrange_prefix_kv(x_for_indexer, _fix_prefix_kv_segments)
++                        if shared_prefix_hidden_states is not None:
++                            x_for_indexer = shared_prefix_hidden_states.detach()
++                        else:
++                            x_for_indexer = gather_from_sp_cp(x_for_indexer, tnd=True)
++                            x_for_indexer = _rearrange_prefix_kv(x_for_indexer, _fix_prefix_kv_segments)
+                     if not local_has_compressible_kv:
+                         # Branch only after the common gather so every CP rank
+                         # executes the same checkpoint communication pattern.
+                         return self._empty_indexer_outputs(x_for_indexer, indexer_attention_mask)
+-                    query_index_, key_index_, weights_, dsa_hidden_states_ = self.indexer.forward_with_index_compress(
+-                        x_for_indexer,
+-                        q_compressed_.detach(),
+-                        start_pos,
+-                        local_freqs_,
+-                        packed_seq_params,
+-                        q_rope_preapplied=False,
+-                        freqs_cis_for_kv=_freqs_cis_for_kv,
+-                        x_for_weights=x_local_for_weights,
+-                    )
+-                    # TND: key_index stays local; cu_seqlens_k is derived from the actual shape.
+-                    query_index_, key_index_, weights_ = self.indexer.all_gather_qk_weight_kvallgather(
+-                        query_index_, key_index_, weights_, tnd=packed_seq_params is not None
+-                    )
++                    indexer_projection_context = nullcontext() if needs_indexer_loss else torch.no_grad()
++                    with indexer_projection_context:
++                        query_index_, key_index_, weights_, dsa_hidden_states_ = (
++                            self.indexer.forward_with_index_compress(
++                                x_for_indexer,
++                                q_compressed_.detach(),
++                                start_pos,
++                                local_freqs_,
++                                packed_seq_params,
++                                q_rope_preapplied=False,
++                                freqs_cis_for_kv=_freqs_cis_for_kv,
++                                x_for_weights=x_local_for_weights,
++                            )
++                        )
++                        # TND: key_index stays local; cu_seqlens_k is derived from the actual shape.
++                        query_index_, key_index_, weights_ = self.indexer.all_gather_qk_weight_kvallgather(
++                            query_index_, key_index_, weights_, tnd=packed_seq_params is not None
++                        )
+                     dsa_indexer_context = torch.no_grad() if args.use_fused_lightning_indexer_loss else nullcontext()
+                     with dsa_indexer_context:
+                         compress_topk_idxs_, compress_topk_score_ = self.indexer.forward_with_scores_compress(
+@@ -915,6 +937,7 @@ class DeepSeek4SelfAttention(MegatronModule):
+                             self.indexer.index_topk,
+                             offset,
+                             self.indexer.compress_ratio,
++                            return_value=needs_indexer_loss and not args.use_fused_lightning_indexer_loss,
+                         )
+                         compress_topk_idxs_, compress_topk_score_ = self.indexer.post_process_index(
+                             compress_topk_idxs_, compress_topk_score_
+@@ -946,6 +969,12 @@ class DeepSeek4SelfAttention(MegatronModule):
+                     compress_topk_idxs, compress_topk_score, query_index, key_index, weights = indexer_outputs
+                 else:
+                     compress_topk_idxs, compress_topk_score, attention_mask = indexer_outputs
++                if local_has_compressible_kv and not needs_indexer_loss:
++                    # Top-k indices are the only indexer output consumed by the
++                    # main attention path. Do not keep inference-only scores or
++                    # projection tensors alive through compressor/attention.
++                    compress_topk_score = None
++                    query_index = key_index = weights = None
+                 if not local_has_compressible_kv:
+                     # The score slot carries the empty-rank anchor out of the
+                     # checkpoint; no placeholder may reach top-k or attention.
+@@ -964,8 +993,11 @@ class DeepSeek4SelfAttention(MegatronModule):
+         if self.mode != LayerCompressMode.NO_COMPRESS:
+             if packed_seq_params is not None and pre_gather_len is not None:
+                 # compressor uses prefix hidden_states + prefix freqs_cis; output matches prefix cu_seqlens_kv.
+-                _hs_gathered = gather_from_sp_cp(hidden_states, tnd=True)
+-                _hs_for_compressor = _rearrange_prefix_kv(_hs_gathered, _fix_prefix_kv_segments)
++                if shared_prefix_hidden_states is not None:
++                    _hs_for_compressor = shared_prefix_hidden_states
++                else:
++                    _hs_gathered = gather_from_sp_cp(hidden_states, tnd=True)
++                    _hs_for_compressor = _rearrange_prefix_kv(_hs_gathered, _fix_prefix_kv_segments)
+                 _freqs_for_compressor = _prefix_freqs_cis if _prefix_freqs_cis is not None else local_freqs_cis
+                 kv_compress = self.compressor(_hs_for_compressor, start_pos, _freqs_for_compressor, packed_seq_params)
+                 if kv_compress is None:
+diff --git a/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py b/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py
+index 7911ad3d3d67f46d80448b206eec6d12d0252767..95e642ef2ded0946086a7aa60a147b147c71a2e0 100644
+--- a/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py
++++ b/mindspeed_llm/tasks/models/transformer/deepseek4/deepseek_utils.py
+@@ -141,6 +141,12 @@ def _rearrange_prefix_kv(kv, kv_segments):
+     """
+     if kv_segments is None or not kv_segments:
+         return kv
++    # Avoid a full-size copy only when the segment is the complete gathered
++    # tensor. Returning a shorter view would keep the full gather storage alive
++    # until attention backward and can use more memory than the original copy.
++    if len(kv_segments) == 1 and kv_segments[0] == (0, kv.shape[0]):
++        start, end = kv_segments[0]
++        return kv[start:end]
+     segments = []
+     for start, end in kv_segments:
+         segments.append(kv[start:end])
+diff --git a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py b/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
+index b3bca2dbb9880f18a1f14050ea51ea821a0a5f39..2ce2c3a4252d0390e2729f98821d609b35eefe25 100644
+--- a/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
++++ b/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
+@@ -484,7 +484,17 @@ class DSAIndexer(MegatronModule):
+ 
+     @staticmethod
+     def forward_with_scores_compress(
+-        x, q, k, weights, mask, packed_seq_params, start_pos, index_topk, offset, compress_ratio=4
++        x,
++        q,
++        k,
++        weights,
++        mask,
++        packed_seq_params,
++        start_pos,
++        index_topk,
++        offset,
++        compress_ratio=4,
++        return_value=True,
+     ):
+         args = get_args()
+         if args.use_fused_lightning_indexer:
+@@ -554,6 +564,7 @@ class DSAIndexer(MegatronModule):
+                     layout_query=layout,
+                     layout_key=layout,
+                     compress_ratio=compress_ratio,
++                    return_value=return_value,
+                 )
+             topk_idxs = torch.where(topk_idxs == -1, topk_idxs, topk_idxs + offset) if offset != 0 else topk_idxs
+         else:
+@@ -1081,6 +1092,7 @@ def fused_lightning_indexer_with_compress(
+     layout_query='BSND',
+     layout_key='BSND',
+     compress_ratio=4,
++    return_value=True,
+ ):
+     topk_indices, topk_score = npu_lightning_indexer(
+         q,
+@@ -1095,9 +1107,10 @@ def fused_lightning_indexer_with_compress(
+         cmp_residual_k=cmp_residual_k,
+         max_seqlen_q=max_seqlen_q,
+         max_seqlen_k=max_seqlen_k,
++        return_value=return_value,
+     )
+     topk_indices = topk_indices.squeeze(2)
+-    topk_score = topk_score.squeeze(2)
++    topk_score = topk_score.squeeze(2) if return_value else None
+     return topk_indices, topk_score
+ 
+ 

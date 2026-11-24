@@ -1,0 +1,46 @@
+diff --git a/mindspeed_llm/features_manager/megatron_basic/megatron_basic.py b/mindspeed_llm/features_manager/megatron_basic/megatron_basic.py
+index a70f0df78f1e47c8bdf15f304aec67c0e93086fd..93916e0b264c127de42510d557abe092f6957b67 100644
+--- a/mindspeed_llm/features_manager/megatron_basic/megatron_basic.py
++++ b/mindspeed_llm/features_manager/megatron_basic/megatron_basic.py
+@@ -123,4 +123,38 @@ class MegatronBasicFeature(MindSpeedMegatronBasicFeature):
+ 
+         from mindspeed.core.megatron_basic.megatron_basic import get_device_arch_version
+         pm.register_patch('megatron.training.utils.get_device_arch_version',
+-                          get_device_arch_version)
+\ No newline at end of file
++                          get_device_arch_version)
++
++        # repatch() 会先 remove_patches() 清掉 MindSpeed core 注册的全部补丁，
++        # 再只按本 feature list 重新注册。以下补丁在 MindSpeed core 里仅由
++        # MegatronBasicFeature.register_mcore_basic_patches 注册，本类覆盖了
++        # 同名方法且没有调用 super()，因此必须在这里补回，否则 repatch 之后
++        # 会退回 MCore 原函数（preload_tensors 还会丢失 staticmethod 描述符，
++        # 保存时 partial(self.preload_tensors, ...) 多绑定一个 self）。
++        from mindspeed.core.megatron_basic.megatron_basic import preload_tensors
++        pm.register_patch(
++            'megatron.core.dist_checkpointing.strategies.filesystem_async.FileSystemWriterAsync.preload_tensors',
++            preload_tensors,
++        )
++
++        from mindspeed.core.megatron_basic.megatron_basic import dist_optim_load_state_dict
++        pm.register_patch(
++            'megatron.core.optimizer.distrib_optimizer.DistributedOptimizer.load_state_dict', dist_optim_load_state_dict
++        )
++
++        if not getattr(args, 'enable_high_availability', False):
++            from mindspeed.core.optimizer.distrib_optimizer import (
++                load_parameter_state as distributed_optimizer_load_parameter_state,
++            )
++            from mindspeed.core.optimizer.optimizer import (
++                load_parameter_state as chained_optimizer_load_parameter_state,
++            )
++
++            pm.register_patch(
++                'megatron.core.optimizer.distrib_optimizer.DistributedOptimizer.load_parameter_state',
++                distributed_optimizer_load_parameter_state,
++            )
++            pm.register_patch(
++                'megatron.core.optimizer.optimizer.ChainedOptimizer.load_parameter_state',
++                chained_optimizer_load_parameter_state,
++            )
+\ No newline at end of file

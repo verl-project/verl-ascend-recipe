@@ -1,0 +1,216 @@
+From 8d7893b8e243a8bd128adea736326504ea0cca38 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Thu, 22 Oct 2026 19:22:31 +0800
+Subject: [PATCH] Fix sparse attention backward for short TND segments
+
+Pad query and KV together, generate valid sparse indices and restore original output lengths for the CANN 9.1 backward workaround.
+
+Source-commit: bb785ab6bbb588ad59ad6f01e1b03f4fbff2ce19
+---
+ mindspeed_llm/ops/npu_sparse_flash_mla.py | 179 ++++++++++++++++++++++
+ 1 file changed, 179 insertions(+)
+
+diff --git a/mindspeed_llm/ops/npu_sparse_flash_mla.py b/mindspeed_llm/ops/npu_sparse_flash_mla.py
+index 267079f9729b1982ff192bb9ac05c9f91438803b..ab626b28204cbd7d2456a1dcaa9bfef0a98afe40 100644
+--- a/mindspeed_llm/ops/npu_sparse_flash_mla.py
++++ b/mindspeed_llm/ops/npu_sparse_flash_mla.py
+@@ -11,6 +11,158 @@ from torch_npu.npu.utils import get_cann_version
+ _CUSTOM_OPS = None
+ 
+ 
++def _pad_short_tnd_csa_segments(
++    q: torch.Tensor,
++    ori_kv: torch.Tensor,
++    cmp_kv: torch.Tensor,
++    cmp_sparse_indices: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    cu_seqlens_ori_kv: torch.Tensor,
++    cu_seqlens_cmp_kv: torch.Tensor,
++    cmp_ratio: int,
++    min_seq_len: int,
++):
++    """Pad short TND CSA segments while preserving their causal alignment.
++
++    CANN 9.1 SparseFlashMlaGrad can access an invalid GM address when a large
++    packed TND batch ends with a very short segment.  Padding both Q and its
++    prefix KV by the same amount keeps ``ori_len - q_len`` unchanged, so the
++    real query rows see exactly the same causal window.  Added compressed-KV
++    rows are never selected by the real query rows and padded output rows are
++    removed immediately after the fused op.
++
++    Returns the possibly padded tensors and a list of ``(start, real_length)``
++    slices used to restore the original packed output.  ``restore_slices`` is
++    ``None`` when no padding is required.
++    """
++    q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
++    if all(q_len >= min_seq_len for q_len in q_lens):
++        return (
++            q,
++            ori_kv,
++            cmp_kv,
++            cmp_sparse_indices,
++            cu_seqlens_q,
++            cu_seqlens_ori_kv,
++            cu_seqlens_cmp_kv,
++            None,
++            None,
++        )
++
++    ori_lens = (cu_seqlens_ori_kv[1:] - cu_seqlens_ori_kv[:-1]).tolist()
++    cmp_lens = (cu_seqlens_cmp_kv[1:] - cu_seqlens_cmp_kv[:-1]).tolist()
++    if not (len(q_lens) == len(ori_lens) == len(cmp_lens)):
++        raise ValueError("TND CSA cu_seqlens must describe the same number of segments")
++
++    q_chunks = []
++    ori_chunks = []
++    cmp_chunks = []
++    index_chunks = []
++    new_q_cu = [0]
++    new_ori_cu = [0]
++    new_cmp_cu = [0]
++    new_residuals = []
++    restore_slices = []
++
++    q_start = ori_start = cmp_start = 0
++    for q_len, ori_len, cmp_len in zip(q_lens, ori_lens, cmp_lens):
++        q_len = int(q_len)
++        ori_len = int(ori_len)
++        cmp_len = int(cmp_len)
++        if cmp_len != ori_len // cmp_ratio:
++            raise ValueError(
++                f"Compressed KV length {cmp_len} does not match ori length {ori_len} / ratio {cmp_ratio}"
++            )
++
++        pad_len = max(0, min_seq_len - q_len)
++        # Keep the padded original-KV length divisible by cmp_ratio.  This makes
++        # the synthetic tail have zero residual and avoids a second short tail
++        # inside the compressed-KV path.
++        if pad_len:
++            pad_len += (-(ori_len + pad_len)) % cmp_ratio
++        padded_q_len = q_len + pad_len
++        padded_ori_len = ori_len + pad_len
++        padded_cmp_len = padded_ori_len // cmp_ratio
++        cmp_pad_len = padded_cmp_len - cmp_len
++
++        q_chunk = q[q_start : q_start + q_len]
++        ori_chunk = ori_kv[ori_start : ori_start + ori_len]
++        cmp_chunk = cmp_kv[cmp_start : cmp_start + cmp_len]
++        index_chunk = cmp_sparse_indices[q_start : q_start + q_len]
++        if pad_len:
++            q_chunk = torch.cat((q_chunk, q.new_zeros((pad_len, *q.shape[1:]))), dim=0)
++            ori_chunk = torch.cat((ori_chunk, ori_kv.new_zeros((pad_len, *ori_kv.shape[1:]))), dim=0)
++            # SparseFlashMlaGrad still gathers compressed KV for padded query
++            # rows even though their downstream d_out is zero.  All -1 rows
++            # therefore are not safe on CANN 9.1.  Populate the causal prefix
++            # with valid per-segment indices and leave only the unused tail at
++            # -1, matching the operator's documented TND input convention.
++            q_positions = torch.arange(
++                q_len,
++                padded_q_len,
++                dtype=torch.int32,
++                device=cmp_sparse_indices.device,
++            )
++            valid_counts = torch.div(
++                ori_len - q_len + q_positions + 1,
++                cmp_ratio,
++                rounding_mode="floor",
++            ).clamp_(min=0, max=min(padded_cmp_len, cmp_sparse_indices.shape[-1]))
++            index_values = torch.arange(
++                cmp_sparse_indices.shape[-1],
++                dtype=cmp_sparse_indices.dtype,
++                device=cmp_sparse_indices.device,
++            ).view(1, 1, -1)
++            pad_indices = torch.where(
++                index_values < valid_counts.view(-1, 1, 1),
++                index_values,
++                -1,
++            ).expand(-1, cmp_sparse_indices.shape[1], -1)
++            index_chunk = torch.cat(
++                (
++                    index_chunk,
++                    pad_indices,
++                ),
++                dim=0,
++            )
++        if cmp_pad_len:
++            cmp_chunk = torch.cat(
++                (cmp_chunk, cmp_kv.new_zeros((cmp_pad_len, *cmp_kv.shape[1:]))), dim=0
++            )
++
++        restore_slices.append((new_q_cu[-1], q_len))
++        q_chunks.append(q_chunk)
++        ori_chunks.append(ori_chunk)
++        cmp_chunks.append(cmp_chunk)
++        index_chunks.append(index_chunk)
++        new_q_cu.append(new_q_cu[-1] + padded_q_len)
++        new_ori_cu.append(new_ori_cu[-1] + padded_ori_len)
++        new_cmp_cu.append(new_cmp_cu[-1] + padded_cmp_len)
++        new_residuals.append(padded_ori_len % cmp_ratio)
++        q_start += q_len
++        ori_start += ori_len
++        cmp_start += cmp_len
++
++    if q_start != q.shape[0] or ori_start != ori_kv.shape[0] or cmp_start != cmp_kv.shape[0]:
++        raise ValueError("TND CSA cu_seqlens do not match packed tensor lengths")
++
++    new_q_cu = cu_seqlens_q.new_tensor(new_q_cu)
++    new_ori_cu = cu_seqlens_ori_kv.new_tensor(new_ori_cu)
++    new_cmp_cu = cu_seqlens_cmp_kv.new_tensor(new_cmp_cu)
++    new_residual = cu_seqlens_ori_kv.new_tensor(new_residuals)
++    return (
++        torch.cat(q_chunks, dim=0),
++        torch.cat(ori_chunks, dim=0),
++        torch.cat(cmp_chunks, dim=0),
++        torch.cat(index_chunks, dim=0),
++        new_q_cu,
++        new_ori_cu,
++        new_cmp_cu,
++        new_residual,
++        restore_slices,
++    )
++
++
+ def _custom_ops():
+     global _CUSTOM_OPS
+     if _CUSTOM_OPS is not None:
+@@ -488,6 +640,31 @@ def npu_sparse_flash_mla(
+         cmp_sparse_indices = (
+             None if cmp_ratio != 4 else rearrange(cmp_sparse_indices, "s b d -> (b s) d").unsqueeze(1).contiguous()
+         )  # [B, S, K] --> [T, 1, K]
++    restore_slices = None
++    if layout_q == "TND" and cmp_ratio == 4 and cmp_kv is not None and cmp_sparse_indices is not None:
++        (
++            q,
++            ori_kv,
++            cmp_kv,
++            cmp_sparse_indices,
++            cu_seqlens_q,
++            cu_seqlens_kv,
++            cu_seqlens_cmp_kv,
++            padded_residual_kv,
++            restore_slices,
++        ) = _pad_short_tnd_csa_segments(
++            q,
++            ori_kv,
++            cmp_kv,
++            cmp_sparse_indices,
++            cu_seqlens_q,
++            cu_seqlens_kv,
++            cu_seqlens_cmp_kv,
++            cmp_ratio,
++            ori_win_left + 1,
++        )
++        if padded_residual_kv is not None:
++            cmp_residual_kv = padded_residual_kv
+     output = SparseFlashMlaFunction.apply(
+         q,
+         ori_kv,
+@@ -511,6 +688,8 @@ def npu_sparse_flash_mla(
+     )
+ 
+     if layout_q == "TND":  # varlen FA
++        if restore_slices is not None:
++            output = torch.cat([output[start : start + length] for start, length in restore_slices], dim=0)
+         output = output.unsqueeze(1)
+     elif layout_q == "BSND":
+         output = output.transpose(0, 1).contiguous()

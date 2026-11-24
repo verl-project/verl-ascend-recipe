@@ -1,0 +1,71 @@
+From 02f282b1b40483643a87d732d37dddd4e47873fb Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Thu, 15 Oct 2026 15:16:07 +0800
+Subject: [PATCH] Support nonuniform pipeline layer counts and offsets
+
+Normalize num_layer_list strings, construct missing offsets and register the module-level Megatron offset function.
+
+Source-commit: ff802915622b02eeb61344d3220d32ad3b82d627
+---
+ .../core/transformer/transformer_block.py     | 20 +++++++++++++++++--
+ .../pipeline_parallel/num_layer_list.py       |  8 ++++++++
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/mindspeed_llm/core/transformer/transformer_block.py b/mindspeed_llm/core/transformer/transformer_block.py
+index 1097d4c9adfd8354eaa5d333029e7d09136bb1fb..24b70e15be10764e1d26800e15ba9d64771902f4 100644
+--- a/mindspeed_llm/core/transformer/transformer_block.py
++++ b/mindspeed_llm/core/transformer/transformer_block.py
+@@ -92,6 +92,9 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
+ 
+     num_layer_list = config.num_layer_list
+     if num_layer_list:
++        if isinstance(num_layer_list, str):
++            num_layer_list = [int(x) for x in num_layer_list.replace(';', ',').split(',') if x.strip()]
++            config.num_layer_list = num_layer_list
+         pp_stage = parallel_state.get_pipeline_model_parallel_rank()
+         num_layers_to_build = num_layer_list[pp_stage]
+     return num_layers_to_build
+@@ -117,9 +120,22 @@ def get_layer_offset_wrapper(fn):
+ 
+     @wraps(fn)
+     def wrapper(config):
+-        if config.num_layer_list:
++        num_layer_list = getattr(config, 'num_layer_list', None)
++        if num_layer_list:
++            # Configs built outside megatron's argument pipeline (e.g. verl
++            # mcore_kwargs) carry num_layer_list as a raw string and never get
++            # layer_offset assigned; normalize both here.
++            if isinstance(num_layer_list, str):
++                num_layer_list = [int(x) for x in num_layer_list.replace(';', ',').split(',') if x.strip()]
++                config.num_layer_list = num_layer_list
++            layer_offset = getattr(config, 'layer_offset', None)
++            if layer_offset is None:
++                layer_offset = [0]
++                for num_layers in num_layer_list:
++                    layer_offset.append(layer_offset[-1] + num_layers)
++                config.layer_offset = layer_offset
+             pp_stage = parallel_state.get_pipeline_model_parallel_rank()
+-            return config.layer_offset[pp_stage]
++            return layer_offset[pp_stage]
+         return fn(config)
+ 
+     return wrapper
+diff --git a/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py b/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py
+index 45fb1ef6beebad7edcaab5f7fa0af418e4c9f218..cab09485983426767ed8535c91af8bd9016b9177 100644
+--- a/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py
++++ b/mindspeed_llm/features_manager/pipeline_parallel/num_layer_list.py
+@@ -63,6 +63,14 @@ class NumLayerListFeature(MindSpeedFeature):
+                 'megatron.core.transformer.transformer_layer.TransformerLayer._get_layer_offset',
+                 get_layer_offset_wrapper,
+             )
++            # TransformerLayer.__init__ resolves the module-level
++            # get_transformer_layer_offset directly (the _get_layer_offset
++            # method above is deprecated and unused), so the module-level
++            # function must be patched as well for non-uniform PP splits.
++            patch_manager.register_patch(
++                'megatron.core.transformer.transformer_layer.get_transformer_layer_offset',
++                get_layer_offset_wrapper,
++            )
+             patch_manager.register_patch(
+                 'megatron.training.arguments.core_transformer_config_from_args',
+                 core_transformer_config_from_args_wrapper,

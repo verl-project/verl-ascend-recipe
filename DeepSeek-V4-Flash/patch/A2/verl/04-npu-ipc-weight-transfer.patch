@@ -1,0 +1,44 @@
+From 1e492fb88efd1882338d45bd22b4a1afc0898389 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:32 +0000
+Subject: [PATCH] fix: enable and align NPU IPC weight transfer
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: ipc
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/utils/device.py                                          | 3 +++
+ verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py | 4 ++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/verl/utils/device.py b/verl/utils/device.py
+index 33f0743f46359d30003aef84a4c35ef963fe86da..a0b05fd0a7b68aaf85488df1fd092888a6a14601 100644
+--- a/verl/utils/device.py
++++ b/verl/utils/device.py
+@@ -284,6 +284,9 @@ def check_ipc_version_support(software_version: str, cann_version: str) -> bool:
+     Raises:
+         RuntimeError: If version format is invalid
+     """
++    # A5 toolkits are not recognised by the version check below; force IPC on.
++    return True
++
+     # For software_version like "25.3.rc1.2", "25.5.0", or "25.5.t3.b001",
+     # we need to extract the base version
+     # Use regex to extract version with the following rules:
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+index 521d8907e70a0e8bffadcefd9e9bda72f9e7c8c5..08663a8602bec4adc85953e01680cd1c77fbf8fe 100644
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -140,6 +140,10 @@ class BucketedWeightSender:
+                     self._direct_send_large_weight(name, weight)
+                     continue
+ 
++                # NPU IPC needs bucket offsets aligned to max(dtype width, 4).
++                alignment = max(weight.element_size(), 4)
++                if offset % alignment != 0:
++                    offset = (offset + alignment - 1) // alignment * alignment
+                 bucket_meta[name] = {
+                     "name": name,
+                     "shape": weight.shape,

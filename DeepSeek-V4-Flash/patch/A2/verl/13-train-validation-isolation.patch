@@ -1,0 +1,744 @@
+From 28c27b5e56f3243641092c5f7b7951585c4f5db3 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:35 +0000
+Subject: [PATCH] fix: isolate validation from training request admission
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: validation
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/checkpoint_engine/base.py                |  25 +++
+ verl/experimental/agent_loop/agent_loop.py    |  13 ++
+ .../agent_loop/single_turn_agent_loop.py      |   5 +-
+ .../agent_loop/tool_agent_loop.py             |   3 +
+ verl/trainer/ppo/v1/trainer_base.py           | 210 +++++++++++++++---
+ verl/trainer/ppo/v1/trainer_colocate_async.py |  24 ++
+ verl/workers/rollout/llm_server.py            | 125 ++++++++++-
+ verl/workers/rollout/replica.py               |  32 +++
+ .../rollout/vllm_rollout/vllm_async_server.py |  60 +++++
+ 9 files changed, 465 insertions(+), 32 deletions(-)
+
+diff --git a/verl/checkpoint_engine/base.py b/verl/checkpoint_engine/base.py
+index 3c0d230296cf06547f4c08ce0f121918dafabd1e..d19158087b5616fdf6b6289f5e806d2985c80ef4 100644
+--- a/verl/checkpoint_engine/base.py
++++ b/verl/checkpoint_engine/base.py
+@@ -464,6 +464,31 @@ class CheckpointEngineManager:
+         """Resume generation on all replicas after abort_all_requests."""
+         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
+ 
++    @auto_await
++    async def pause_generation_for_release(self):
++        """Pause scheduling while held train requests re-enter the engine queues."""
++        await asyncio.gather(*[r.pause_generation_for_release() for r in self.replicas])
++
++    @auto_await
++    async def prepare_train_admission_release(self, load_balancer):
++        """Install engine-add acknowledgments for the validation release barrier."""
++        await asyncio.gather(*[r.prepare_train_admission_release(load_balancer) for r in self.replicas])
++
++    @auto_await
++    async def complete_train_admission_release(self):
++        """Remove engine-add acknowledgments after the release barrier."""
++        await asyncio.gather(*[r.complete_train_admission_release() for r in self.replicas])
++
++    @auto_await
++    async def hold_train_admission(self):
++        """Reject train generate calls until validation finishes. Returns immediately."""
++        await asyncio.gather(*[r.hold_train_admission() for r in self.replicas])
++
++    @auto_await
++    async def release_train_admission(self):
++        """Accept train generate calls again after validation."""
++        await asyncio.gather(*[r.release_train_admission() for r in self.replicas])
++
+     @auto_await
+     async def release_kv_cache_replicas(self):
+         """Release kv_cache of all rollout replicas before NCCL weight sync.
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index a009ac8bcbb7c876a2d45d9567d57583fb995fed..d682bebaf3ad2257a6455903e84d1f1da756f9d3 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -720,7 +720,20 @@ class AgentLoopWorker:
+                 data_config=DictConfigWrap(self.config.data),
+                 tools=ToolListWrap(self.tools),
+             )
++            kwargs.pop("validate", None)
++            # Only validation passes this keyword. Train calls stay compatible with
++            # agent loops that do not accept ``validate``. A validation loop that
++            # neither accepts it nor forwards it to ``server_manager.generate`` will
++            # wait on the train-admission gate and stall ``_validate``.
++            if trajectory.get("validate", False):
++                kwargs["validate"] = True
+             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
++            # ``_agent_loop_postprocess`` already takes ``validate`` positionally.
++            # Leaving the keyword in ``kwargs`` raises
++            # ``TypeError: got multiple values for argument 'validate'`` on every
++            # validation sample, which the prompt runner records as a failed group
++            # and retries forever.
++            kwargs.pop("validate", None)
+             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+ 
+     def _pad_token_ids(
+diff --git a/verl/experimental/agent_loop/single_turn_agent_loop.py b/verl/experimental/agent_loop/single_turn_agent_loop.py
+index dda94de5871aa502558424195a8cca301bdc63c2..754237e2dae4eb526086f402ae3b11e5c1e33cce 100644
+--- a/verl/experimental/agent_loop/single_turn_agent_loop.py
++++ b/verl/experimental/agent_loop/single_turn_agent_loop.py
+@@ -35,7 +35,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
+         self.response_length = self.rollout_config.response_length
+ 
+     @rollout_trace_op
+-    async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
++    async def run(
++        self, sampling_params: dict[str, Any], priority: int = 0, validate: bool = False, **kwargs
++    ) -> AgentLoopOutput:
+         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
+         priority = int(priority)
+         messages = list(kwargs["raw_prompt"])
+@@ -73,6 +75,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
+                 video_data=videos,
+                 mm_processor_kwargs=mm_processor_kwargs,
+                 priority=priority,
++                validate=validate,
+             )
+         if metrics.get("num_preempted") is None:
+             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+diff --git a/verl/experimental/agent_loop/tool_agent_loop.py b/verl/experimental/agent_loop/tool_agent_loop.py
+index 098db2b96fe72f4c2fe77724219b73a173b4b625..377664ea7f9e1e05b132e2559554e0d06763ab87 100644
+--- a/verl/experimental/agent_loop/tool_agent_loop.py
++++ b/verl/experimental/agent_loop/tool_agent_loop.py
+@@ -123,6 +123,8 @@ class ToolAgentLoop(AgentLoopBase):
+ 
+     @rollout_trace_op
+     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
++        validate = bool(kwargs.pop("validate", False))
++        self._request_validate = validate
+         messages = list(kwargs["raw_prompt"])
+ 
+         # extract multimodal inputs from messages
+@@ -240,6 +242,7 @@ class ToolAgentLoop(AgentLoopBase):
+                 video_data=agent_data.video_data,
+                 audio_data=agent_data.audio_data,
+                 mm_processor_kwargs=agent_data.mm_processor_kwargs,
++                validate=getattr(self, "_request_validate", False),
+             )
+         # first time to set num_preempted
+         if agent_data.metrics.get("num_preempted") is None:
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index f510875d150558105811638d3152c0b22db0467c..85219fdafea070fd79b59bf14641a3fdf7062119 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -16,6 +16,9 @@ import json
+ import logging
+ import math
+ import os
++import sys
++import threading
++import time
+ import uuid
+ from abc import ABC, abstractmethod
+ from collections import defaultdict
+@@ -444,36 +447,47 @@ class PPOTrainer(ABC):
+             is_last_step = self.global_steps >= self.total_training_steps
+             metrics = {}
+             self.timing_raw = {}
++            will_validate = self.config.trainer.test_freq > 0 and (
++                is_last_step or self.global_steps % self.config.trainer.test_freq == 0
++            )
++            # colocate_async reads this in on_sample_end and holds partial-rollout
++            # retries until validation returns. Other trainers ignore it.
++            # VERL_R3_ISOLATE_VAL_TRAIN=0 disables the hold for A/B or rollback:
++            # the gate never closes, so the rest of this patch stays inert.
++            self._isolate_train_during_validation = will_validate and (
++                os.environ.get("VERL_R3_ISOLATE_VAL_TRAIN", "1") != "0"
++            )
+ 
+-            # 1. perform rollout and actor/critic training
+-            with marked_timer("step", self.timing_raw):
+-                self.on_step_begin()
+-
+-                self._start_profiling()
+-                batch = self.step(metrics, self.timing_raw)
+-                self._stop_profiling()
+-
+-                # 2. save checkpoint
+-                if self.config.trainer.save_freq > 0 and (
+-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+-                ):
+-                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
+-                        self._save_checkpoint()
++            try:
++                # 1. perform rollout and actor/critic training
++                with marked_timer("step", self.timing_raw):
++                    self.on_step_begin()
+ 
+-                self.on_step_end()
+-                metrics.update(self._consume_sync_metrics())
++                    self._start_profiling()
++                    batch = self.step(metrics, self.timing_raw)
+ 
+-            # 4. validate
+-            if self.config.trainer.test_freq > 0 and (
+-                is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+-            ):
+-                with marked_timer("testing", self.timing_raw, color="green"):
+-                    self.on_validate_begin()
+-                    val_metrics: dict = self._validate()
+-                    self.on_validate_end()
+-                    if is_last_step:
+-                        last_val_metrics = val_metrics
+-                metrics.update(val_metrics)
++                    # 2. save checkpoint
++                    if self.config.trainer.save_freq > 0 and (
++                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0
++                    ):
++                        with marked_timer("save_checkpoint", self.timing_raw, color="green"):
++                            self._save_checkpoint()
++
++                    self.on_step_end()
++                    metrics.update(self._consume_sync_metrics())
++
++                # 4. validate
++                if will_validate:
++                    with marked_timer("testing", self.timing_raw, color="green"):
++                        self.on_validate_begin()
++                        val_metrics: dict = self._validate()
++                        self.on_validate_end()
++                        if is_last_step:
++                            last_val_metrics = val_metrics
++                    metrics.update(val_metrics)
++            finally:
++                if will_validate:
++                    self._release_train_admission()
+ 
+             # 5. record metrics
+             self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
+@@ -607,6 +621,119 @@ class PPOTrainer(ABC):
+         """Called after the validation loop ends."""
+         return
+ 
++    def _release_train_admission(self) -> None:
++        """Requeue held train requests before admitting the next fresh batch.
++
++        The next ``_add_batch_to_generate`` runs only after this method returns, so
++        the engine does not need to be paused here. Keeping it running avoids a DP
++        engine path where ``add_request`` would not complete while paused, leaving
++        every held request without an acknowledgment.
++
++        The load balancer tracks held vLLM request IDs and each server acknowledges
++        after ``AsyncLLM.add_request`` submits the request. The barrier is fail-open
++        by default: a missing acknowledgment must not kill a training run. Set
++        ``VERL_R3_VAL_RELEASE_STRICT=1`` to restore the hard failure for debugging.
++        """
++        if not getattr(self, "_train_admission_held", False):
++            return
++        self._train_admission_held = False
++        self._isolate_train_during_validation = False
++        logger.info("Releasing in-flight train generation after validation")
++        pending_exception = sys.exc_info()[0] is not None
++        release_error: Optional[BaseException] = None
++        load_balancer = getattr(getattr(self, "llm_server_manager", None), "global_load_balancer", None)
++        strict = os.environ.get("VERL_R3_VAL_RELEASE_STRICT", "0") == "1"
++        no_ack_grace_s = float(os.environ.get("VERL_R3_VAL_RELEASE_NO_ACK_GRACE_S", "10"))
++
++        try:
++            if load_balancer is None:
++                raise RuntimeError("validation release ordering requires the global load balancer")
++            self.checkpoint_manager.prepare_train_admission_release(load_balancer)
++            ray.get(load_balancer.begin_train_admission_release.remote())
++
++            # Open the server before the client poll, so a retry cannot observe an
++            # open poll and then get rejected. The engine stays running so that the
++            # held requests can reach AsyncLLM.add_request and acknowledge.
++            self.checkpoint_manager.release_train_admission()
++            ray.get(load_balancer.release_train_admission.remote())
++
++            timeout_s = float(os.environ.get("VERL_R3_VAL_RELEASE_TIMEOUT_S", "60"))
++            started = time.monotonic()
++            deadline = started + timeout_s
++            last_log = 0.0
++            empty_since = None
++            while True:
++                pending, completed = ray.get(load_balancer.train_admission_release_status.remote())
++                now = time.monotonic()
++                if pending == 0:
++                    if empty_since is None:
++                        empty_since = now
++                    # Match the client's maximum 5s backoff plus 20% jitter.
++                    # A late held retry can still join the barrier during this window.
++                    if now - empty_since >= 6.0:
++                        logger.info("[R3VAL] release barrier: all %d held requests added", completed)
++                        break
++                else:
++                    empty_since = None
++                # No acknowledgment at all usually means this vLLM build does not
++                # route generate() through the patched add_request, or the held
++                # waiters no longer exist. Both are non-fatal; let training proceed.
++                if not strict and completed == 0 and now - started >= no_ack_grace_s:
++                    logger.warning(
++                        "[R3VAL] release barrier saw no add_request acknowledgment after %.0fs "
++                        "(pending=%d); proceeding without strict ordering",
++                        now - started,
++                        pending,
++                    )
++                    break
++                if now >= deadline:
++                    message = (
++                        f"validation release barrier timed out after {timeout_s:.0f}s: "
++                        f"pending={pending} completed={completed}"
++                    )
++                    if strict:
++                        raise TimeoutError(message)
++                    logger.warning("[R3VAL] %s; proceeding without strict ordering", message)
++                    break
++                if now - last_log >= 5.0:
++                    logger.info("[R3VAL] release barrier: completed=%d pending=%d", completed, pending)
++                    last_log = now
++                time.sleep(0.1)
++        except Exception as exc:
++            logger.exception("Failed to preserve train-request order after validation")
++            release_error = exc
++        finally:
++            # Always recover to an open, schedulable state. If this release was
++            # already handling an exception, cleanup must not replace it.
++            def cleanup(description, fn):
++                nonlocal release_error
++                try:
++                    fn()
++                except Exception as exc:
++                    logger.exception("Failed to %s", description)
++                    if release_error is None:
++                        release_error = exc
++
++            cleanup("release server train admission", self.checkpoint_manager.release_train_admission)
++            if load_balancer is not None:
++                cleanup(
++                    "release load-balancer train admission",
++                    lambda: ray.get(load_balancer.release_train_admission.remote()),
++                )
++            cleanup("resume generation after validation", self.checkpoint_manager.resume_generation_replicas)
++            cleanup(
++                "remove validation release hooks",
++                self.checkpoint_manager.complete_train_admission_release,
++            )
++            if load_balancer is not None:
++                cleanup(
++                    "clear validation release barrier",
++                    lambda: ray.get(load_balancer.finish_train_admission_release.remote()),
++                )
++
++        if release_error is not None and not pending_exception:
++            raise release_error
++
+     def on_step_begin(self):
+         """Called at the beginning of each training step."""
+         return
+@@ -956,6 +1083,31 @@ class PPOTrainer(ABC):
+         with open(local_latest_checkpointed_iteration, "w") as f:
+             f.write(str(self.global_steps))
+ 
++    def _sample_val_with_heartbeat(self, batch_size: int):
++        """Block on the val partition and log while it is still outstanding.
++
++        A healthy validation already waits tens of minutes for generation, so the
++        line is a heartbeat, not a fault. If it keeps printing and ``_validate``
++        never returns, the val requests are not finishing. One cause is a custom
++        agent loop that received ``validate`` but did not forward it to ``generate``.
++        """
++        stop = threading.Event()
++        started = time.monotonic()
++
++        def _heartbeat() -> None:
++            while not stop.wait(300):
++                logger.info("[R3VAL] waiting %.0fs for val samples", time.monotonic() - started)
++
++        beater = threading.Thread(target=_heartbeat, name="r3val-sample-heartbeat", daemon=True)
++        beater.start()
++        try:
++            return self.replay_buffer.sample(
++                global_steps=self.global_steps, partition_id="val", batch_size=batch_size
++            )
++        finally:
++            stop.set()
++            beater.join(timeout=1.0)
++
+     def _validate(self) -> dict[str, float]:
+         # Lists to collect samples for the table
+         sample_uids = []
+@@ -988,9 +1140,7 @@ class PPOTrainer(ABC):
+             self.agent_loop_manager.generate_sequences(batch)
+ 
+             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
+-            batch, _ = self.replay_buffer.sample(
+-                global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
+-            )
++            batch, _ = self._sample_val_with_heartbeat(len(batch))
+ 
+             # 3. [OPTIONAL] compute reward score with colocated reward model
+             if self.reward_loop_manager.reward_loop_worker_handles is None:
+diff --git a/verl/trainer/ppo/v1/trainer_colocate_async.py b/verl/trainer/ppo/v1/trainer_colocate_async.py
+index 12e31a35df5cb228a0009d57a62255609ce0b12f..349b3b2dadf7c8a11aac5348e398a3bb0ce3c643 100644
+--- a/verl/trainer/ppo/v1/trainer_colocate_async.py
++++ b/verl/trainer/ppo/v1/trainer_colocate_async.py
+@@ -14,6 +14,8 @@
+ import logging
+ import os
+ 
++import ray
++
+ from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
+ from verl.utils.debug import marked_timer
+ from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+@@ -53,6 +55,28 @@ class PPOTrainerColocateAsync(PPOTrainer):
+             self.checkpoint_manager.resume_generation_replicas()
+ 
+     def on_sample_end(self):
++        # On a validation step, close train admission before abort. Partial-rollout
++        # retries then wait outside the engine; validation requests pass the gate.
++        # fit() opens the gate again after _validate().
++        # parameter_sync_step > 1 samples again inside this step. Hold only on the
++        # last trigger, after which on_step_end resumes the engine for validation.
++        is_last_trigger = self.local_trigger_step >= self.parameter_sync_step - 1
++        if getattr(self, "_isolate_train_during_validation", False) and is_last_trigger:
++            load_balancer = getattr(self.llm_server_manager, "global_load_balancer", None)
++            if load_balancer is None:
++                raise RuntimeError(
++                    "colocate_async cannot hold train generation across validation "
++                    "without the global load balancer"
++                )
++            self._train_admission_held = True
++            logger.info(
++                "Holding in-flight train generation until validation finishes. "
++                "After release, step sample waits for the remaining generation; "
++                "that extra wall time is the cost of keeping validation off this batch."
++            )
++            # Close the client-side poll first, then the server reject, then abort.
++            ray.get(load_balancer.hold_train_admission.remote())
++            self.checkpoint_manager.hold_train_admission()
+         # abort all unfinished requests and pause generation
+         self.checkpoint_manager.abort_replicas()
+         # sleep all replicas to discard weights and kv cache
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index d9beede7531d55247751ac2aa6295e68c680ec75..f4551117c7db6ad2cee1c9aa054e02faed9a771b 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -21,6 +21,8 @@ Utility classes for manage and request LLM servers:
+ import asyncio
+ import logging
+ import os
++import random
++import time
+ from typing import Any, Optional
+ from uuid import uuid4
+ 
+@@ -79,6 +81,73 @@ class GlobalRequestLoadBalancer:
+         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
+         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+         self._full_determinism = full_determinism
++        # Closed only across validation. Train partial-rollout retries poll this
++        # instead of entering vLLM, so validation has the engine to itself.
++        self._train_admission_open = True
++        self._hold_started: Optional[float] = None
++        self._hold_wait_logged = False
++        self._train_admission_waiters: set[str] = set()
++        self._train_release_pending: Optional[set[str]] = None
++        self._train_release_completed: set[str] = set()
++
++    def hold_train_admission(self) -> None:
++        """Stop train generation retries from entering vLLM until release."""
++        self._train_admission_open = False
++        self._hold_started = time.monotonic()
++        self._hold_wait_logged = False
++        self._train_admission_waiters.clear()
++        self._train_release_pending = None
++        self._train_release_completed.clear()
++
++    def begin_train_admission_release(self) -> None:
++        """Snapshot requests that must be added to vLLM before scheduling resumes."""
++        self._train_release_pending = set(self._train_admission_waiters)
++        self._train_release_completed.clear()
++
++    def release_train_admission(self) -> None:
++        """Allow train generation retries into vLLM again."""
++        self._train_admission_open = True
++        self._hold_started = None
++        self._hold_wait_logged = False
++
++    def train_admission_open(self, request_id: Optional[str] = None) -> tuple[bool, Optional[float]]:
++        """Whether train retries may enter vLLM, plus a one-shot hold age.
++
++        The age is seconds since this hold began, returned once after 60s and
++        then ``None`` until the next ``hold_train_admission``. The clock lives
++        here so an ``admission_closed`` retry cannot reset it.
++        """
++        if request_id is not None:
++            if not self._train_admission_open:
++                self._train_admission_waiters.add(request_id)
++            elif self._train_release_pending is not None and request_id not in self._train_release_completed:
++                # A late retry from the held set still joins the release barrier.
++                # The next train batch is not submitted until the barrier finishes.
++                self._train_release_pending.add(request_id)
++        notice: Optional[float] = None
++        if not self._train_admission_open and not self._hold_wait_logged and self._hold_started is not None:
++            elapsed = time.monotonic() - self._hold_started
++            if elapsed >= 60.0:
++                self._hold_wait_logged = True
++                notice = elapsed
++        return self._train_admission_open, notice
++
++    def train_admission_queued(self, request_id: str) -> None:
++        """Record that AsyncLLM.add_request has submitted this request to EngineCore."""
++        if self._train_release_pending is None or request_id not in self._train_release_pending:
++            return
++        self._train_release_pending.remove(request_id)
++        self._train_release_completed.add(request_id)
++
++    def train_admission_release_status(self) -> tuple[int, int]:
++        """Return (pending, completed) request counts for the release barrier."""
++        return len(self._train_release_pending or ()), len(self._train_release_completed)
++
++    def finish_train_admission_release(self) -> None:
++        """Clear release-barrier state after scheduling resumes."""
++        self._train_admission_waiters.clear()
++        self._train_release_pending = None
++        self._train_release_completed.clear()
+ 
+     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+         """Acquire a server for the given request (sticky + least-loaded).
+@@ -271,14 +340,22 @@ class LLMServerClient:
+             priority_kwargs = (
+                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
+             )
++            # vLLM rejects train calls while validation owns the engine. Other backends
++            # do not accept this keyword.
++            validate = bool(kwargs.pop("validate", False))
++            validate_kwargs = (
++                {"validate": True} if validate and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
++            )
++            vllm_request_id = kwargs.pop("_vllm_request_id_override", None) or self._vllm_request_id(request_id)
+             output: TokenOutput = await server.generate.remote(
+-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
++                request_id=vllm_request_id,  # use new request_id for each turn
+                 prompt_ids=prompt_ids,
+                 sampling_params=sampling_params,
+                 image_data=image_data,
+                 video_data=video_data,
+                 **multimodal_kwargs,
+                 **priority_kwargs,
++                **validate_kwargs,
+                 **kwargs,
+             )
+             global_steps = output.extra_fields.get("global_steps")
+@@ -342,6 +419,36 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+             return response_length
+         return None
+ 
++    async def _wait_train_admission(self, request_id: str) -> None:
++        """Block while validation is using the engine.
++
++        The flag lives on the shared load balancer, a single-threaded Ray actor that
++        also serves ``acquire_server``. Polling backs off so a full train batch
++        waiting out validation does not flood that actor. The server rejects any
++        train call that races the flag with ``stop_reason="admission_closed"``,
++        which this loop does not record as a weight version.
++        """
++        if self._load_balancer is None:
++            # No poll target. Sleep once so a closed server gate cannot tight-spin
++            # the retry loop; the following acquire then fails visibly.
++            await asyncio.sleep(0.5)
++            return
++        delay = 0.5
++        while True:
++            open_, notice = await self._load_balancer.train_admission_open.remote(request_id=request_id)
++            if notice is not None:
++                logger.info(
++                    "Train generation is waiting on the validation gate (%.0fs); "
++                    "this is expected while validation owns the engine.",
++                    notice,
++                )
++            if open_:
++                return
++            # Jitter so a full batch does not wake on the same tick and spike the
++            # single-threaded load balancer.
++            await asyncio.sleep(delay * random.uniform(0.8, 1.2))
++            delay = min(delay * 2, 5.0)
++
+     @rollout_trace_op
+     async def generate(
+         self,
+@@ -400,8 +507,17 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+             num_preempted=0,
+         )
+         min_global_steps, max_global_steps = None, None
++        # Validation requests must run while train retries are held. Train requests,
++        # including the first attempt of a batch submitted before the hold, wait here
++        # so they do not enter the engine during validation.
++        validate = bool(kwargs.get("validate", False))
+ 
+         while True:
++            # Use one ID for admission registration and this exact vLLM attempt so
++            # the release barrier can match the engine-side add_request ack.
++            vllm_request_id = self._vllm_request_id(request_id)
++            if not validate:
++                await self._wait_train_admission(vllm_request_id)
+             # 1. generate tokens
+             output = await super().generate(
+                 request_id=request_id,
+@@ -411,9 +527,16 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+                 video_data=video_data,
+                 audio_data=audio_data,
+                 mm_processor_kwargs=mm_processor_kwargs,
++                _vllm_request_id_override=vllm_request_id,
+                 **kwargs,
+             )
+ 
++            # The server gate is closed. No tokens were produced, so this attempt
++            # must not move min/max_global_steps. The wait at the top of the loop
++            # backs off until validation releases the engine.
++            if output.stop_reason == "admission_closed":
++                continue
++
+             # 2. merge output into final_output
+             final_output.token_ids.extend(output.token_ids)
+             if output.log_probs is not None:
+diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
+index 22bb8667c11184904ecbb952a6929c7acd55bc72..cbcd78ee5a60c3fcf134f3f63a948a74bba5e795 100644
+--- a/verl/workers/rollout/replica.py
++++ b/verl/workers/rollout/replica.py
+@@ -278,6 +278,38 @@ class RolloutReplica(ABC):
+         """Resume generation on all servers after abort_all_requests."""
+         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
+ 
++    async def pause_generation_for_release(self):
++        """Pause scheduling but allow held retries to queue before the next batch."""
++        if self.is_reward_model or self.is_teacher_model or getattr(self.config, "name", None) != "vllm":
++            return
++        await asyncio.gather(*[server.pause_generation_for_release.remote() for server in self.servers])
++
++    async def prepare_train_admission_release(self, load_balancer):
++        """Install the temporary engine-add acknowledgment hook."""
++        if self.is_reward_model or self.is_teacher_model or getattr(self.config, "name", None) != "vllm":
++            return
++        await asyncio.gather(
++            *[server.prepare_train_admission_release.remote(load_balancer) for server in self.servers]
++        )
++
++    async def complete_train_admission_release(self):
++        """Remove the temporary engine-add acknowledgment hook."""
++        if self.is_reward_model or self.is_teacher_model or getattr(self.config, "name", None) != "vllm":
++            return
++        await asyncio.gather(*[server.complete_train_admission_release.remote() for server in self.servers])
++
++    async def hold_train_admission(self):
++        """Reject train generate calls on vLLM replicas until validation finishes."""
++        if self.is_reward_model or self.is_teacher_model or getattr(self.config, "name", None) != "vllm":
++            return
++        await asyncio.gather(*[server.hold_train_admission.remote() for server in self.servers])
++
++    async def release_train_admission(self):
++        """Accept train generate calls on vLLM replicas again."""
++        if self.is_reward_model or self.is_teacher_model or getattr(self.config, "name", None) != "vllm":
++            return
++        await asyncio.gather(*[server.release_train_admission.remote() for server in self.servers])
++
+     async def clear_kv_cache(self):
+         """reset kv cache in each rollout server."""
+         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 210ecd68066e1d422f25633050b5a52b8b6ca59b..e095af5f046473a947f3c56720169b3c15c047cc 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -160,6 +160,11 @@ class vLLMHttpServer:
+         # model weights version, set by ServerAdapter when update weights.
+         self.global_steps = None
+         self._warned_missing_spec_decode_stats = False
++        # Closed across validation. A closed gate returns aborted immediately so the
++        # vLLM actor is not occupied while train clients wait out the validation.
++        self._train_admission_open = True
++        self._train_admission_ack_load_balancer = None
++        self._train_admission_original_add_request = None
+ 
+         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
+@@ -558,12 +563,24 @@ class vLLMHttpServer:
+         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+         priority: int = 0,
+         kv_transfer_params: Optional[dict] = None,
++        validate: bool = False,
+     ) -> TokenOutput:
+         """Generate sequence with token-in-token-out.
+ 
+         Args:
+             kv_transfer_params: vLLM KV-transfer payload for PD requests.
++            validate: validation requests skip the train-admission gate.
+         """
++        if not validate and not self._train_admission_open:
++            # Distinct from a real abort: the client retries without recording a
++            # weight version for this empty attempt.
++            return TokenOutput(
++                token_ids=[],
++                log_probs=None,
++                stop_reason="admission_closed",
++                extra_fields={},
++            )
++
+         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+             return await self._pd_dispatch(
+                 prompt_ids,
+@@ -949,12 +966,55 @@ class vLLMHttpServer:
+             logger.exception(f"Error aborting requests: {e}")
+             raise
+ 
++    async def pause_generation_for_release(self):
++        """Queue new requests without scheduling them during validation release."""
++        if self.node_rank != 0:
++            return
++        await self.engine.pause_generation(mode="keep", clear_cache=False)
++
++    async def prepare_train_admission_release(self, load_balancer):
++        """Acknowledge held requests after AsyncLLM.add_request submits them."""
++        if self.node_rank != 0:
++            return
++        self._train_admission_ack_load_balancer = load_balancer
++        if self._train_admission_original_add_request is not None:
++            return
++
++        original_add_request = self.engine.add_request
++        self._train_admission_original_add_request = original_add_request
++
++        async def add_request_with_ack(request_id, *args, **kwargs):
++            queue = await original_add_request(request_id, *args, **kwargs)
++            load_balancer = self._train_admission_ack_load_balancer
++            if load_balancer is not None:
++                await load_balancer.train_admission_queued.remote(request_id)
++            return queue
++
++        self.engine.add_request = add_request_with_ack
++
++    async def complete_train_admission_release(self):
++        """Remove the temporary add_request hook after the release barrier."""
++        if self.node_rank != 0:
++            return
++        self._train_admission_ack_load_balancer = None
++        if self._train_admission_original_add_request is not None:
++            self.engine.add_request = self._train_admission_original_add_request
++            self._train_admission_original_add_request = None
++
+     async def resume_generation(self):
+         """Resume generation after abort_all_requests (pause_generation)."""
+         if self.node_rank != 0:
+             return
+         await self.engine.resume_generation()
+ 
++    async def hold_train_admission(self):
++        """Reject new train generate calls until release_train_admission()."""
++        self._train_admission_open = False
++
++    async def release_train_admission(self):
++        """Accept train generate calls again."""
++        self._train_admission_open = True
++
+     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+         """Abort a specific generation request.
+ 

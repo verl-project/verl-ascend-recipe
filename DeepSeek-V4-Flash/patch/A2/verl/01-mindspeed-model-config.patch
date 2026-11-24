@@ -1,0 +1,133 @@
+From 4e744a6507be35213808d5e1b895e2e94103ba89 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:32 +0000
+Subject: [PATCH] feat: configure the MindSpeed DeepSeek V4 model provider
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: model
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ verl/trainer/config/engine/mindspeed.yaml     | 39 +------------------
+ .../engine/mindspeed/transformer_impl.py      | 16 +++++++-
+ verl/workers/engine/mindspeed/utils.py        |  8 ++--
+ 3 files changed, 21 insertions(+), 42 deletions(-)
+
+diff --git a/verl/trainer/config/engine/mindspeed.yaml b/verl/trainer/config/engine/mindspeed.yaml
+index 1435604f0390fa2436a626e463eefb872e6bf6fa..0cda7371ba7ef7a9d02b0fc8da4262bae0e330db 100644
+--- a/verl/trainer/config/engine/mindspeed.yaml
++++ b/verl/trainer/config/engine/mindspeed.yaml
+@@ -4,43 +4,6 @@ _target_: verl.workers.config.MindSpeedEngineConfig
+ # mindspeed_megatron or mindspeed_fsdp
+ strategy: mindspeed_megatron
+ 
+-# mindspeed_megatron backend config
+-mcore_kwargs:
+-  # llm model config
+-  use_mcore_models: true
+-  spec: []
+-  qk_layernorm: true
+-  position_embedding_type: rope
+-  normalization: RMSNorm
+-  disable_bias_linear: true
+-  swiglu: true
+-  attention_softmax_in_fp32: true
+-  no_gradient_accumulation_fusion: true
+-  group_query_attention: true
+-
+-  # only support transformer_engine for now
+-  transformer_impl: transformer_engine
+-
+-  no_pad_to_seq_lengths: true
+-  reset_attention_mask: true
+-  context_parallel_algo: ulysses_cp_algo
+-  attention_mask_type: general
+-
+-  # llm optimizer config
+-  use_flash_attn: true
+-  use_fused_rotary_pos_emb: true
+-  sequence_parallel: true
+-  use_rotary_position_embeddings: true
+-  use_fused_swiglu: true
+-  use_fused_rmsnorm: true
+-  no_masked_softmax_fusion: true
+-  use_distributed_optimizer: true
+-
+-  # llm train config
+-  seq_length: 10240
+-  micro_batch_size: 1
+-  initial_loss_scale: 4096
+-  init_method_std: 0.01
+-  hidden_dropout: 0.0
++mcore_kwargs: {}
+ 
+ fsdp_kwargs: {}
+diff --git a/verl/workers/engine/mindspeed/transformer_impl.py b/verl/workers/engine/mindspeed/transformer_impl.py
+index 6fa78d901b38acdc7ef608edce9470ad43de3d6b..4b6d71fd0b7b8f7b0451569d474914bd3861affa 100644
+--- a/verl/workers/engine/mindspeed/transformer_impl.py
++++ b/verl/workers/engine/mindspeed/transformer_impl.py
+@@ -34,7 +34,6 @@ from ..base import EngineRegistry
+ from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
+ from .utils import (
+     apply_patch,
+-    gpt_model_provider,
+     reset_fp8_reuse_quantized_weight,
+ )
+ 
+@@ -139,6 +138,14 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
+         import torch.distributed
+         from megatron.core.enums import ModelType
+         from megatron.training.training import get_model
++        from verl.utils.device import get_torch_device
++
++        local_rank = int(os.environ["LOCAL_RANK"])
++        get_torch_device().set_device(local_rank)
++
++        # DSV4 uses its MindSpeed-LLM pretrain model_provider.
++        from mindspeed_llm.pretrain_deepseek4 import model_provider as gpt_model_provider
++
+ 
+         # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
+         if self.engine_config.forward_only:
+@@ -146,6 +153,13 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
+         else:
+             module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=True)
+ 
++        param_device = next(module[0].parameters()).device
++        if param_device.index != local_rank:
++            raise RuntimeError(
++                f"MindSpeed model was built on {param_device}, but LOCAL_RANK={local_rank}. "
++                "Check Ray's ASCEND_RT_VISIBLE_DEVICES mapping."
++            )
++
+         if self.vanilla_bridge:
+             self.bridge.load_weights(module, self.model_config.local_path)
+         else:
+diff --git a/verl/workers/engine/mindspeed/utils.py b/verl/workers/engine/mindspeed/utils.py
+index 42e949d42079ee336cc1489457da9a6014963acf..9e009d8df83565157a05b0a86379ce1f3e64a6fb 100644
+--- a/verl/workers/engine/mindspeed/utils.py
++++ b/verl/workers/engine/mindspeed/utils.py
+@@ -140,6 +140,10 @@ def add_mcore_arguments(all_config: dict) -> dict:
+     for key, value in all_config.items():
+         if value is None:
+             continue
++        # Hydra represents list overrides as lists, while MindSpeed's argparse
++        # interface expects num_layer_list as a comma-separated string.
++        if key == "num_layer_list" and not isinstance(value, str):
++            value = ",".join(str(item) for item in value)
+         mcore_config_dict[key] = value
+         if isinstance(value, bool):
+             mcore_config_list.append(f"--{key.replace('_', '-')}")
+@@ -153,10 +157,8 @@ def add_mcore_arguments(all_config: dict) -> dict:
+ 
+ 
+ def apply_patch(model_config, engine_config, optimizer_config):
+-    model_config = get_base_mcore_config_from_model_config(model_config)
+-    optimizer_config = get_base_mcore_config_from_optim_config(optimizer_config)
+     engine_config = get_base_mcore_config_from_engine_config(engine_config)
+-    all_config = {**model_config, **optimizer_config, **engine_config}
++    all_config = {**engine_config}
+     mcore_config = add_mcore_arguments(all_config)
+     from mindspeed_llm.tasks.megatron_adaptor_v2 import repatch
+ 

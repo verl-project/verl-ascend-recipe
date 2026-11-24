@@ -1,0 +1,320 @@
+From 3d6b9477e76e454cdaacbf3cf575ac4596682366 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 13:26:34 +0000
+Subject: [PATCH] perf: reduce model loading and training memory retention
+
+Source-base: 91c297dc8d9991b79c90cad5b50683a5d6d8c02b
+Functional-group: memory
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ .../engine/megatron/transformer_impl.py       |  23 ++-
+ .../engine/mindspeed/deepseek4_memory.py      | 167 ++++++++++++++++++
+ .../engine/mindspeed/transformer_impl.py      |  26 ++-
+ verl/workers/engine_workers.py                |   6 +
+ 4 files changed, 218 insertions(+), 4 deletions(-)
+ create mode 100644 verl/workers/engine/mindspeed/deepseek4_memory.py
+
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index de311f66237d3a7e2ca89151fb529dd8fd83e182..e245d679a9e82ce0d09b8cab482dc9d6cd5724ba 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -838,6 +838,8 @@ class MegatronEngine(BaseEngine):
+     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+         self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
+         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
++        requested_model_output = tu.get_non_tensor_data(data, key="return_model_output", default=False)
++        collect_model_output = forward_only or requested_model_output
+ 
+         _check_dcp_unsupported_features(self.engine_config, self.model_config, batch=data)
+ 
+@@ -935,6 +937,7 @@ class MegatronEngine(BaseEngine):
+             self.postprocess_micro_batch_func,
+             forward_only=forward_only,
+             loss_function=loss_function,
++            collect_model_output=collect_model_output,
+         )
+ 
+         tu.assign_non_tensor(data, num_micro_batch=n_micro_batch)
+@@ -1006,7 +1009,10 @@ class MegatronEngine(BaseEngine):
+         if mpu.is_pipeline_last_stage(ignore_virtual=True):
+             if dcp_group is not None:
+                 output = postprocess_dynamic_cp_batch(
+-                    losses_reduced, len(data), dcp_group, include_model_output=self.is_mp_src_rank_with_outputs()
++                    losses_reduced,
++                    len(data),
++                    dcp_group,
++                    include_model_output=collect_model_output and self.is_mp_src_rank_with_outputs(),
+                 )
+             else:
+                 output = postprocess_batch_func(output_lst=losses_reduced, indices=indices, data=data)
+@@ -1430,7 +1436,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
+         return output, partial(postprocess_micro_batch_func, data=batch, local_cp_size=local_cp_size)
+ 
+     def postprocess_micro_batch_func(
+-        self, output, data: TensorDict, forward_only: bool, loss_function, local_cp_size=None
++        self,
++        output,
++        data: TensorDict,
++        forward_only: bool,
++        loss_function,
++        local_cp_size=None,
++        collect_model_output: bool = True,
+     ):
+         # For memory efficiency
+         # We move calculation of entropy to compute_log_probs, forward_only == True
+@@ -1450,7 +1462,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
+             scaled_loss = loss
+             metrics = {}
+         output = {"loss": loss.detach().item(), "metrics": metrics}
+-        if forward_only or not self.engine_config.dynamic_context_parallel:
++        # The loss has consumed model_output at this point. Standard training
++        # must not append the still graph-connected per-token tensors to
++        # Megatron's forward_data_store: that list lives through the optimizer
++        # step and scales with the number of micro-batches. Forward-only calls
++        # and specialized training clients explicitly opt in above.
++        if collect_model_output:
+             output["model_output"] = model_output
+         if self.engine_config.dynamic_context_parallel:
+             output[DCP_SAMPLE_IDS] = tu.get_non_tensor_data(data, key=DCP_SAMPLE_IDS, default=None)
+diff --git a/verl/workers/engine/mindspeed/deepseek4_memory.py b/verl/workers/engine/mindspeed/deepseek4_memory.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..23878a11eea903f8df68e21b2bedf10a027fc6c5
+--- /dev/null
++++ b/verl/workers/engine/mindspeed/deepseek4_memory.py
+@@ -0,0 +1,167 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import functools
++import sys
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++import torch
++from torch.multiprocessing.reductions import StorageWeakRef
++
++_CHECKPOINT_INPUTS = ContextVar("deepseek4_checkpoint_inputs", default=None)
++_CHECKPOINT_HOOKS = ContextVar("deepseek4_checkpoint_hooks", default=None)
++
++
++def track_checkpoint_tensor(tensor, tracked, hooks):
++    """Observe input and input-gradient storage without holding either allocation alive."""
++    tracked.append(StorageWeakRef(tensor.untyped_storage()))
++
++    def capture_gradient(gradient):
++        tracked.append(StorageWeakRef(gradient.untyped_storage()))
++
++    hooks.append(tensor.register_hook(capture_gradient))
++
++
++def install_checkpoint_input_tracking():
++    """Track MHC checkpoint inputs without retaining their tensor objects."""
++    from megatron.core.tensor_parallel.random import CheckpointFunction
++
++    original = CheckpointFunction.forward
++    if getattr(original, "_verl_tracks_mhc_inputs", False):
++        return
++
++    @functools.wraps(original)
++    def forward(ctx, run_function, distribute_saved_activations, *args):
++        tracked = _CHECKPOINT_INPUTS.get()
++        if tracked is not None:
++            for value in args:
++                if (
++                    isinstance(value, torch.Tensor)
++                    and value.device.type != "cpu"
++                    and value.ndim == 4
++                    and value.dtype == torch.bfloat16
++                    and value.requires_grad
++                ):
++                    # Saved/detached tensor wrappers may die while another
++                    # wrapper still owns the same allocation. Track StorageImpl
++                    # weakly so those aliases remain visible without extending
++                    # the allocation's lifetime through the pipeline schedule.
++                    track_checkpoint_tensor(value, tracked, _CHECKPOINT_HOOKS.get())
++        return original(ctx, run_function, distribute_saved_activations, *args)
++
++    forward._verl_tracks_mhc_inputs = True
++    CheckpointFunction.forward = staticmethod(forward)
++
++
++@contextmanager
++def release_completed_checkpoint_inputs(models, device):
++    """Release tracked MHC activation storage only after the entire backward finishes.
++
++    The checkpoint implementation can retain saved inputs through graph objects
++    after backward. Their storage is no longer read once the complete pipeline
++    schedule returns. This boundary avoids freeing inputs shared by other layers
++    while their backward is still running. Parameter and gradient storage is
++    excluded, and failed schedules do not release any tracked inputs.
++    """
++    tracked = []
++    hooks = []
++    token = _CHECKPOINT_INPUTS.set(tracked)
++    hook_token = _CHECKPOINT_HOOKS.set(hooks)
++    try:
++        yield
++        device.synchronize()
++        protected = set()
++        for chunk in models:
++            for param in chunk.parameters():
++                protected.add(param.untyped_storage().data_ptr())
++                for grad in (param.grad, getattr(param, "main_grad", None)):
++                    if grad is not None:
++                        protected.add(grad.untyped_storage().data_ptr())
++        seen = set()
++        released = 0
++        for reference in tracked:
++            storage = torch.UntypedStorage._new_with_weak_ptr(reference.cdata)
++            if storage is None:
++                continue
++            pointer = storage.data_ptr()
++            if pointer in protected or pointer in seen or not storage.nbytes():
++                continue
++            seen.add(pointer)
++            released += storage.nbytes()
++            storage.resize_(0)
++        if released:
++            device.empty_cache()
++        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++            print(f"[deepseek4-memory] completed_checkpoint_inputs_released_bytes={released}", flush=True)
++    finally:
++        for handle in hooks:
++            handle.remove()
++        tracked.clear()
++        _CHECKPOINT_HOOKS.reset(hook_token)
++        _CHECKPOINT_INPUTS.reset(token)
++
++
++def configure_rope_cache(models, max_sequence_length):
++    """Size deterministic RoPE tables for the current packed sequence, growing as needed."""
++    from megatron.core.parallel_state import get_context_parallel_world_size
++
++    for chunk in models:
++        for model in chunk.modules():
++            if getattr(model, "position_embedding_type", None) != "deepseek4":
++                continue
++            original = model.rotary_pos_emb
++            original_forward = model.forward
++            model._verl_rope_length = max_sequence_length
++
++            @functools.wraps(original)
++            def rotary(dim, seqlen, *args, _original=original, _model=model, **kwargs):
++                return _original(dim, min(seqlen, _model._verl_rope_length), *args, **kwargs)
++
++            model.rotary_pos_emb = rotary
++
++            @functools.wraps(original_forward)
++            def forward(*args, _original=original_forward, _model=model, **kwargs):
++                packed = kwargs.get("packed_seq_params")
++                if packed is not None:
++                    cumulative = packed.cu_seqlens_q
++                    required = int(cumulative[-1].item())
++                else:
++                    inputs = kwargs.get("decoder_input")
++                    if inputs is None:
++                        inputs = kwargs.get("input_ids", args[0] if args else None)
++                    required = inputs.numel() if inputs is not None else max_sequence_length
++                    required *= get_context_parallel_world_size()
++                if required > _model._verl_rope_length:
++                    _model._verl_rope_length = required
++                    _model.rotary_pos_emb_cache.clear()
++                return _original(*args, **kwargs)
++
++            model.forward = forward
++
++
++def clear_rope_cache(models):
++    """Drop ordinary RoPE attributes and global tables when a model is offloaded."""
++    for chunk in models:
++        for module in chunk.modules():
++            cache = getattr(module, "rotary_pos_emb_cache", None)
++            if isinstance(cache, dict):
++                cache.clear()
++            if hasattr(module, "freqs_cis"):
++                module.freqs_cis = None
++    module = sys.modules.get("mindspeed_llm.core.models.common.embeddings.rotary_pos_embedding")
++    if module is not None:
++        cache = getattr(module, "_DEEPSEEK4_ROPE_TABLE_CACHE", None)
++        if isinstance(cache, dict):
++            cache.clear()
+diff --git a/verl/workers/engine/mindspeed/transformer_impl.py b/verl/workers/engine/mindspeed/transformer_impl.py
+index 0727c87dedb3f96f9d72d7ed00d9a290fab9be9f..587754295dffc87742cd0c00488ab0baad7a2540 100644
+--- a/verl/workers/engine/mindspeed/transformer_impl.py
++++ b/verl/workers/engine/mindspeed/transformer_impl.py
+@@ -167,7 +167,7 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
+             )
+ 
+         if self.vanilla_bridge:
+-            self.bridge.load_weights(module, self.model_config.local_path)
++            self.bridge.load_weights(module, self.model_config.local_path, memory_efficient=True)
+         else:
+             raise ValueError(f"vanilla_bridge should be true now, but got {self.vanilla_bridge}")
+ 
+@@ -177,8 +177,25 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
+         if self.enable_routing_replay:
+             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
+ 
++        from megatron.training import get_args
++
++        from .deepseek4_memory import configure_rope_cache, install_checkpoint_input_tracking
++
++        args = get_args()
++        configure_rope_cache(module, args.seq_length)
++        install_checkpoint_input_tracking()
+         return module
+ 
++    def forward_backward_batch(self, data, loss_function, forward_only=False):
++        from verl.utils.device import get_torch_device
++
++        from .deepseek4_memory import release_completed_checkpoint_inputs
++
++        if forward_only or self.model_config.mtp.enable:
++            return super().forward_backward_batch(data, loss_function, forward_only=forward_only)
++        with release_completed_checkpoint_inputs(self.module, get_torch_device()):
++            return super().forward_backward_batch(data, loss_function, forward_only=forward_only)
++
+     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+         """
+         Move model parameters, optimizer states, or both to the specified device.
+@@ -191,3 +208,10 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
+         """
+         reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
+         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
++        if device == "cpu" and model:
++            from verl.utils.device import get_torch_device
++
++            from .deepseek4_memory import clear_rope_cache
++
++            clear_rope_cache(self.module)
++            get_torch_device().empty_cache()
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index b913d3729e3b8d3aefc9763fffcf18d0d83237bb..89e12253e60b0e429ea4b665e3123222b8ed5347 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -114,6 +114,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
+         self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
+         self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
+ 
++        # Enable expandable segments for every NPU training worker before the
++        # engine performs its first model allocation. This stays scoped to the
++        # training worker process; vLLM server processes keep their own allocator.
++        if self.device_name == "npu":
++            set_expandable_segments(True)
++
+         self.profiler_config = self.config.profiler_config
+         if self.profiler_config is not None:
+             self.profiler_tool_config = self.profiler_config.tool_config.get(self.profiler_config.tool, {})

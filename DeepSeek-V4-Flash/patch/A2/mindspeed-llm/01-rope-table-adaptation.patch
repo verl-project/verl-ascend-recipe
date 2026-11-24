@@ -1,0 +1,111 @@
+From a814c1edcf99244e79f767a780ba928cbe890c4f Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Thu, 15 Oct 2026 15:16:07 +0800
+Subject: [PATCH] Align and cache DeepSeek4 RoPE tables
+
+Compute RoPE on CPU in FP64, convert to complex64, use extended context lengths and cache individual and stacked tables.
+
+Source-commit: ff802915622b02eeb61344d3220d32ad3b82d627
+---
+ .../common/embeddings/rotary_pos_embedding.py | 27 +++++++++++++++----
+ .../core/models/deepseek4/deepseek4_model.py  | 11 +++++---
+ 2 files changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/mindspeed_llm/core/models/common/embeddings/rotary_pos_embedding.py b/mindspeed_llm/core/models/common/embeddings/rotary_pos_embedding.py
+index 0cfd44240944d3f8abaed038d3f1e8fcb489aa33..80d101e5aac937aeeb7292a9b30116dab2d9e628 100644
+--- a/mindspeed_llm/core/models/common/embeddings/rotary_pos_embedding.py
++++ b/mindspeed_llm/core/models/common/embeddings/rotary_pos_embedding.py
+@@ -318,6 +318,9 @@ def apply_rotary_pos_emb_bshd_in_complex(t: Tensor, freqs: Tensor, rotary_interl
+     return y.to(t.dtype)
+ 
+ 
++_DEEPSEEK4_ROPE_TABLE_CACHE = {}
++
++
+ def apply_deepseek4_rotary_embedding(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow) -> torch.Tensor:
+     """
+     Precomputes frequency-based complex exponential values for rotary positional embeddings.
+@@ -329,6 +332,15 @@ def apply_deepseek4_rotary_embedding(dim, seqlen, original_seq_len, base, factor
+         torch.Tensor: Precomputed complex exponential values for positional embeddings.
+     """
+ 
++    # Cache the (extended-length) table: this runs on every forward, and the
++    # fp64 CPU computation below is one-shot by design.
++    device = torch.npu.current_device()
++    key = (dim, seqlen, original_seq_len, float(base), float(factor),
++           float(beta_fast), float(beta_slow), device)
++    cached = _DEEPSEEK4_ROPE_TABLE_CACHE.get(key)
++    if cached is not None:
++        return cached
++
+     def find_correction_dim(num_rotations, dim, base, max_seq_len):
+         return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+ 
+@@ -340,22 +352,27 @@ def apply_deepseek4_rotary_embedding(dim, seqlen, original_seq_len, base, factor
+     def linear_ramp_factor(min_val, max_val, dim):
+         if min_val == max_val:
+             max_val += 0.001
+-        linear_func = (torch.arange(dim, dtype=torch.float32, device=torch.npu.current_device()) - min_val) / (
++        linear_func = (torch.arange(dim, dtype=torch.float64) - min_val) / (
+             max_val - min_val
+         )
+         ramp_func = torch.clamp(linear_func, 0, 1)
+         return ramp_func
+ 
+     freqs = 1.0 / (
+-        base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=torch.npu.current_device()) / dim)
++        base ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim)
+     )  # RoPE编码的频率,i越接近0的越大(->1),i越接近dim/2的越小(->0);  base^(-2i/dim) (2i是0-dim的偶数序列)
+     if original_seq_len > 0:  # bing 第一处不同 V3.2是seqlen > args.original_seq_len
+         low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
+         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+         freqs = freqs / factor * (1 - smooth) + freqs * smooth
+ 
+-    t = torch.arange(seqlen, device=torch.npu.current_device())
++    # fp64 on CPU: identical formula/op-order to the vllm-ascend rollout
++    # (precompute_freqs_cis), so both tables round to the same complex64
++    # bits; fp32 angles would drift ~2.4e-2 rad at 1M positions.
++    t = torch.arange(seqlen, dtype=torch.float64)
+     freqs = torch.outer(t, freqs)
+-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
++    freqs_cis = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
+ 
+-    return freqs_cis
++    result = freqs_cis.to(device)
++    _DEEPSEEK4_ROPE_TABLE_CACHE[key] = result
++    return result
+diff --git a/mindspeed_llm/core/models/deepseek4/deepseek4_model.py b/mindspeed_llm/core/models/deepseek4/deepseek4_model.py
+index cae051fdfaac4fe55a76c3c241e2623c611380e7..2446e07d6211cc46a68bd1829858beefd6481286 100644
+--- a/mindspeed_llm/core/models/deepseek4/deepseek4_model.py
++++ b/mindspeed_llm/core/models/deepseek4/deepseek4_model.py
+@@ -274,7 +274,8 @@ class DeepSeek4Model(MegatronCoreGPTModel):
+             compress_rope_theta = args.compress_rope_theta  # for compress_ratio>1
+             rotary_pos_emb_comp = self.rotary_pos_emb(
+                 args.qk_pos_emb_head_dim,
+-                args.rope_scaling_original_max_position_embeddings,
++                # table spans the full yarn-extended context
++                args.max_position_embeddings,
+                 args.original_seq_len,
+                 compress_rope_theta,
+                 args.rope_factor,
+@@ -283,14 +284,18 @@ class DeepSeek4Model(MegatronCoreGPTModel):
+             )
+             rotary_pos_emb_no_comp = self.rotary_pos_emb(
+                 args.qk_pos_emb_head_dim,
+-                args.rope_scaling_original_max_position_embeddings,
++                # table spans the full yarn-extended context
++                args.max_position_embeddings,
+                 0,
+                 rope_theta,
+                 args.rope_factor,
+                 args.beta_fast,
+                 args.beta_slow,
+             )
+-            rotary_pos_emb = torch.stack((rotary_pos_emb_comp, rotary_pos_emb_no_comp))
++            rotary_pos_emb = self.rotary_pos_emb_cache.get('dsv4_tables')
++            if rotary_pos_emb is None:
++                rotary_pos_emb = torch.stack((rotary_pos_emb_comp, rotary_pos_emb_no_comp))
++                self.rotary_pos_emb_cache['dsv4_tables'] = rotary_pos_emb
+         else:
+             pass
+         if self.pre_process:

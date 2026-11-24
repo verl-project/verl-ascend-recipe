@@ -1,0 +1,221 @@
+From 816f19b7c1964b4112f7df63b34f318201d60acd Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 2 Nov 2026 16:21:00 +0800
+Subject: [PATCH] support r3
+
+---
+ mindspeed_llm/core/transformer/moe/moe_utils.py |  112 +++++++++++++++++++++--
+ mindspeed_llm/core/transformer/moe/router.py    |    1 
+ mindspeed_llm/training/arguments.py             |    3 +
+ 3 files changed, 106 insertions(+), 10 deletions(-)
+
+diff --git a/mindspeed_llm/core/transformer/moe/moe_utils.py b/mindspeed_llm/core/transformer/moe/moe_utils.py
+index d20e40a0983404805cdabce05dd65201dc16c33f..85dced7d3a7a53468b9e5880ac819dbef13f2dcc 100644
+--- a/mindspeed_llm/core/transformer/moe/moe_utils.py
++++ b/mindspeed_llm/core/transformer/moe/moe_utils.py
+@@ -108,6 +108,7 @@ def topk_softmax_with_capacity_and_hash(
+     token_hash: bool = False,
+     tid2eid: Optional[torch.Tensor] = None,
+     input_ids: Optional[torch.Tensor] = None,
++    router_replay=None,
+ ):
+     """
+     patch hash operator in megatron topk_softmax_with_capacity
+@@ -115,7 +116,7 @@ def topk_softmax_with_capacity_and_hash(
+     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
+     num_tokens, num_experts = logits.shape
+ 
+-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++    def _compute_topk(scores, topk, num_groups=None, group_topk=None):
+         if group_topk:
+             return group_limited_topk(
+                 scores=scores,
+@@ -128,6 +129,19 @@ def topk_softmax_with_capacity_and_hash(
+         else:
+             return torch.topk(scores, k=topk, dim=1)
+ 
++    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++        if router_replay is None:
++            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++        # RECORD / REPLAY_FORWARD / REPLAY_BACKWARD are handled centrally by
++        # RouterReplay (including the R3 replay mask).
++        return router_replay.get_replay_topk(
++            scores,
++            topk,
++            num_groups=num_groups,
++            group_topk=group_topk,
++            default_compute_topk=_compute_topk,
++        )
++
+     if score_function == "softmax":
+         if use_pre_softmax:
+             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+@@ -152,16 +166,49 @@ def topk_softmax_with_capacity_and_hash(
+             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+         # hash
+         elif token_hash and tid2eid is not None and expert_bias is None:
++            replay_action = None
++            replay_forward_or_backward = False
++            if router_replay is not None:
++                from verl.utils.megatron.router_replay_patch import RouterReplayAction
++
++                replay_action = router_replay.router_replay_action
++                replay_forward_or_backward = replay_action in (
++                    RouterReplayAction.REPLAY_FORWARD,
++                    RouterReplayAction.REPLAY_BACKWARD,
++                )
++
++            # R3 31: hash routing is the deterministic tid2eid lookup, so replaying
++            # it is an identity transform (17/25 measured agree=1.0). Keep the native
++            # branch instead: it removes a replay path that can be poisoned by
++            # capture-side row loss (see dsv4_r3_issue.md P4) at zero numerical cost.
++            replay_forward_or_backward = False
++
+             input_ids = input_ids.flatten()
+             # support tp
+             tp_size = parallel_state.get_tensor_model_parallel_world_size()
+             tp_rank = parallel_state.get_tensor_model_parallel_rank()
+             input_ids = input_ids.chunk(tp_size)[tp_rank]
+-            top_indices = tid2eid[input_ids]  # [b * s / sp_size, top_k]
+-            # print(f"[debug] top_indices shape is: {top_indices.shape}")
+-            # print(f"[debug] top_indices is {top_indices}")
+ 
+-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(scores)
++            if replay_forward_or_backward:
++                # Replay rollout routes, but rows outside the replay mask must fall
++                # back to the token-id hash table, not the dense group_limited_topk.
++                def _hash_native_topk(_scores, _topk, num_groups=None, group_topk=None):
++                    _indices = tid2eid[input_ids]
++                    return torch.gather(_scores, dim=1, index=_indices).type_as(_scores), _indices
++
++                scores, top_indices = router_replay.get_replay_topk(
++                    scores,
++                    topk,
++                    num_groups=num_groups,
++                    group_topk=group_topk,
++                    default_compute_topk=_hash_native_topk,
++                )
++            else:
++                top_indices = tid2eid[input_ids]  # [b * s / sp_size, top_k]
++                if router_replay is not None and replay_action == RouterReplayAction.RECORD:
++                    router_replay.record_indices(top_indices)
++                scores = torch.gather(scores, dim=1, index=top_indices).type_as(scores)
++
+             probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+ 
+             if scaling_factor:
+@@ -229,6 +276,7 @@ def topk_softmax_with_capacity(
+     token_hash: bool = False,
+     tid2eid: Optional[torch.Tensor] = None,
+     input_ids: Optional[torch.Tensor] = None,
++    router_replay=None,
+ ):
+     """Apply capacity and padding to the top-k selection.
+     Args:
+@@ -264,7 +312,7 @@ def topk_softmax_with_capacity(
+         raise ValueError(f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}.")
+     num_tokens, num_experts = logits.shape
+ 
+-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++    def _compute_topk(scores, topk, num_groups=None, group_topk=None):
+         if group_topk:
+             return group_limited_topk(
+                 scores=scores,
+@@ -277,6 +325,17 @@ def topk_softmax_with_capacity(
+         else:
+             return torch.topk(scores, k=topk, dim=1)
+ 
++    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++        if router_replay is None:
++            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++        return router_replay.get_replay_topk(
++            scores,
++            topk,
++            num_groups=num_groups,
++            group_topk=group_topk,
++            default_compute_topk=_compute_topk,
++        )
++
+     if score_function == "softmax":
+         if use_pre_softmax:
+             if args.topk_softmax_in_fp32:
+@@ -303,16 +362,49 @@ def topk_softmax_with_capacity(
+             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+         # hash
+         elif token_hash and tid2eid is not None and expert_bias is None:
++            replay_action = None
++            replay_forward_or_backward = False
++            if router_replay is not None:
++                from verl.utils.megatron.router_replay_patch import RouterReplayAction
++
++                replay_action = router_replay.router_replay_action
++                replay_forward_or_backward = replay_action in (
++                    RouterReplayAction.REPLAY_FORWARD,
++                    RouterReplayAction.REPLAY_BACKWARD,
++                )
++
++            # R3 31: hash routing is the deterministic tid2eid lookup, so replaying
++            # it is an identity transform (17/25 measured agree=1.0). Keep the native
++            # branch instead: it removes a replay path that can be poisoned by
++            # capture-side row loss (see dsv4_r3_issue.md P4) at zero numerical cost.
++            replay_forward_or_backward = False
++
+             input_ids = input_ids.flatten()
+             # support tp
+             tp_size = parallel_state.get_tensor_model_parallel_world_size()
+             tp_rank = parallel_state.get_tensor_model_parallel_rank()
+             input_ids = input_ids.chunk(tp_size)[tp_rank]
+-            top_indices = tid2eid[input_ids]  # [b * s / sp_size, top_k]
+-            # print(f"[debug] top_indices shape is: {top_indices.shape}")
+-            # print(f"[debug] top_indices is {top_indices}")
+ 
+-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(scores)
++            if replay_forward_or_backward:
++                # Replay rollout routes, but rows outside the replay mask must fall
++                # back to the token-id hash table, not the dense group_limited_topk.
++                def _hash_native_topk(_scores, _topk, num_groups=None, group_topk=None):
++                    _indices = tid2eid[input_ids]
++                    return torch.gather(_scores, dim=1, index=_indices).type_as(_scores), _indices
++
++                scores, top_indices = router_replay.get_replay_topk(
++                    scores,
++                    topk,
++                    num_groups=num_groups,
++                    group_topk=group_topk,
++                    default_compute_topk=_hash_native_topk,
++                )
++            else:
++                top_indices = tid2eid[input_ids]  # [b * s / sp_size, top_k]
++                if router_replay is not None and replay_action == RouterReplayAction.RECORD:
++                    router_replay.record_indices(top_indices)
++                scores = torch.gather(scores, dim=1, index=top_indices).type_as(scores)
++
+             probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+ 
+             if scaling_factor:
+diff --git a/mindspeed_llm/core/transformer/moe/router.py b/mindspeed_llm/core/transformer/moe/router.py
+index a7c3cf99104095b23c9395edcf28a32f0a493608..b32e2a37b0a9c619bbc8ccd5655e1fc40fc47ca2 100644
+--- a/mindspeed_llm/core/transformer/moe/router.py
++++ b/mindspeed_llm/core/transformer/moe/router.py
+@@ -601,6 +601,7 @@ def topk_router_routing(self, logits: torch.Tensor, input_ids: torch.Tensor = No
+                 token_hash=self.hash if hasattr(self, "hash") else None,
+                 tid2eid=self.tid2eid if hasattr(self, "tid2eid") else None,
+                 input_ids=input_ids,
++                router_replay=getattr(self, "router_replay", None),
+             )
+         else:
+             # A naive top-k routing without load balancing
+diff --git a/mindspeed_llm/training/arguments.py b/mindspeed_llm/training/arguments.py
+index 5c085d01984e74a2173cb3ed20fb1d3878340fd0..5720eb447dbf08f4e78eb3800126c5dae1eb7f30 100644
+--- a/mindspeed_llm/training/arguments.py
++++ b/mindspeed_llm/training/arguments.py
+@@ -134,6 +134,9 @@ def core_transformer_config_from_args_wrapper(fn):
+             raise ValueError("--num-layer-list and --pipeline-model-parallel-layout are mutually exclusive.")
+ 
+         config = fn(args, config_class)
++        # verl enables router replay at runtime; the config dataclass has no
++        # matching constructor argument, so copy the flag explicitly.
++        config.enable_routing_replay = getattr(args, "enable_routing_replay", False)
+         # Turn down batch_p2p_comm only when pp2vpp
+         if args.pipeline_model_parallel_size == 2 and args.num_layers_per_virtual_pipeline_stage is not None:
+             config.batch_p2p_comm = False

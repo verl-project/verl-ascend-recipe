@@ -1,0 +1,38 @@
+From d95b7cdc89888e07a3d643ba8bee27497fd05391 Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 10:16:37 +0000
+Subject: [PATCH] fix: keep speculative decoding predecessor addresses valid
+
+Clamp predecessor offsets before the Triton load and mask the first value after loading.
+
+Source-base: 2df8721f4ed5d581136d7a5e3dd2487ef5036899
+Source-state: uncommitted tracked files
+
+Co-authored-by: TRAE <trae@localhost>
+Signed-off-by: chenjiao.angel <chenjiao.angel@bytedance.com>
+---
+ vllm_ascend/ops/triton/spec_decode/utils.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_ascend/ops/triton/spec_decode/utils.py b/vllm_ascend/ops/triton/spec_decode/utils.py
+index 9da372ebc79caee329b5daf74a849c94d5177233..4e93e4d44fd0f94e0ea5a28d3b04491842a49d2d 100644
+--- a/vllm_ascend/ops/triton/spec_decode/utils.py
++++ b/vllm_ascend/ops/triton/spec_decode/utils.py
+@@ -42,13 +42,15 @@ def prepare_inputs_padded_kernel(
+         # cumulative sum (first entry is the first value, not zero).
+         cu_draft_curr = tl.load(cu_num_draft_tokens_ptr + offsets, mask=mask)
+ 
+-        prev_indices = offsets - 1
++        # Keep predecessor addresses valid before applying the value mask.
++        prev_indices = tl.maximum(offsets - 1, 0)
+         has_prev = offsets > 0
+         cu_draft_prev = tl.load(
+             cu_num_draft_tokens_ptr + prev_indices,
+-            mask=mask & has_prev,
++            mask=mask,
+             other=0,
+         )
++        cu_draft_prev = tl.where(has_prev, cu_draft_prev, 0)
+ 
+         num_draft_tokens = tl.where(has_prev, cu_draft_curr - cu_draft_prev, cu_draft_curr)
+ 

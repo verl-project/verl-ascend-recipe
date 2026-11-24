@@ -1,0 +1,497 @@
+From 8ce2197b371f58de44c141d6498bf6ddb2d6778f Mon Sep 17 00:00:00 2001
+From: "chenjiao.angel" <chenjiao.angel@bytedance.com>
+Date: Mon, 16 Nov 2026 08:55:53 +0000
+Subject: [PATCH] Add grouped GEMM expert loading and export
+
+Enable grouped GEMM and add expert-major mappings, tensor conversions, ETP load/merge/split and per-expert EP streaming with device cache cleanup.
+
+Source-base: 0cd4ae23f2425da77a80cb3f517828452fa8e984
+Source-state: uncommitted worktree
+---
+ mbridge/core/bridge.py        | 170 +++++++++++++++++++++++++-
+ mbridge/models/deepseek_v4.py | 223 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 390 insertions(+), 3 deletions(-)
+
+diff --git a/mbridge/core/bridge.py b/mbridge/core/bridge.py
+index 28f8b67106efe27f2d9ce58b5fc712a633c6f5e8..fa7c77d0aa50f082d0d3ca6cc2d0c1bd087f9084 100644
+--- a/mbridge/core/bridge.py
++++ b/mbridge/core/bridge.py
+@@ -1,7 +1,7 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ import os
+ from abc import ABC
+-from typing import Callable, Generator
++from typing import Callable, Generator, Optional
+ 
+ import torch
+ from megatron.core.models.gpt.gpt_model import ModelType
+@@ -213,7 +213,11 @@ class Bridge(ABC):
+                         continue
+ 
+                 param_to_load = torch.empty_like(param)
+-                if self._is_expert_weight_name(local_name):
++                if self._is_expert_gemm_name(local_name):
++                    self._load_gemm_weights_over_etp(
++                        local_name, mcore_weight, param_to_load
++                    )
++                elif self._is_expert_weight_name(local_name):
+                     # split mcore weights across etp
+                     if self.mpu.etp_rank == 0:
+                         mcore_weights_tp_split = self._weight_split_across_tp(
+@@ -300,13 +304,166 @@ class Bridge(ABC):
+         return (
+             ".mlp.experts.linear_fc" in name
+             or ".mlp.experts.local_experts" in name
++            or self._is_expert_gemm_name(name)
+         )
+ 
++    def _is_expert_gemm_name(self, name: str) -> bool:
++        return False
++
++    def _get_hf_experts_key(self) -> Optional[str]:
++        return None
++
+     def _is_tp_sharded(self, mcore_weights_name: str, param: torch.Tensor) -> bool:
+         return (
+             hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
+         )
+ 
++    def _weight_to_mcore_format_gemm(
++        self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
++    ) -> torch.Tensor:
++        raise NotImplementedError(
++            f"Unsupported GEMM expert parameter: {mcore_weights_name}"
++        )
++
++    def _iter_gemm_export_experts(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        num_experts_in_tensor: Optional[int] = None,
++        expert_offset: int = 0,
++    ) -> Generator[tuple[list[str], list[torch.Tensor]], None, None]:
++        raise NotImplementedError(
++            f"Unsupported GEMM expert parameter: {mcore_weights_name}"
++        )
++
++    def _iter_gemm_local_expert_blocks(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> Generator[torch.Tensor, None, None]:
++        raise NotImplementedError(
++            f"Unsupported GEMM expert parameter: {mcore_weights_name}"
++        )
++
++    def _iter_gemm_etp_slices(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> Generator[torch.Tensor, None, None]:
++        raise NotImplementedError(
++            f"Unsupported GEMM expert parameter: {mcore_weights_name}"
++        )
++
++    @staticmethod
++    def _empty_device_cache(device: torch.device) -> None:
++        if device.type == "cuda":
++            torch.cuda.empty_cache()
++        elif device.type == "npu":
++            npu = getattr(torch, "npu", None)
++            if npu is not None and hasattr(npu, "empty_cache"):
++                npu.empty_cache()
++
++    def _load_gemm_weights_over_etp(
++        self,
++        local_name: str,
++        mcore_weight: torch.Tensor,
++        param_to_load: torch.Tensor,
++    ) -> None:
++        if self.mpu.etp_size == 1:
++            param_to_load.copy_(mcore_weight.to(param_to_load.device))
++            return
++
++        etp_group = self.mpu.etp_group
++        if self.mpu.etp_rank == 0:
++            slices = self._iter_gemm_etp_slices(
++                local_name, mcore_weight.to(param_to_load.device)
++            )
++            local_slice = None
++            for rank, weight_slice in enumerate(slices):
++                weight_slice = weight_slice.to(
++                    device=param_to_load.device, dtype=param_to_load.dtype
++                ).contiguous()
++                if rank == 0:
++                    local_slice = weight_slice
++                else:
++                    torch.distributed.send(
++                        weight_slice,
++                        dst=torch.distributed.get_global_rank(etp_group, rank),
++                        group=etp_group,
++                    )
++            param_to_load.copy_(local_slice)
++        else:
++            torch.distributed.recv(
++                param_to_load,
++                src=torch.distributed.get_global_rank(etp_group, 0),
++                group=etp_group,
++            )
++
++    def _export_gemm_weights(
++        self, name: str, broad_pp_param: torch.Tensor
++    ) -> Generator[tuple[str, torch.Tensor], None, None]:
++        hf_experts_key = self._get_hf_experts_key()
++        if not hf_experts_key:
++            raise RuntimeError(f"Missing HF expert key for {name}")
++
++        if self.mpu.etp_size > 1:
++            etp_params = [
++                torch.empty_like(broad_pp_param) for _ in range(self.mpu.etp_size)
++            ]
++            torch.distributed.all_gather(
++                etp_params, broad_pp_param, group=self.mpu.etp_group
++            )
++            own_merged = self._weight_merge_across_tp(
++                name, etp_params, broad_pp_param
++            )
++            del etp_params
++        else:
++            own_merged = self._weight_merge_across_tp(
++                name, [broad_pp_param], broad_pp_param
++            )
++        self._empty_device_cache(broad_pp_param.device)
++
++        # Every rank in every EP group all_gathers each expert block and
++        # yields the full global expert sequence, so all ranks produce an
++        # identical weight-name stream (verl relies on this: each training
++        # rank streams independently to its paired inference engine).
++        num_experts_per_rank = self.config.num_moe_experts // self.mpu.ep_size
++
++        def splice_expert_id(hf_name: str, global_expert_id: int) -> str:
++            prefix, suffix = hf_name.split(hf_experts_key, 1)
++            suffix = suffix.split(".", 1)[1]
++            return f"{prefix}{hf_experts_key}{global_expert_id}.{suffix}"
++
++        for local_expert_id, block in enumerate(
++            self._iter_gemm_local_expert_blocks(name, own_merged)
++        ):
++            if self.mpu.ep_size > 1:
++                gathered = [
++                    torch.empty_like(block) for _ in range(self.mpu.ep_size)
++                ]
++                torch.distributed.all_gather(
++                    gathered, block.contiguous(), group=self.mpu.ep_group
++                )
++            else:
++                gathered = [block]
++            for ep_rank in range(self.mpu.ep_size):
++                global_expert_id = num_experts_per_rank * ep_rank + local_expert_id
++                for hf_names, hf_weights in self._iter_gemm_export_experts(
++                    name,
++                    gathered[ep_rank],
++                    num_experts_in_tensor=1,
++                    expert_offset=local_expert_id,
++                ):
++                    converted_names = [
++                        splice_expert_id(hf_name, global_expert_id)
++                        for hf_name in hf_names
++                    ]
++                    yield from zip(converted_names, hf_weights)
++            del gathered
++            self._empty_device_cache(broad_pp_param.device)
++
++        del own_merged
++        self._empty_device_cache(broad_pp_param.device)
++        npu = getattr(torch, "npu", None)
++        if broad_pp_param.device.type == "npu" and npu is not None:
++            npu.synchronize()
++
+     def _extra_export_keys(
+         self, model: torch.nn.Module, existing_keys: set[str]
+     ) -> list[str]:
+@@ -372,6 +529,10 @@ class Bridge(ABC):
+             name = broadcast_str_from_megatron_pp(name)
+             broad_pp_param = broadcast_from_megatron_pp(param)
+ 
++            if self._is_expert_gemm_name(name):
++                yield from self._export_gemm_weights(name, broad_pp_param)
++                continue
++
+             # EP
+             if self._is_expert_weight_name(name) and self.mpu.ep_size > 1:
+                 num_experts = self.config.num_moe_experts
+@@ -799,6 +960,11 @@ class Bridge(ABC):
+                 w.to(self.dtype) if w.dtype != self.dtype else w for w in hf_weights
+             ]
+ 
++        if self._is_expert_gemm_name(mcore_weights_name):
++            return self._weight_to_mcore_format_gemm(
++                mcore_weights_name, hf_weights
++            )
++
+         if len(hf_weights) == 1:
+             # pad embeding and output layer
+             if self.make_vocab_size_divisible_by is not None and (
+diff --git a/mbridge/models/deepseek_v4.py b/mbridge/models/deepseek_v4.py
+index bcc44c403e5ee4021b9e23482d84d0dd83760f1a..4fc68e3a6cad6ea7b0813fa75d89ae36e9060922 100644
+--- a/mbridge/models/deepseek_v4.py
++++ b/mbridge/models/deepseek_v4.py
+@@ -1,5 +1,7 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ 
++from typing import Generator, Optional
++
+ import torch
+ from megatron.core.transformer import MLATransformerConfig
+ from megatron.core.transformer.enums import AttnBackend
+@@ -138,7 +140,7 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
+             moe_aux_loss_coeff=getattr(hf_config, "aux_loss_alpha", 0.0),
+             moe_router_load_balancing_type="none",
+             moe_shared_expert_overlap=True,
+-            moe_grouped_gemm=False,
++            moe_grouped_gemm=True,
+             moe_router_score_function=hf_config.scoring_func,
+             moe_router_pre_softmax=False,
+             moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
+@@ -216,6 +218,25 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
+                 for template in templates
+             ]
+ 
++        if ".mlp.experts.weight1" in name or ".mlp.experts.weight2" in name:
++            num_local_experts = self.config.num_moe_experts // self.mpu.ep_size
++            templates = (
++                [
++                    "layers.{layer_number}.ffn.experts.{expert_id}.w1.weight",
++                    "layers.{layer_number}.ffn.experts.{expert_id}.w3.weight",
++                ]
++                if ".mlp.experts.weight1" in name
++                else ["layers.{layer_number}.ffn.experts.{expert_id}.w2.weight"]
++            )
++            return [
++                template.format(
++                    layer_number=layer_number,
++                    expert_id=num_local_experts * self.mpu.ep_rank + index,
++                )
++                for index in range(num_local_experts)
++                for template in templates
++            ]
++
+         for keyword, mapping_names in self._MLP_MAPPING.items():
+             if keyword in name:
+                 return [
+@@ -253,6 +274,12 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
+             for converted in names
+         ]
+ 
++    def _is_expert_gemm_name(self, name: str) -> bool:
++        return name.endswith((".mlp.experts.weight1", ".mlp.experts.weight2"))
++
++    def _get_hf_experts_key(self) -> str:
++        return ".ffn.experts."
++
+     def _preserve_hf_dtype(self, mcore_weights_name: str) -> bool:
+         return super()._preserve_hf_dtype(mcore_weights_name) or any(
+             key in mcore_weights_name
+@@ -270,6 +297,59 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
+         )
+         return keys
+ 
++    def _weight_to_hf_format(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> tuple[list[str], list[torch.Tensor]]:
++        if self._is_expert_gemm_name(mcore_weights_name):
++            merged = self._weight_merge_across_tp_gemm(
++                mcore_weights_name, [mcore_weights], mcore_weights
++            )
++            hf_names, hf_weights = [], []
++            for names, tensors in self._iter_gemm_export_experts(
++                mcore_weights_name, merged
++            ):
++                hf_names.extend(names)
++                hf_weights.extend(tensors)
++            return hf_names, hf_weights
++        return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
++
++    def _weight_to_mcore_format_gemm(
++        self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
++    ) -> torch.Tensor:
++        # Runtime layout (megatron/mindspeed GroupedMLP): weight1 memory is
++        # expert-major, viewed at runtime as (num_local_experts, hidden, -1);
++        # weight2 memory viewed as (num_local_experts, -1, hidden).
++        num_local_experts = self.config.num_moe_experts // self.mpu.ep_size
++        if ".mlp.experts.weight1" in mcore_weights_name:
++            assert len(hf_weights) == num_local_experts * 2
++            expert_weights = []
++            for index in range(0, len(hf_weights), 2):
++                gate, up = hf_weights[index], hf_weights[index + 1]
++                if self.mpu.etp_size > 1:
++                    fused = torch.cat(
++                        [
++                            torch.cat((gate_part, up_part), dim=0)
++                            for gate_part, up_part in zip(
++                                gate.chunk(self.mpu.etp_size, dim=0),
++                                up.chunk(self.mpu.etp_size, dim=0),
++                            )
++                        ],
++                        dim=0,
++                    )
++                else:
++                    fused = torch.cat((gate, up), dim=0)
++                expert_weights.append(fused.t().contiguous())
++            stacked = torch.stack(expert_weights, dim=0)
++            hidden_size = stacked.shape[1]
++            return stacked.view(hidden_size, -1)
++
++        if ".mlp.experts.weight2" in mcore_weights_name:
++            assert len(hf_weights) == num_local_experts
++            return torch.cat(
++                [weight.t().contiguous() for weight in hf_weights], dim=0
++            ).contiguous()
++        raise NotImplementedError(f"Unsupported parameter name: {mcore_weights_name}")
++
+     def _weight_merge_across_tp(
+         self,
+         mcore_weights_name: str,
+@@ -278,5 +358,146 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
+     ) -> torch.Tensor:
+         if "attn_sink" in mcore_weights_name:
+             return torch.cat(mcore_weights, dim=0)
++        if self._is_expert_gemm_name(mcore_weights_name):
++            return self._weight_merge_across_tp_gemm(
++                mcore_weights_name, mcore_weights, param
++            )
+         return super()._weight_merge_across_tp(mcore_weights_name, mcore_weights, param)
+ 
++    def _weight_merge_across_tp_gemm(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: list[torch.Tensor],
++        param: torch.Tensor,
++    ) -> torch.Tensor:
++        # Merge ETP shards back into the full expert-major mcore tensor:
++        # weight1 -> shape (hidden, num_local_experts * 2 * ffn), memory
++        # viewed as (num_local_experts, hidden, 2 * ffn);
++        # weight2 -> shape (num_local_experts * ffn, hidden), memory viewed
++        # as (num_local_experts, ffn, hidden).
++        num_local_experts = self.config.num_moe_experts // self.mpu.ep_size
++        first = mcore_weights[0]
++
++        if ".mlp.experts.weight1" in mcore_weights_name:
++            hidden_size = first.shape[0]
++            # each shard: (hidden, E * 2I/etp) with expert-major memory,
++            # per-expert columns [gate_part | up_part]
++            gate_parts, up_parts = [], []
++            for shard in mcore_weights:
++                block = shard.view(num_local_experts, hidden_size, 2, -1)
++                gate_parts.append(block[:, :, 0])
++                up_parts.append(block[:, :, 1])
++            gates = torch.cat(gate_parts, dim=2)
++            ups = torch.cat(up_parts, dim=2)
++            merged = torch.cat([gates, ups], dim=2)
++            return merged.contiguous().view(hidden_size, -1)
++
++        hidden_size = first.shape[1]
++        shards = [
++            shard.view(num_local_experts, -1, hidden_size) for shard in mcore_weights
++        ]
++        merged = torch.cat(shards, dim=1)
++        return merged.view(-1, hidden_size)
++
++    def _weight_split_across_tp(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        param: torch.Tensor,
++        tp_split_size: int,
++    ) -> list[torch.Tensor]:
++        if self._is_expert_gemm_name(mcore_weights_name):
++            return self._weight_split_across_tp_gemm(
++                mcore_weights_name, mcore_weights, tp_split_size
++            )
++        return super()._weight_split_across_tp(
++            mcore_weights_name, mcore_weights, param, tp_split_size
++        )
++
++    def _weight_split_across_tp_gemm(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        tp_split_size: int,
++    ) -> list[torch.Tensor]:
++        return [
++            weight.contiguous()
++            for weight in self._split_gemm_weight(
++                mcore_weights_name, mcore_weights, tp_split_size
++            )
++        ]
++
++    def _iter_gemm_etp_slices(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> Generator[torch.Tensor, None, None]:
++        yield from self._split_gemm_weight(
++            mcore_weights_name, mcore_weights, self.mpu.etp_size
++        )
++
++    def _split_gemm_weight(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor, split_size: int
++    ) -> Generator[torch.Tensor, None, None]:
++        if split_size == 1:
++            yield mcore_weights
++            return
++        num_local_experts = self.config.num_moe_experts // self.mpu.ep_size
++        if ".mlp.experts.weight1" in mcore_weights_name:
++            hidden_size = mcore_weights.shape[0]
++            weights = mcore_weights.view(num_local_experts, hidden_size, -1)
++            for chunk in weights.chunk(split_size, dim=2):
++                yield chunk.contiguous().view(hidden_size, -1)
++            return
++
++        hidden_size = mcore_weights.shape[-1]
++        weights = mcore_weights.view(num_local_experts, -1, hidden_size)
++        for chunk in weights.chunk(split_size, dim=1):
++            yield chunk.contiguous().view(-1, hidden_size)
++
++    def _iter_gemm_local_expert_blocks(
++        self, mcore_weights_name: str, mcore_weights: torch.Tensor
++    ) -> Generator[torch.Tensor, None, None]:
++        num_local_experts = self.config.num_moe_experts // self.mpu.ep_size
++        if ".mlp.experts.weight1" in mcore_weights_name:
++            yield from mcore_weights.view(
++                num_local_experts, mcore_weights.shape[0], -1
++            )
++            return
++        yield from mcore_weights.view(
++            num_local_experts, -1, mcore_weights.shape[1]
++        )
++
++    def _iter_gemm_export_experts(
++        self,
++        mcore_weights_name: str,
++        mcore_weights: torch.Tensor,
++        num_experts_in_tensor: Optional[int] = None,
++        expert_offset: int = 0,
++    ) -> Generator[tuple[list[str], list[torch.Tensor]], None, None]:
++        hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
++        num_local_experts = self.config.num_moe_experts // self.mpu.ep_size
++        num_in = (
++            num_local_experts
++            if num_experts_in_tensor is None
++            else num_experts_in_tensor
++        )
++        if ".mlp.experts.weight1" in mcore_weights_name:
++            assert len(hf_names) == num_local_experts * 2
++            hidden_size = mcore_weights.shape[0]
++            fused = mcore_weights.view(num_in, hidden_size, -1)
++            for index in range(num_in):
++                gate_t, up_t = fused[index].chunk(2, dim=1)
++                name_idx = 2 * (expert_offset + index)
++                yield hf_names[name_idx : name_idx + 2], [
++                    gate_t.t().contiguous(),
++                    up_t.t().contiguous(),
++                ]
++            return
++
++        assert len(hf_names) == num_local_experts
++        hidden_size = mcore_weights.shape[1]
++        blocks = mcore_weights.view(num_in, -1, hidden_size)
++        for index in range(num_in):
++            name_idx = expert_offset + index
++            yield hf_names[name_idx : name_idx + 1], [
++                blocks[index].t().contiguous()
++            ]

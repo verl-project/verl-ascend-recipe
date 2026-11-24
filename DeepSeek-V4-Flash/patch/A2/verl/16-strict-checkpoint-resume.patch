@@ -1,0 +1,1015 @@
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index bdda2f633d3c4995e43eedc682c63673de46ac16..b39ac49c85ac5a9efbe9b063a2d1375c493297f0 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -16,6 +16,7 @@ import json
+ import logging
+ import math
+ import os
++import shutil
+ import sys
+ import threading
+ import time
+@@ -118,6 +119,115 @@ def _tq_supports_checkpoint() -> bool:
+     )
+ 
+ 
++def _strict_ckpt_resume() -> bool:
++    """dsv4-ckpt-29: missing dataloader or TransferQueue state fails the resume.
++
++    Set VERL_STRICT_CKPT_RESUME=0 to keep the old warn-and-continue behavior.
++    """
++    return os.environ.get("VERL_STRICT_CKPT_RESUME", "1").lower() not in ("0", "false", "no")
++
++
++def _atomic_torch_save(obj, path: str) -> None:
++    tmp = path + ".tmp"
++    torch.save(obj, tmp)
++    os.replace(tmp, path)
++
++
++def _atomic_write_text(path: str, text: str) -> None:
++    tmp = path + ".tmp"
++    with open(tmp, "w") as f:
++        f.write(text)
++        f.flush()
++        os.fsync(f.fileno())
++    os.replace(tmp, path)
++
++
++def _atomic_write_json(path: str, payload: dict) -> None:
++    tmp = path + ".tmp"
++    with open(tmp, "w") as f:
++        json.dump(payload, f, indent=2, sort_keys=True)
++        f.flush()
++        os.fsync(f.fileno())
++    os.replace(tmp, path)
++
++
++def _checkpoint_publish_state(folder: str, *, require_tq: bool) -> str:
++    """dsv4-ckpt-29: 'complete', 'legacy', or 'partial'.
++
++    A new save is complete only after ``ckpt_complete.json`` is replaced into
++    place. Older saves have no marker; they count as legacy when the actor
++    manifest, ``data.pt``, and (for async trainers) ``transfer_queue/`` are
++    all present. Anything else is a partial save and must not be resumed.
++    """
++    if os.path.isfile(os.path.join(folder, "ckpt_complete.json")):
++        return "complete"
++    actor_ok = os.path.isfile(os.path.join(folder, "actor", "ckpt_contents.json"))
++    data_ok = os.path.isfile(os.path.join(folder, "data.pt"))
++    tq_ok = os.path.isdir(os.path.join(folder, "transfer_queue"))
++    if actor_ok and data_ok and (tq_ok or not require_tq):
++        return "legacy"
++    return "partial"
++
++
++def _iter_global_step_dirs(root: str):
++    if not root or not os.path.isdir(root):
++        return
++    for name in os.listdir(root):
++        if not name.startswith("global_step_"):
++            continue
++        folder = os.path.join(root, name)
++        suffix = name[len("global_step_") :]
++        if suffix.isdigit() and os.path.isdir(folder):
++            yield int(suffix), folder
++
++
++def _previous_complete_checkpoint(root: str, *, require_tq: bool, exclude: str | None) -> str | None:
++    exclude_abs = os.path.abspath(exclude) if exclude else None
++    found = None
++    for _step, folder in sorted(_iter_global_step_dirs(root)):
++        if exclude_abs and os.path.abspath(folder) == exclude_abs:
++            continue
++        if _checkpoint_publish_state(folder, require_tq=require_tq) != "partial":
++            found = folder
++    return found
++
++
++def _retain_published_checkpoints(root: str, keep: int | None, protect: list[str]) -> None:
++    """Delete whole step directories only after a new step has been published."""
++    if not isinstance(keep, int) or keep <= 0 or not root or not os.path.isdir(root):
++        return
++    steps = sorted(_iter_global_step_dirs(root))
++    protect_abs = {os.path.abspath(path) for path in protect if path}
++    keep_abs = {os.path.abspath(path) for _step, path in steps[-keep:]} | protect_abs
++    for _step, folder in steps:
++        if os.path.abspath(folder) in keep_abs:
++            continue
++        logger.info("[CKPT-PUBLISH] removing checkpoint over retention cap: %s", folder)
++        shutil.rmtree(folder, ignore_errors=True)
++
++
++
++def _invalidate_unpublished_checkpoint(folder: str) -> None:
++    """dsv4-ckpt-39: this step must not look complete or legacy until publish.
++
++    Drops the trainer marker, the actor manifest, and ``data.pt``. Other
++    ``global_step_*`` directories stay, and this does not run retention.
++    """
++    if not folder:
++        return
++    for path in (
++        os.path.join(folder, "ckpt_complete.json"),
++        os.path.join(folder, "actor", "ckpt_contents.json"),
++        os.path.join(folder, "data.pt"),
++    ):
++        try:
++            os.remove(path)
++        except FileNotFoundError:
++            continue
++        except OSError as exc:
++            logger.warning("[CKPT-PUBLISH] could not invalidate %s: %s", path, exc)
++
++
+ class PPOTrainer(ABC):
+     """Base class for PPO trainer.
+ 
+@@ -432,7 +542,9 @@ class PPOTrainer(ABC):
+         self.global_steps += 1
+         # SkipManager skips warmup batches in async trainers, so it doesn't conflict with reissue.
+         SkipManager.set_step(self.global_steps)
+-        self._reissue_inflight_prompts()
++        # dsv4-ckpt-38: keep the restored in-flight count so on_train_begin can
++        # avoid priming the rollout pipeline a second time after a resume.
++        self._restored_inflight_prompts = self._reissue_inflight_prompts()
+         self.prev_step_profile = False
+         self.curr_step_profile = (
+             self.global_steps in self.config.global_profiler.steps
+@@ -936,6 +1048,39 @@ class PPOTrainer(ABC):
+             logger.exception(f"Unknown resume mode {self.config.trainer.resume_mode}")
+ 
+         # set global step
++        require_tq = self.trainer_mode != "sync"
++        if _strict_ckpt_resume():
++            if require_tq and not _tq_supports_checkpoint():
++                version = getattr(tq, "__version__", "unknown")
++                raise RuntimeError(
++                    "Strict resume requires TransferQueue checkpoint support (>=0.1.9); "
++                    f"installed {version}."
++                )
++            state = _checkpoint_publish_state(global_step_folder, require_tq=require_tq)
++            if state == "partial":
++                fallback = _previous_complete_checkpoint(
++                    os.path.dirname(global_step_folder),
++                    require_tq=require_tq,
++                    exclude=global_step_folder,
++                )
++                if self.config.trainer.resume_mode == "auto" and fallback is not None:
++                    logger.warning(
++                        "[CKPT-PUBLISH] %s is incomplete; falling back to %s",
++                        global_step_folder,
++                        fallback,
++                    )
++                    global_step_folder = fallback
++                else:
++                    raise RuntimeError(
++                        f"Refusing incomplete checkpoint {global_step_folder}. "
++                        f"Previous complete checkpoint: {fallback or 'none'}."
++                    )
++            elif state == "legacy":
++                logger.warning(
++                    "[CKPT-PUBLISH] legacy checkpoint without ckpt_complete.json: %s",
++                    global_step_folder,
++                )
++        self._resume_source_folder = os.path.abspath(global_step_folder)
+         self.global_steps = int(global_step_folder.split("global_step_")[-1])
+         logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
+ 
+@@ -957,16 +1102,27 @@ class PPOTrainer(ABC):
+         if os.path.exists(dataloader_local_path):
+             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+             self.train_dataloader.load_state_dict(dataloader_state_dict)
++        elif _strict_ckpt_resume():
++            raise FileNotFoundError(f"Strict resume requires dataloader state at {dataloader_local_path}")
+         else:
+             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+ 
+         # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
+         # deferred to fit() to use the agent_loop_manager.
+-        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
++        if self.trainer_mode != "sync":
+             tq_ckpt_path = os.path.join(global_step_folder, "transfer_queue")
+-            if os.path.exists(tq_ckpt_path):
++            if not _tq_supports_checkpoint():
++                if _strict_ckpt_resume():
++                    version = getattr(tq, "__version__", "unknown")
++                    raise RuntimeError(
++                        "Strict resume requires TransferQueue checkpoint support (>=0.1.9); "
++                        f"installed {version}."
++                    )
++            elif os.path.exists(tq_ckpt_path):
+                 logger.info(f"Loading TransferQueue state from {tq_ckpt_path}")
+                 tq.load_checkpoint(tq_ckpt_path)
++            elif _strict_ckpt_resume():
++                raise FileNotFoundError(f"Strict resume requires TransferQueue state at {tq_ckpt_path}")
+ 
+     def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
+         """Restart checkpointed pending/running prompt groups from their persisted prompt data."""
+@@ -1015,6 +1171,20 @@ class PPOTrainer(ABC):
+         )
+         logger.info(f"Saving checkpoint to {local_global_step_folder}")
+ 
++        # dsv4-ckpt-29: async saves read live CPU storage. Refuse until a snapshot exists.
++        actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
++        if actor_ckpt_cfg.get("async_save", False):
++            raise RuntimeError(
++                "actor.checkpoint.async_save=True is disabled: CPU checkpoint bytes are not snapshotted. "
++                "Keep async_save=False."
++            )
++        if self.trainer_mode != "sync" and not _tq_supports_checkpoint():
++            version = getattr(tq, "__version__", "unknown")
++            raise RuntimeError(
++                "Saving an async checkpoint requires TransferQueue checkpoint support (>=0.1.9); "
++                f"installed {version}."
++            )
++
+         # resolve max checkpoints to keep
+         remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
+         if remove_previous_ckpt_in_save:
+@@ -1036,49 +1206,90 @@ class PPOTrainer(ABC):
+             if self.config.trainer.default_hdfs_dir is None
+             else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+         )
+-        self.actor_rollout_wg.save_checkpoint(
+-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+-        )
++        # dsv4-ckpt-39: drop this step's publish files first. A failure below
++        # leaves the directory partial. Retention runs only after the marker
++        # is in place, and a failure there does not remove that marker.
++        _invalidate_unpublished_checkpoint(local_global_step_folder)
++        published = False
++        try:
++            # dsv4-ckpt-29: do not let the actor manager delete older checkpoints
++            # before data.pt, TransferQueue, and the trainer marker exist.
++            self.actor_rollout_wg.save_checkpoint(
++                actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=None
++            )
+ 
+-        # save critic
+-        if self.use_critic:
+-            critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
+-            critic_remote_path = (
+-                None
+-                if self.config.trainer.default_hdfs_dir is None
+-                else os.path.join(
+-                    self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
++            # save critic
++            if self.use_critic:
++                critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
++                critic_remote_path = (
++                    None
++                    if self.config.trainer.default_hdfs_dir is None
++                    else os.path.join(
++                        self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
++                    )
++                )
++                self.critic_wg.save_checkpoint(
++                    critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=None
+                 )
+-            )
+-            self.critic_wg.save_checkpoint(
+-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+-            )
+ 
+-        # save dataloader state
+-        local_mkdir_safe(local_global_step_folder)
+-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+-
+-        # save TransferQueue state for async modes so in-flight prompts (already fetched from the
+-        # dataloader but not yet trained into this checkpoint's weights) survive a restart:
+-        # finished trajectories are restored as-is, pending/running prompts are re-issued on resume.
+-        # Requires a TransferQueue release with checkpoint support (see _tq_supports_checkpoint).
+-        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+-            tq.save_checkpoint(
+-                os.path.join(local_global_step_folder, "transfer_queue"),
+-                metadata={"global_steps": self.global_steps},
++            # save dataloader state
++            local_mkdir_safe(local_global_step_folder)
++            dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
++            _atomic_torch_save(self.train_dataloader.state_dict(), dataloader_local_path)
++
++            # save TransferQueue state for async modes so in-flight prompts (already fetched from the
++            # dataloader but not yet trained into this checkpoint's weights) survive a restart:
++            # finished trajectories are restored as-is, pending/running prompts are re-issued on resume.
++            # Requires a TransferQueue release with checkpoint support (see _tq_supports_checkpoint).
++            tq_saved = False
++            if self.trainer_mode != "sync":
++                tq.save_checkpoint(
++                    os.path.join(local_global_step_folder, "transfer_queue"),
++                    metadata={"global_steps": self.global_steps},
++                )
++                tq_saved = True
++
++            # dsv4-ckpt-29: this marker is the trainer-level publish. Actor
++            # ckpt_contents.json only means the DCP write finished.
++            _atomic_write_json(
++                os.path.join(local_global_step_folder, "ckpt_complete.json"),
++                {
++                    "global_steps": self.global_steps,
++                    "actor": True,
++                    "data": True,
++                    "transfer_queue": tq_saved,
++                    "trainer_mode": self.trainer_mode,
++                },
+             )
++            logger.info("[CKPT-PUBLISH] step=%s dir=%s", self.global_steps, local_global_step_folder)
++            published = True
+ 
+-        # write latest checkpointed iteration tracker for atomic resume
+-        actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
+-        if actor_ckpt_cfg.get("async_save", False):
+-            logger.info("skip write latest_checkpointed_iteration.txt when async_save is True")
+-            return
+-        local_latest_checkpointed_iteration = os.path.join(
+-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+-        )
+-        with open(local_latest_checkpointed_iteration, "w") as f:
+-            f.write(str(self.global_steps))
++            local_latest_checkpointed_iteration = os.path.join(
++                self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
++            )
++            _atomic_write_text(local_latest_checkpointed_iteration, str(self.global_steps))
++            keep = max_actor_ckpt_to_keep if isinstance(max_actor_ckpt_to_keep, int) else max_critic_ckpt_to_keep
++            _retain_published_checkpoints(
++                self.config.trainer.default_local_dir,
++                keep,
++                [
++                    getattr(self, "_resume_source_folder", None),
++                    local_global_step_folder,
++                ],
++            )
++        except Exception:
++            if not published:
++                _invalidate_unpublished_checkpoint(local_global_step_folder)
++                logger.exception(
++                    "[CKPT-PUBLISH] save failed; ckpt_complete.json not written for %s",
++                    local_global_step_folder,
++                )
++            else:
++                logger.exception(
++                    "[CKPT-PUBLISH] marker is in place; post-publish step failed for %s",
++                    local_global_step_folder,
++                )
++            raise
+ 
+     def _sample_val_with_heartbeat(self, batch_size: int):
+         """Block on the val partition and log while it is still outstanding.
+diff --git a/verl/trainer/ppo/v1/trainer_colocate_async.py b/verl/trainer/ppo/v1/trainer_colocate_async.py
+index 349b3b2dadf7c8a11aac5348e398a3bb0ce3c643..810b7200bf5c50a9ae089791b133c64f51c78cec 100644
+--- a/verl/trainer/ppo/v1/trainer_colocate_async.py
++++ b/verl/trainer/ppo/v1/trainer_colocate_async.py
+@@ -42,6 +42,15 @@ class PPOTrainerColocateAsync(PPOTrainer):
+     def on_train_begin(self):
+         if self.config.skip.rollout_tq.enable:
+             return
++        # dsv4-ckpt-38: restored in-flight prompts are re-issued in fit() and
++        # already keep the pipeline busy. Re-priming here adds one extra
++        # train_batch_size to TQ depth on every restart, which eventually
++        # saturates the rollout server's Ray actor concurrency and hangs sleep.
++        if getattr(self, "_restored_inflight_prompts", 0) > 0:
++            logger.info(
++                f"Skip warmup: {self._restored_inflight_prompts} in-flight prompts restored from checkpoint"
++            )
++            return
+         num_warmup_batches = self.config.trainer.v1.colocate_async.num_warmup_batches
+         for _ in range(num_warmup_batches):
+             self._add_batch_to_generate()
+diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
+index 18a06ee26e9a32cb3fadd3c6e224e48ee151069e..3d1ddd0c717071b644236dae36a1795e2bbd9886 100644
+--- a/verl/trainer/ppo/v1/trainer_separate_async.py
++++ b/verl/trainer/ppo/v1/trainer_separate_async.py
+@@ -138,6 +138,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+     def on_train_begin(self):
+         if self.config.skip.rollout_tq.enable:
+             return
++        # dsv4-ckpt-38: restored in-flight prompts already prime the pipeline;
++        # see trainer_colocate_async.on_train_begin.
++        if getattr(self, "_restored_inflight_prompts", 0) > 0:
++            logger.info(
++                f"Skip warmup: {self._restored_inflight_prompts} in-flight prompts restored from checkpoint"
++            )
++            return
+         num_warmup_batches = self.config.trainer.v1.separate_async.num_warmup_batches
+         for _ in range(num_warmup_batches):
+             self._add_batch_to_generate()
+diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
+index 02be397d886e2ac8c9800caad4f267289d0dc0d0..6d73c94a78e406cd9bd90c4eb9695e254f1ec1ef 100644
+--- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
++++ b/verl/utils/checkpoint/megatron_checkpoint_manager.py
+@@ -25,7 +25,8 @@ import numpy as np
+ import torch
+ import torch.distributed
+ from megatron.core import dist_checkpointing, mpu, tensor_parallel
+-from megatron.core.dist_checkpointing.mapping import ShardedObject
++from megatron.core.dist_checkpointing.dict_utils import nested_values
++from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+ from packaging import version
+ from transformers import GenerationConfig
+ 
+@@ -382,8 +383,57 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+             if hasattr(model, "module"):
+                 model = model.module
+             model_sharded_state_dict[key] = model.sharded_state_dict(metadata=model_metadata)
++        self._fold_layer_axis_into_key(model_sharded_state_dict)
++        self._rewrite_dsv4_replica_metadata(model_sharded_state_dict)
+         return model_sharded_state_dict
+ 
++    @staticmethod
++    def _fold_layer_axis_into_key(model_sharded_state_dict):
++        """Fold the prepended pipeline layer axis into every tensor key.
++
++        In a homogeneous transformer block the layer index is carried only by the
++        prepended axis, so all layers emit the same key. That breaks once layers
++        are heterogeneous (DSV4 uses per-layer compression ratios and only some
++        layers own ``tid2eid``): different layers then disagree on the shape
++        stored under a single key. Moving the layer index into the key leaves the
++        remaining TP/EP fragmentations untouched.
++        """
++        for sharded in nested_values(model_sharded_state_dict):
++            if not isinstance(sharded, ShardedTensor) or sharded.prepend_axis_num != 1:
++                continue
++            if "layers." not in sharded.key:
++                continue
++            layer_offset = sharded.global_offset[0]
++            sharded.key = sharded.key.replace("layers.", f"layers.{layer_offset}.", 1)
++            sharded.global_shape = sharded.global_shape[1:]
++            sharded.global_offset = sharded.global_offset[1:]
++            sharded.axis_fragmentations = sharded.axis_fragmentations[1:]
++            sharded.prepend_axis_num = 0
++            sharded.validate_metadata_integrity()
++
++    @staticmethod
++    def _rewrite_dsv4_replica_metadata(model_sharded_state_dict):
++        """Rewrite DSV4 ``tid2eid`` sharding into a per-layer full replica.
++
++        ``tid2eid`` is a full-vocabulary hash routing table, so every rank holds
++        the same complete tensor. The default builder derives its metadata from
++        the owning expert parameter, which yields an invalid layout. The layer
++        index only lives in the prepended axis, so fold it back into the key
++        before declaring a plain replica.
++        """
++        for sharded in nested_values(model_sharded_state_dict):
++            if not isinstance(sharded, ShardedTensor) or not sharded.key.endswith(".tid2eid"):
++                continue
++            if sharded.prepend_axis_num and "layers." in sharded.key:
++                layer_offset = sharded.global_offset[0]
++                sharded.key = sharded.key.replace("layers.", f"layers.{layer_offset}.", 1)
++            local_shape = tuple(sharded.local_shape)
++            sharded.global_shape = local_shape
++            sharded.global_offset = (0,) * len(local_shape)
++            sharded.axis_fragmentations = (1,) * len(local_shape)
++            sharded.prepend_axis_num = 0
++            sharded.validate_metadata_integrity()
++
+     def _build_optimizer_state_dict(
+         self,
+         model_sharded_state_dict: dict,
+@@ -409,6 +459,210 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+             state_dict["lr_scheduler"] = self.lr_scheduler.state_dict()
+         return state_dict
+ 
++    def _debug_ckpt_sharding(self, model_sharded_state_dict) -> None:
++        """dsv4-ckpt-26: name-keyed SSD probe. Read-only; a failure here does not stop the load."""
++        try:
++            self._report_ckpt_sharding(model_sharded_state_dict)
++        except Exception as exc:
++            log_with_rank(
++                f"[CKPTDBG] probe failed: {type(exc).__name__}: {exc}",
++                rank=self.rank,
++                logger=logger,
++            )
++
++    def _report_ckpt_sharding(self, model_sharded_state_dict) -> None:
++        """Split "not in the SSD" from "the name matches but the object is different".
++
++        ``identity_miss`` is the old ``params_missing_from_ssd`` count: an optimizer
++        param object is not the ``data`` of any SSD entry. Model parameters are
++        classified separately by qualified name.
++        """
++        from megatron.core.dist_checkpointing.dict_utils import nested_values
++        from megatron.core.dist_checkpointing.mapping import ShardedTensor
++
++        def storage_ptr(tensor):
++            try:
++                return tensor.untyped_storage().data_ptr()
++            except Exception:
++                return None
++
++        def storage_offset(tensor):
++            try:
++                return int(tensor.storage_offset())
++            except Exception:
++                return None
++
++        entries = list(nested_values(model_sharded_state_dict))
++        bad = []
++        by_id = {}
++        by_key = {}
++        for entry in entries:
++            replica_id = getattr(entry, "replica_id", None)
++            if not isinstance(replica_id, tuple):
++                bad.append((type(entry).__name__, getattr(entry, "key", None), replica_id))
++            if not isinstance(entry, ShardedTensor):
++                continue
++            data = entry.data if isinstance(getattr(entry, "data", None), torch.Tensor) else None
++            rec = {
++                "key": entry.key,
++                "shape": tuple(data.shape) if data is not None else None,
++                "dtype": str(data.dtype) if data is not None else str(getattr(entry, "dtype", None)),
++                "storage_offset": storage_offset(data) if data is not None else None,
++                "storage_ptr": storage_ptr(data) if data is not None else None,
++                "global_offset": tuple(entry.global_offset),
++                "local_shape": tuple(entry.local_shape),
++                "replica_id": entry.replica_id,
++                "frag": (
++                    tuple(entry.axis_fragmentations)
++                    if entry.axis_fragmentations is not None
++                    else None
++                ),
++            }
++            by_key.setdefault(entry.key, []).append(rec)
++            if data is not None:
++                by_id.setdefault(id(data), []).append(rec)
++                inner = getattr(data, "data", None)
++                if isinstance(inner, torch.Tensor) and inner is not data:
++                    by_id.setdefault(id(inner), []).append(rec)
++
++        names = {}
++        qualified = []
++        models = list(self.model)
++        for vpp_rank, model in enumerate(models):
++            module = model.module if hasattr(model, "module") else model
++            prefix = f"model{vpp_rank}." if len(models) > 1 else ""
++            named = list(module.named_parameters()) + list(module.named_buffers())
++            for name, tensor in named:
++                qn = prefix + name
++                qualified.append((qn, tensor))
++                names.setdefault(id(tensor), qn)
++                if getattr(tensor, "data", tensor) is not tensor:
++                    names.setdefault(id(tensor.data), qn)
++
++        def keys_for(qn):
++            # A one-component key such as "weight" is not a qualified-name match.
++            suffix = "." + qn
++            found = []
++            for key in by_key:
++                if key == qn or key.endswith(suffix):
++                    found.append(key)
++                    continue
++                if key.count(".") >= 1 and qn.endswith("." + key):
++                    found.append(key)
++            return found
++
++        def same_storage(tensor, recs):
++            ptr = storage_ptr(tensor)
++            if ptr is None:
++                return False
++            return any(rec["storage_ptr"] == ptr for rec in recs)
++
++        identity_hit = 0
++        identity_differs = 0
++        not_in_ssd = 0
++        differ_lines = []
++        missing_lines = []
++        seen = set()
++        watch_tokens = ("attn_sink", "expert_bias", "hc_scale", "hc_base", "hc_fn")
++        watch_rows = {token: [] for token in watch_tokens}
++
++        for qn, tensor in qualified:
++            if id(tensor) in seen:
++                continue
++            seen.add(id(tensor))
++            ident = by_id.get(id(tensor)) or by_id.get(id(getattr(tensor, "data", tensor)))
++            matched_keys = keys_for(qn)
++            recs = [rec for key in matched_keys for rec in by_key[key]]
++            if ident:
++                identity_hit += 1
++                kind = "identity"
++            elif matched_keys:
++                identity_differs += 1
++                kind = "differs"
++                if len(differ_lines) < 8:
++                    rec = recs[0]
++                    differ_lines.append(
++                        f"name={qn} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
++                        f"storage_offset={storage_offset(tensor)} "
++                        f"ssd_key={rec['key']} ssd_shards={len(recs)} "
++                        f"ssd_shape={rec['shape']} ssd_dtype={rec['dtype']} "
++                        f"ssd_storage_offset={rec['storage_offset']} "
++                        f"ssd_global_offset={rec['global_offset']} "
++                        f"ssd_local_shape={rec['local_shape']} "
++                        f"ssd_replica_id={rec['replica_id']} "
++                        f"ssd_axis_fragmentations={rec['frag']} "
++                        f"same_storage={same_storage(tensor, recs)}"
++                    )
++            else:
++                not_in_ssd += 1
++                kind = "not_in_ssd"
++                if len(missing_lines) < 8:
++                    missing_lines.append(
++                        f"name={qn} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
++                        f"storage_offset={storage_offset(tensor)}"
++                    )
++            for token in watch_tokens:
++                if token in qn:
++                    watch_rows[token].append((qn, tensor, kind, recs))
++
++        optimizers = getattr(self.optimizer, "chained_optimizers", [self.optimizer])
++        identity_miss = 0
++        unnamed = 0
++        unnamed_lines = []
++        for optimizer in optimizers:
++            for group in getattr(optimizer, "param_groups", []):
++                for param in group["params"]:
++                    param_data = getattr(param, "data", param)
++                    if id(param) in by_id or id(param_data) in by_id:
++                        continue
++                    identity_miss += 1
++                    qn = names.get(id(param)) or names.get(id(param_data))
++                    if qn is None:
++                        unnamed += 1
++                        if len(unnamed_lines) < 8:
++                            unnamed_lines.append(
++                                f"shape={tuple(param.shape)} dtype={param.dtype} "
++                                f"storage_offset={storage_offset(param)}"
++                            )
++
++        log_with_rank(
++            f"[CKPTDBG] model_ssd_entries={len(entries)} sharded_keys={len(by_key)} "
++            f"non_tuple_replica_id={len(bad)} identity_hit={identity_hit} "
++            f"identity_differs={identity_differs} not_in_ssd={not_in_ssd} "
++            f"identity_miss={identity_miss} unnamed_optimizer_param={unnamed}",
++            rank=self.rank,
++            logger=logger,
++        )
++        for item in bad[:10]:
++            log_with_rank(f"[CKPTDBG] bad_replica_id={item}", rank=self.rank, logger=logger)
++        for line in differ_lines:
++            log_with_rank(f"[CKPTDBG] identity_differs {line}", rank=self.rank, logger=logger)
++        for line in missing_lines:
++            log_with_rank(f"[CKPTDBG] not_in_ssd {line}", rank=self.rank, logger=logger)
++        for line in unnamed_lines:
++            log_with_rank(
++                f"[CKPTDBG] unnamed_optimizer_param {line}", rank=self.rank, logger=logger
++            )
++        for token in watch_tokens:
++            rows = watch_rows[token]
++            shapes = sorted({tuple(tensor.shape) for _qn, tensor, _kind, _recs in rows})
++            dtypes = sorted({str(tensor.dtype) for _qn, tensor, _kind, _recs in rows})
++            ssd_dtypes = sorted(
++                {rec["dtype"] for _qn, _tensor, _kind, recs in rows for rec in recs}
++            )
++            counts = {"identity": 0, "differs": 0, "not_in_ssd": 0}
++            for _qn, _tensor, kind, _recs in rows:
++                counts[kind] += 1
++            ssd_keys = [key for key in by_key if token in key][:6]
++            log_with_rank(
++                f"[CKPTDBG] watch={token} model={len(rows)} "
++                f"identity={counts['identity']} differs={counts['differs']} "
++                f"not_in_ssd={counts['not_in_ssd']} shapes={shapes} "
++                f"model_dtypes={dtypes} ssd_dtypes={ssd_dtypes} ssd_keys={ssd_keys}",
++                rank=self.rank,
++                logger=logger,
++            )
++
+     def _build_extra_state_dict(self) -> dict:
+         """Build the extra state dict (RNG states)."""
+         torch.distributed.barrier()
+@@ -907,6 +1161,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+             or (self.should_load_hf_model and self.peft_cls is not None)
+         ):
+             model_sharded_state_dict = self._build_model_sharded_state_dict(metadata)
++            self._debug_ckpt_sharding(model_sharded_state_dict)
+ 
+         # ── Load model weights ──────────────────────────────────────────────
+         if self.should_load_dist_ckpt_model or (self.should_load_hf_model and self.peft_cls is not None):
+@@ -938,6 +1193,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+ 
+         # ── Load optimizer / LR scheduler ───────────────────────────────────
+         if self.should_load_optimizer:
++            # Rebuild the model sharded state dict before the optimizer uses it.
++            # The dist-ckpt model load above runs fully-parallel loading, which
++            # rewrites ``replica_id`` in place to an int (0/1) for every
++            # ShardedTensor it sees. Reusing the same objects would make the
++            # optimizer's (PP, TP, DP) replica_id assertion fail.
++            model_sharded_state_dict = self._build_model_sharded_state_dict(metadata)
+             optim_sd = self._build_optimizer_state_dict(model_sharded_state_dict, metadata, is_loading=True)
+             loaded_optim = load_dist_checkpointing(
+                 sharded_state_dict=optim_sd,
+diff --git a/verl/utils/megatron/dist_checkpointing.py b/verl/utils/megatron/dist_checkpointing.py
+index 98c0e54635c9b04a8feafa4a926f9f1495df85ef..01fa9e12fdcad9b32f1986da385a01c487cd6c7d 100644
+--- a/verl/utils/megatron/dist_checkpointing.py
++++ b/verl/utils/megatron/dist_checkpointing.py
+@@ -12,6 +12,10 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import inspect
++import os
++from functools import partial
++
+ import megatron.core
+ import torch
+ from megatron.core import dist_checkpointing, mpu
+@@ -26,6 +30,235 @@ from megatron.core.dist_checkpointing.strategies.torch import (
+ from packaging import version
+ 
+ 
++def _open_distcp_write_stream(filename):
++    """Open a .distcp file for the in-process writer (dsv4-ckpt-22).
++
++    When the Megatron dsv4-ckpt-17 patch is active (MEGATRON_CKPT_FSYNC_CHUNK_BYTES > 0),
++    route the file through _ChunkedSyncWriter so every chunk is flushed, fdatasync-ed and
++    posix_fadvise(DONTNEED)-ed inside write(): the page cache of a direct shared-disk
++    save stays bounded instead of accumulating the whole file. Without the Megatron patch
++    or with the knob off this is a plain unbuffered file and the caller fsyncs once at
++    the end. Either way the byte stream is identical to the fork-writer path.
++    """
++    from megatron.core.dist_checkpointing.strategies import filesystem_async
++
++    raw = open(filename, "wb", buffering=0)
++    writer_cls = getattr(filesystem_async, "_ChunkedSyncWriter", None)
++    chunk_bytes = getattr(filesystem_async, "_CKPT_FSYNC_CHUNK_BYTES", 0)
++    if writer_cls is not None and chunk_bytes > 0:
++        return writer_cls(raw)
++    return raw
++
++
++def _cpu_shard_for_write(tensor):
++    """Return a tensor whose storage is exactly this shard.
++
++    dsv4-ckpt-28: the plan no longer clones every CPU view. ``torch.save`` of a
++    view pickles the parent storage, so the shard being written gets a private
++    copy and that copy is dropped before the next tensor.
++    """
++    if tensor.device.type != "cpu":
++        return tensor.to("cpu", non_blocking=False)
++    nbytes = tensor.numel() * tensor.itemsize
++    try:
++        owns_storage = tensor.is_contiguous() and tensor.untyped_storage().size() == nbytes
++    except Exception:
++        owns_storage = False
++    if owns_storage:
++        return tensor
++    return tensor.detach().clone()
++
++
++def _write_checkpoint_in_process(transform_list, rank, write_buckets, results_queue):
++    """dsv4-ckpt-22: serialize one tensor at a time in the current process.
++
++    Replaces the native sync path's whole-bucket preload (bucket-sized D2H staging)
++    and per-rank forked bucket writer processes (host COW while training is blocked):
++    device tensors are copied to host one at a time, written through the same
++    chunked-streaming stream as dsv4-ckpt-17, and released before the next tensor
++    is staged. Host peak is bounded by a single tensor instead of a bucket.
++    """
++    from torch.distributed.checkpoint.filesystem import _write_item
++
++    extra = {}
++    if "serialization_format" in inspect.signature(_write_item).parameters:
++        from torch.distributed.checkpoint.filesystem import SerializationFormat
++
++        extra["serialization_format"] = SerializationFormat.TORCH_SAVE
++
++    from megatron.core.dist_checkpointing.strategies import filesystem_async
++
++    chunked = (
++        getattr(filesystem_async, "_CKPT_FSYNC_CHUNK_BYTES", 0) > 0
++        and getattr(filesystem_async, "_ChunkedSyncWriter", None) is not None
++    )
++    print(
++        f"[CKPT-SYNC] in-process per-tensor writer: buckets={len(write_buckets)} "
++        f"chunked={chunked} view_clone=per_tensor",
++        flush=True,
++    )
++
++    results = {}
++    for index, (filename, storage_key, (bytes_data, tensor_data)) in enumerate(write_buckets):
++        written = []
++        stream = _open_distcp_write_stream(filename)
++        try:
++            for item, data in bytes_data:
++                written.append(_write_item(*transform_list, stream, data, item, storage_key, **extra))
++            for item, tensor in tensor_data:
++                # dsv4-ckpt-28: one private shard at a time. Training is blocked,
++                # so the source view is stable for this copy.
++                cpu = _cpu_shard_for_write(tensor)
++                try:
++                    written.append(_write_item(*transform_list, stream, cpu, item, storage_key, **extra))
++                finally:
++                    if cpu is not tensor:
++                        del cpu
++            if hasattr(stream, "_sync"):
++                # _ChunkedSyncWriter.close() forces the trailing fdatasync + fadvise.
++                stream.close()
++            else:
++                stream.flush()
++                os.fsync(stream.fileno())
++                stream.close()
++        finally:
++            if not stream.closed:
++                stream.close()
++        results[index] = written
++    results_queue.put(results)
++
++
++
++def _stage_error_text(stage, exc):
++    """dsv4-ckpt-39: one line, bounded, safe to all_gather."""
++    text = f"{stage}: {type(exc).__name__}: {exc}"
++    return text if len(text) <= 800 else text[:800]
++
++
++def _gather_stage_error(stage, error):
++    """dsv4-ckpt-39: every rank enters, then every rank raises together.
++
++    Call this only after the previous collective has returned on this rank.
++    A local exception inside a collective that this rank never entered cannot
++    be collected here; the ranks still inside that collective stay there.
++    """
++    message = None if not error else error
++    if message and not message.startswith(stage + ":"):
++        message = f"{stage}: {message}"
++    if message and len(message) > 800:
++        message = message[:800]
++    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
++    if not distributed:
++        if message:
++            raise RuntimeError(
++                "Synchronous DCP save failed; ckpt_complete.json will not be written. " + message
++            )
++        return
++    errors = [None] * torch.distributed.get_world_size()
++    torch.distributed.all_gather_object(errors, message)
++    bad = [item for item in errors if item]
++    if not bad:
++        return
++    print(
++        f"[CKPT-SYNC] save stage failed stage={stage} rank={torch.distributed.get_rank()} "
++        f"failed_ranks={len(bad)} first={bad[0]}",
++        flush=True,
++    )
++    raise RuntimeError(
++        "Synchronous DCP save failed; ckpt_complete.json will not be written. " + " | ".join(bad[:4])
++    )
++
++
++def _finalize_dist_metadata(save_state_dict_ret):
++    """dsv4-ckpt-39: write metadata without the trailing barrier.
++
++    ``save_state_dict_async_finalize`` gathers write results first. A failure
++    after that gather returns is reported by ``save`` before any rank barriers.
++    """
++    from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
++        save_state_dict_async_finalize,
++    )
++
++    save_state_dict_async_finalize(*save_state_dict_ret)
++
++
++class _InProcessSyncSaveStrategy(TorchDistSaveShardedStrategy):
++    """dsv4-ckpt-22: synchronous saves write in the current process, one tensor at a time.
++
++    The native `AsyncSaveShardedStrategy.save` schedules the request through the async
++    caller machinery even for sync saves: preload_fn stages a whole bucket to host and
++    async_fn forks writer processes (which MindSpeed's scheduler may additionally move
++    to shared storage, duplicating a whole optimizer). Since training is already blocked
++    during a sync save, none of that isolation is needed: run the per-tensor writer
++    inline and finalize only after every rank succeeded.
++    """
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.in_process_sync = True
++
++    def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret):
++        request = super()._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
++        if self.in_process_sync:
++            # dsv4-ckpt-39: drop the barrier inside the upstream finalize closure.
++            # dsv4-ckpt-40: do this even when async_fn is None. Empty extra
++            # otherwise keeps that barrier while ranks with data wait in
++            # _gather_stage_error.
++            finalize_fns = [partial(_finalize_dist_metadata, save_state_dict_ret)]
++            if request.async_fn is not None:
++                transforms = [writer.transforms] if hasattr(writer, "transforms") else []
++                request = request._replace(
++                    async_fn=partial(_write_checkpoint_in_process, transforms),
++                    preload_fn=None,
++                    finalize_fns=finalize_fns,
++                )
++            else:
++                request = request._replace(finalize_fns=finalize_fns)
++        return request
++
++    def save(self, sharded_state_dict, checkpoint_dir):
++        # dsv4-ckpt-28: do not clone every CPU view in the save plan. The
++        # in-process writer copies the one shard it is writing. Async saves
++        # use TorchDistSaveShardedStrategy and keep the plan clone.
++        from megatron.core.dist_checkpointing.strategies import filesystem_async
++
++        setter = getattr(filesystem_async, "set_ckpt_clone_cpu_views", None)
++        if setter is not None:
++            setter(False)
++        try:
++            # dsv4-ckpt-39: plan, write, and finalize each end in an all_gather.
++            # One rank's local exception after a collective returns must not skip
++            # the next collective and leave the others blocked there.
++            plan_error = None
++            request = None
++            try:
++                request = self.async_save(sharded_state_dict, checkpoint_dir)
++            except Exception as exc:
++                plan_error = _stage_error_text("plan", exc)
++            _gather_stage_error("plan", plan_error)
++
++            write_error = None
++            try:
++                if request.async_fn is not None:
++                    request.async_fn(*request.async_fn_args, **request.async_fn_kwargs)
++            except Exception as exc:
++                write_error = _stage_error_text("write", exc)
++            _gather_stage_error("write", write_error)
++
++            fin_error = None
++            try:
++                for finalize in request.finalize_fns:
++                    finalize()
++            except Exception as exc:
++                fin_error = _stage_error_text("finalize", exc)
++            _gather_stage_error("finalize", fin_error)
++            if torch.distributed.is_available() and torch.distributed.is_initialized():
++                torch.distributed.barrier()
++        finally:
++            if setter is not None:
++                setter(True)
++
++
+ def save_dist_checkpointing(
+     sharded_state_dict,
+     ckpt_path,
+@@ -33,8 +266,14 @@ def save_dist_checkpointing(
+     content_metadata=None,
+ ):
+     validate_sharding_integrity = True
+-    # Get checkpointing strategies
+-    save_strategy = TorchDistSaveShardedStrategy(backend="torch_dist", version=1)
++    # dsv4-ckpt-22: sync saves write per-tensor in the current process, sharing the
++    # dsv4-ckpt-17 chunked stream. Opt out with VERL_DCP_INPROCESS_SYNC_WRITE=0 to
++    # fall back to the native preload + forked bucket writer.
++    in_process_sync = os.environ.get("VERL_DCP_INPROCESS_SYNC_WRITE", "1").lower() not in ("0", "false")
++    if async_save or not in_process_sync:
++        save_strategy = TorchDistSaveShardedStrategy(backend="torch_dist", version=1)
++    else:
++        save_strategy = _InProcessSyncSaveStrategy(backend="torch_dist", version=1)
+     save_strategy = FullyParallelSaveStrategyWrapper(
+         save_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+     )
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 4b368339bc4353142d0197be2e8aa5c8c85f16a1..f86f6b438138e10f793207d2af51c97863637753 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -487,7 +487,7 @@ class MegatronEngine(BaseEngine):
+         self.tf_config = updated_tf_config
+         print(f"module: {len(module)}")
+ 
+-        if self.engine_config.use_dist_checkpointing:
++        if self.engine_config.use_dist_checkpointing and self.engine_config.dist_checkpointing_path:
+             load_mcore_dist_weights(
+                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
+             )
+@@ -781,7 +781,8 @@ class MegatronEngine(BaseEngine):
+         """
+         origin_module_device = get_megatron_module_device(self.module)
+         if self._is_offload_param or origin_module_device == "cpu":
+-            load_megatron_model_to_gpu(self.module, load_grad=True)
++            # dsv4-ckpt-30: checkpoint save does not read gradients.
++            load_megatron_model_to_gpu(self.module, load_grad=False)
+         self.checkpoint_mananager.save_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+         )
+@@ -801,7 +802,8 @@ class MegatronEngine(BaseEngine):
+             del_local_after_load: Whether to delete local copy after loading.
+         """
+         if self._is_offload_param:
+-            load_megatron_model_to_gpu(self.module)
++            # dsv4-ckpt-30: checkpoint load does not read gradients.
++            load_megatron_model_to_gpu(self.module, load_grad=False)
+         self.checkpoint_mananager.load_checkpoint(
+             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+         )
+diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
+index cbcd78ee5a60c3fcf134f3f63a948a74bba5e795..c82452a77b5b6be25406e99427bb73d2ae46d822 100644
+--- a/verl/workers/rollout/replica.py
++++ b/verl/workers/rollout/replica.py
+@@ -257,7 +257,7 @@ class RolloutReplica(ABC):
+     def max_concurrency(self) -> int:
+         # 1000 is Ray's default max_concurrency for async execution.
+         # Add some margin to account for control method call.
+-        return max(1000, self.config.max_num_seqs + CONTROL_METHOD_CONCURRENCY)
++        return max(1000, self.config.max_num_seqs) + CONTROL_METHOD_CONCURRENCY
+ 
+     def rollout_worker_use_gpu(self) -> bool:
+         return True
