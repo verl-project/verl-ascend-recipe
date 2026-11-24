@@ -3,7 +3,6 @@ set -eo pipefail
 source env/bin/activate
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-export PYTHONPATH=$PWD/verl-1a8a0f5ffd9d3f169ae4432b68526233ba028102:/usr/local/Ascend/cann-9.1.0/python/site-packages
 export OMP_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false WANDB_MODE=disabled
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ASCEND_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export n_gpus_per_node=8 train_batch_size=32 ppo_mini_batch_size=8 rollout_n=4
