@@ -1,0 +1,9 @@
+# sft_recovery — pinned; exact commits to be confirmed before submission
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned
+BRANCH=main
+# TODO: fill with the exact verl commit the RL-parity stage was validated
+# against (the data-build / eval tools themselves are trainer-agnostic).
+VERL_COMMIT=<PLACEHOLDER>
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@<PLACEHOLDER>
+NOTES=Data-build and evaluation stages are inference/trainer agnostic (OpenAI-compatible vLLM server + HF-format datasets); verl is only required for the RL-parity stage (GRPO from recovered checkpoints).
