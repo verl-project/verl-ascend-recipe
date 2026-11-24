@@ -112,8 +112,4 @@ USE_PEFT=0 SP_SIZE=2 TRAIN_BATCH_SIZE=32 SAVE_PATH="$PWD/checkpoints_full_100" \
 
 ![LoRA 100 步逐步训练 loss 及最近 10 步移动平均](lora_training_loss.png)
 
-曲线取自 LoRA 日志中全部 100 条 `train/loss`。下降主要发生在前 30 步；第 21–30 步均值为 0.3886，第 91–100 步均值为 0.3276。逐步核对两份日志，所有训练 loss 和梯度范数均为有限值，梯度范数均大于零。
 
-## 验收范围
-
-按 [issue #74](https://github.com/verl-project/verl-ascend-recipe/issues/74) 的无 GPU 标杆条件，LoRA 作业提供了 100 步 loss 下降和训练 TPS 超过 100 的证据。全参数作业首末各 10 步平均训练 loss 从 0.7583 降至 0.4682，第 100 步的模型检查点包含全部 8 个 rank 分片。GSM8K 生成准确率、A100 相对性能和检查点恢复尚未实测。
