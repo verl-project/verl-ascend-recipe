@@ -1,180 +1,27 @@
-# Qwen3-8B RLOO FSDP2 + vLLM Ascend Recipe
----
+# Qwen3-8B RLOO Ascend 910B/910C 训练配方
 
-当前 8 卡 910B3 复现、算法补丁与验收状态见
-[`PRACTICE_ISSUE79.md`](PRACTICE_ISSUE79.md)。下文的 20 步结果是历史实验，不能代替当前 100 步验收。
-本次 PR 更新仅提交文档与结果文件；新增补丁、测试和脚本改动目前位于本地/实验服务器工作树，尚待单独代码提交。
+本配方使用 FSDP2 和 vLLM Ascend 运行 Qwen3-8B RLOO 训练。启动脚本读取 GSM8K 的 train.parquet 和 test.parquet；verl 版本固定在 [REQUIRED_VERL.txt](REQUIRED_VERL.txt)。
 
-### 1. 范围与验收链路
+## 运行方法
 
-提供 Qwen3-8B 在昇腾 NPU 上的 RLOO训练配方：
+在仓库根目录安装指定版本的 verl：
 
-- FSDP2 负责 Actor 和 Reference Model；
-- vLLM Ascend 负责 rollout；
-- GSM8K strict reward 负责结果评分；
-- RLOO 使用同一 prompt 的多条 response 构造 leave-one-out baseline；
-- KL penalty 直接计入 reward，不额外启用 Actor KL loss。
+    ./install_verl.sh --recipe rloo --method git --dest ./verl
 
-本次实测链路为单张 Ascend910_9382。
-[`ACCEPTANCE_CRITERIA.md`](ACCEPTANCE_CRITERIA.md)。
+使用 verl 的 examples/data_preprocess/gsm8k.py 准备 GSM8K 数据，然后启动训练：
 
-### 2. 文件
+    bash rloo/run_qwen3_8b_rloo_fsdp_npu.sh --data_path=/path/to/gsm8k --model_path=/path/to/Qwen3-8B
 
-- `run_qwen3_8b_rloo_fsdp_npu.sh`：RLOO + FSDP2 + vLLM Ascend 启动脚本；
-- [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt)：已验证的官方 verl revision；
-- `patch/verl_qwen3_8b_rloo_model.patch`：Qwen3-8B 模型接入配置 Patch；
-- `patch/README.md`：Patch 的应用、验证和回滚方法；
-- [`ACCEPTANCE_CRITERIA.md`](ACCEPTANCE_CRITERIA.md)：验收标准及当前实测结论。
+数据目录需包含 train.parquet 和 test.parquet。两个路径参数之后可以继续传入 Hydra 覆盖参数。脚本默认使用一张可见 NPU；多卡运行时需设置 n_gpus_per_node 和设备可见性。启动前请加载 CANN 环境。
 
-### 3. 环境
+脚本使用 RLOO 优势估计、FSDP2 Actor/Reference、BF16、vLLM rollout 和 DAPO reward。为匹配 GSM8K 的严格答案格式，脚本关闭 Qwen3 thinking；相关模型配置已写入脚本，无需额外的模型补丁。
 
-当前结果使用以下软硬件栈：
+## 验证材料
 
-| 组件 | 已验证版本或 revision |
-| --- | --- |
-| NPU | Ascend910_9382，64 GB HBM |
-| PyTorch / torch-npu | `2.10.0+cpu` / `2.10.0.post4` |
-| vLLM | `0.23.0+empty` |
-| vLLM Ascend | `0.23.0` |
-| Transformers | `5.5.4` |
-| 模型 | Qwen3-8B，BF16 |
+[Issue #79 实践报告](../verl_ascend_practice/reports/rloo/README.md)记录了一次独立的 8 卡 Ascend 910B、100 步训练。[完整训练日志](../verl_ascend_practice/reports/rloo/evidence/train.log)、[reward 曲线](../verl_ascend_practice/reports/rloo/reward_curve.png)和[材料索引](../verl_ascend_practice/reports/rloo/evidence/README.md)均随本 PR 提交。
 
-启动训练前加载 CANN 环境；若环境同时安装 NNAL/ATB，也应加载对应环境脚本：
+实测前 10 步与后 10 步的平均 reward 分别为 0.578812 和 0.741040。8 卡合计训练吞吐为 1588.43 tokens/s，平均每卡 198.55 tokens/s；该口径包含训练步中的 prompt 和 response token。实验覆盖参数、验证集范围与启动脚本退出状态见实践报告。
 
-```bash
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
-    source /usr/local/Ascend/nnal/atb/set_env.sh
-fi
-```
+**本次实验使用的运行脚本**：[run_qwen3_8b_rloo_fsdp_npu.sh](run_qwen3_8b_rloo_fsdp_npu.sh)。
 
-### 4. 安装固定 verl
-
-从 `verl-ascend-recipe` 根目录检查安装计划：
-
-```bash
-./install_verl.sh --recipe rloo --show
-./install_verl.sh --recipe rloo --method git --dest ./verl
-```
-
-也可在已检出 `REQUIRED_VERL.txt` 所列 commit 的 verl 仓库中手动应用 Patch：
-
-```bash
-git apply --check ../rloo/patch/verl_qwen3_8b_rloo_model.patch
-git apply ../rloo/patch/verl_qwen3_8b_rloo_model.patch
-git diff --check
-```
-
-Patch 已在上述 verl commit 上通过 `git apply --check`。它修改的是官方 RLOO 示例；
-本目录的 NPU 脚本已直接包含相同配置，因此直接运行本目录脚本时不重复依赖 Patch。
-
-### 5. 数据
-
-使用 verl 的 GSM8K 预处理脚本生成数据：
-
-```bash
-python examples/data_preprocess/gsm8k.py \
-  --local_save_dir "$HOME/data/gsm8k"
-```
-
-数据目录必须包含：
-
-```text
-$HOME/data/gsm8k/train.parquet
-$HOME/data/gsm8k/test.parquet
-```
-
-### 6. 启动
-
-在已安装 verl 的环境中执行：
-
-```bash
-bash /path/to/verl-ascend-recipe/rloo/run_qwen3_8b_rloo_fsdp_npu.sh \
-  --data_path="$HOME/data/gsm8k" \
-  --model_path="/models/Qwen3-8B"
-```
-
-脚本默认执行 100 步。可通过环境变量覆盖主要参数，并在末尾追加 Hydra override：
-
-```bash
-ASCEND_RT_VISIBLE_DEVICES=0 \
-total_training_steps=1 \
-train_batch_size=32 \
-rollout_n=2 \
-bash rloo/run_qwen3_8b_rloo_fsdp_npu.sh \
-  --data_path=/data/gsm8k \
-  --model_path=/models/Qwen3-8B \
-  trainer.default_local_dir=/checkpoints/rloo_smoke
-```
-
-正式训练前建议先运行一步 smoke，并确认 loss、gradient、reward 和 TPS 均为有限值。
-
-### 7. 模型适配与算法配置
-
-#### Qwen3 模型适配 Patch
-
-Patch 向 verl 官方 Qwen3-8B RLOO 示例补充以下配置：
-
-```text
-data.trust_remote_code=True
-+data.apply_chat_template_kwargs.enable_thinking=False
-actor_rollout_ref.model.trust_remote_code=True
-```
-
-`trust_remote_code` 允许 tokenizer 和训练模型加载模型仓库提供的实现。关闭 thinking
-使训练 rollout、GSM8K strict `####` 答案提取及下游评测使用相同模板口径。
-
-#### RLOO 与 Ascend 配置
-
-| 配置 | 实测值 | 目的 |
-| --- | ---: | --- |
-| `algorithm.adv_estimator` | `rloo` | 启用 leave-one-out advantage |
-| `rollout_n` | 5 | 为每个 prompt 采样多条 response |
-| `algorithm.kl_ctrl.kl_coef` | 0.001 | 控制 reference KL reward penalty |
-| `actor.strategy` / `ref.strategy` | `fsdp2` | 使用 FSDP2 训练和 reference 计算 |
-| `model_dtype` | `bfloat16` | 匹配 Ascend BF16 路径 |
-| `use_dynamic_bsz` | `True` | 按 token 数平衡动态 batch |
-| `param_offload` / `optimizer_offload` | `True` | 满足单卡 8B 训练显存约束 |
-| `rollout.name` | `vllm` | 使用 vLLM Ascend rollout |
-| `free_cache_engine` | `True` | 训推切换时释放 KV cache |
-
-新增 `patch/verl_rloo_vectorized.patch`，使用分组 scatter reduction 计算 leave-one-out
-baseline，保留原目标函数、单样本组行为和 response mask。应用方法见
-[`patch/README.md`](patch/README.md)，公式对照测试见 `tests/test_rloo_vectorized.py`。
-该补丁独立于模型配置补丁，运行训练前需要同时应用。
-
-### 8. 实测结果
-
-训练端 global TPS 沿用 verl 日志口径：
-
-```text
-global TPS = perf/total_num_tokens / perf/time_per_step
-```
-
-#### 20 步训练
-
-| 指标 | 结果 |
-| --- | ---: |
-| 完成步数 | 20/20，checkpoint `global_step_20` |
-| Reward 首步 / 末步 | 0.593750 / 0.656004 |
-| Reward 前 5 步 / 后 5 步均值 | 0.571879 / 0.615449 |
-| Reward 窗口提升 | +0.043570 |
-| Reward 线性斜率 | +0.003911/步 |
-| 平均 global TPS | 153.67 token/s |
-| 平均 step time | 145.52 s |
-
-Reward 呈上升趋势，训练 TPS 高于无匹配 A100 标杆时约定的 100 token/s 门槛。
-
-#### GSM8K 下游评测
-
-两组权重使用同一份 1,319 条 GSM8K test、greedy decoding、`max_tokens=512`、关闭
-thinking，并采用 verl strict `####` 答案提取：
-
-| 权重 | 正确数 | 准确率 | 输出 token | 输出 TPS |
-| --- | ---: | ---: | ---: | ---: |
-| Qwen3-8B 基座 | 703/1319 | 53.30% | 343,572 | 389.35 |
-| RLOO step 20 | 824/1319 | 62.47% | 341,096 | 381.31 |
-
-RLOO 权重相对基座提升 121 道题，即 `+9.17` 个百分点。推理 TPS 与训练 global TPS
-是不同口径，不能直接横向比较；前者仅用于验证训练权重的部署吞吐。
-
+实验环境还应用了尚未纳入本 PR 的向量化 RLOO 优势计算改动，且服务器上的启动脚本在训练期间被修改。因此，上述性能数据是该实验配置的记录，不能直接视作当前 PR 脚本与未修改 verl 的性能基准。
