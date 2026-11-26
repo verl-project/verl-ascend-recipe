@@ -1,0 +1,21 @@
+--- a/transfer_queue/storage/clients/mooncake_client.py
++++ b/transfer_queue/storage/clients/mooncake_client.py
+@@ -30,7 +30,0 @@
+-MOONCAKE_STORE_IMPORTED: bool = True
+-try:
+-    from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+-
+-except ImportError:
+-    MOONCAKE_STORE_IMPORTED = False
+-
+@@ -53,2 +46,8 @@
+-        if not MOONCAKE_STORE_IMPORTED:
+-            raise ImportError("Mooncake Store not installed. Please install via: pip install mooncake-transfer-engine")
++        # Import the optional native backend only when it is selected.
++        try:
++            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
++        except ImportError as exc:
++            raise ImportError(
++                "Mooncake Store not installed. Please install via: pip install mooncake-transfer-engine"
++            ) from exc
++
