@@ -1,6 +1,6 @@
 # Qwen3-8B RLOO：8 卡 Ascend 910B 验证报告
 
-本报告记录 2026 年 11 月 19 日针对 [Issue #79](https://github.com/verl-project/verl-ascend-recipe/issues/79) 完成的独立实验，与此前的 20 步实验分开统计。PR 中附有[完整的 100 步训练日志](evidence/train.log)和[reward 曲线](reward_curve.png)。
+本报告记录 2026 年 11 月 19 日针对 [Issue #79](https://github.com/verl-project/verl-ascend-recipe/issues/79) 完成的独立实验，与此前的 20 步实验分开统计。[完整的 100 步训练日志](https://github.com/erfgss/verl-ascend-recipe/blob/6b0397e7325f34b8f430a3751debe470b5446d7f/verl_ascend_practice/reports/rloo/evidence/train.log)和[reward 曲线](reward_curve.png)可供核对。
 
 ## 实测结果
 
@@ -34,6 +34,6 @@
 
 ## 复现记录与退出状态
 
-[train.log](evidence/train.log)开头记录了实际执行的 Hydra 命令，逐步记录训练指标；本报告中的统计值由该日志汇总。
+[训练日志](https://github.com/erfgss/verl-ascend-recipe/blob/6b0397e7325f34b8f430a3751debe470b5446d7f/verl_ascend_practice/reports/rloo/evidence/train.log)开头记录了实际执行的 Hydra 命令，逐步记录训练指标；本报告中的统计值由该日志汇总。
 
 训练器完成了连续 100 步、最终验证与 checkpoint 保存。由于训练过程中启动脚本被修改，外层脚本在训练结束后退出 127。冻结脚本后，从第 100 步 checkpoint 恢复并完成第 101 步，退出码为 0。恢复成功不改变原始启动脚本的退出状态；恢复运行的完整日志仍保留在实验服务器。
