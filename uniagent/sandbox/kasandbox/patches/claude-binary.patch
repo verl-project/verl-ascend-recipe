@@ -1,0 +1,190 @@
+diff --git a/uni_agent/agents/claude_code/agent.py b/uni_agent/agents/claude_code/agent.py
+index 6245be4..e396d3d 100644
+--- a/uni_agent/agents/claude_code/agent.py
++++ b/uni_agent/agents/claude_code/agent.py
+@@ -10,11 +10,16 @@ No proxy process.
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import hashlib
+ import logging
++import os
++import shlex
+ import uuid
++from pathlib import Path, PurePosixPath
+ from typing import TYPE_CHECKING, Any
+ 
+-from pydantic import Field
++from pydantic import Field, model_validator
+ 
+ from ..base import Agent, AgentConfig, AgentResult
+ from ..registry import register_agent
+@@ -65,6 +70,42 @@ class ClaudeCodeConfig(AgentConfig):
+     """Black-box launch params for Claude Code (policy endpoint lives on :attr:`AgentConfig.model`)."""
+ 
+     name: str = "claude_code"
++    local_binary_path: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_LOCAL_BINARY") or None,
++        description="Native binary on the worker filesystem; uploaded instead of installing online.",
++    )
++    local_binary_sha256: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_LOCAL_BINARY_SHA256") or None,
++        pattern=r"^[0-9a-fA-F]{64}$",
++        description="Optional expected SHA-256 of the supplied native binary.",
++    )
++    nfs_source: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_NFS_SOURCE") or None,
++        pattern=r"^[A-Za-z0-9_.-]+:/[A-Za-z0-9_./-]+$",
++        description="Read-only guest NFS source; mutually exclusive with worker binary upload.",
++    )
++    nfs_mount_path: str = Field(
++        default_factory=lambda: os.getenv("CLAUDE_CODE_NFS_MOUNT_PATH", "/opt/claude-shared"),
++    )
++    nfs_relative_binary: str = Field(
++        default_factory=lambda: os.getenv("CLAUDE_CODE_NFS_RELATIVE_BINARY", "claude"),
++    )
++    nfs_binary_sha256: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_NFS_BINARY_SHA256") or None,
++        pattern=r"^[0-9a-fA-F]{64}$",
++    )
++
++    @model_validator(mode="after")
++    def validate_binary_source(self):
++        if self.nfs_source and self.local_binary_path:
++            raise ValueError("claude_code: choose either NFS or local binary upload")
++        mount, relative = PurePosixPath(self.nfs_mount_path), PurePosixPath(self.nfs_relative_binary)
++        if not mount.is_absolute() or mount == PurePosixPath("/") or ".." in mount.parts:
++            raise ValueError("claude_code: NFS mount must be a non-root absolute guest path")
++        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
++            raise ValueError("claude_code: NFS binary must be a relative path without '..'")
++        return self
++
+     max_turns: int | None = Field(default=80, description="--max-turns budget; None to omit.")
+     enable_web_tools: bool = Field(
+         default=False,
+@@ -155,6 +196,14 @@ class ClaudeCodeAgent(Agent):
+ 
+     # ----- helpers -----
+     async def _ensure_claude(self, sandbox: Sandbox) -> None:
++        cfg: ClaudeCodeConfig = self.config  # type: ignore[assignment]
++        if cfg.nfs_source:
++            await self._mount_claude(sandbox, cfg)
++            return
++        if cfg.local_binary_path:
++            await self._upload_claude(sandbox, cfg)
++            return
++
+         if (await sandbox.exec_shell("command -v claude >/dev/null 2>&1")).exit_code == 0:
+             logger.info("claude_code: found existing claude on PATH; skipping installation")
+             return
+@@ -172,13 +221,95 @@ class ClaudeCodeAgent(Agent):
+             raise RuntimeError("claude_code: installation finished but claude is not available on PATH")
+         logger.info("claude_code: installation completed")
+ 
++    async def _mount_claude(self, sandbox: Sandbox, cfg: ClaudeCodeConfig) -> None:
++        """Use the guest's own host export; never upload or rewrite the shared executable."""
++        mount = shlex.quote(cfg.nfs_mount_path)
++        source = shlex.quote(cfg.nfs_source)
++        binary = shlex.quote(str(PurePosixPath(cfg.nfs_mount_path) / cfg.nfs_relative_binary))
++        script = f"""set -euo pipefail
++sudo -n mkdir -p -- {mount}
++if ! mountpoint -q -- {mount}; then
++  sudo -n timeout 30 mount -t nfs -o ro,vers=3,proto=tcp,nolock,nosuid,nodev {source} {mount}
++fi
++[ "$(findmnt -rn -o SOURCE --mountpoint {mount})" = {source} ]
++case ",$(findmnt -rn -o OPTIONS --mountpoint {mount})," in
++  *,ro,*) ;;
++  *) echo 'Claude NFS mount is not read-only' >&2; exit 1 ;;
++esac
++test -x {binary}
++"""
++        result = await sandbox.exec_shell(script, timeout=45)
++        if result.exit_code != 0:
++            raise RuntimeError("claude_code: read-only NFS mount failed; check guest NFS support and host export")
++        check = f"test -x {binary}; "
++        if cfg.nfs_binary_sha256:
++            check += f"printf '%s  %s\n' {shlex.quote(cfg.nfs_binary_sha256.lower())} {binary} | sha256sum -c -; "
++        check += f"{binary} --version"
++        result = await sandbox.exec_shell(
++            "set -euo pipefail; " + check,
++            timeout=120,
++            env={"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
++        )
++        if result.exit_code != 0:
++            raise RuntimeError("claude_code: NFS binary checksum/version check failed")
++        self._private_home = f"/tmp/uni-agent-claude-{uuid.uuid4().hex}"
++        result = await sandbox.exec(["mkdir", "-m", "0700", "-p", self._private_home], timeout=30)
++        if result.exit_code != 0:
++            raise RuntimeError("claude_code: cannot create private guest home")
++
++    async def _upload_claude(self, sandbox: Sandbox, cfg: ClaudeCodeConfig) -> None:
++        assert cfg.local_binary_path is not None
++        source = Path(cfg.local_binary_path).expanduser()
++        if not source.is_absolute() or not source.is_file():
++            raise ValueError(
++                f"claude_code: local_binary_path must be an existing absolute file on this worker: {source}"
++            )
++
++        def checksum() -> str:
++            digest = hashlib.sha256()
++            with source.open("rb") as stream:
++                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++                    digest.update(chunk)
++            return digest.hexdigest()
++
++        digest = await asyncio.to_thread(checksum)
++        if cfg.local_binary_sha256 and digest != cfg.local_binary_sha256.lower():
++            raise ValueError(f"claude_code: local binary SHA-256 mismatch: {source}")
++        temporary = f"/usr/local/bin/.claude-upload-{uuid.uuid4().hex}"
++        logger.info("claude_code: uploading %s (sha256=%s)", source, digest)
++        try:
++            result = await sandbox.exec_shell("mkdir -p /usr/local/bin", timeout=30)
++            if result.exit_code != 0:
++                raise RuntimeError(f"claude_code: cannot prepare binary directory: {result.stderr}")
++            await sandbox.upload_file(source, temporary)
++            result = await sandbox.exec_shell(
++                f"set -e; printf '%s  %s\n' '{digest}' '{temporary}' | sha256sum -c -; "
++                f"chmod 0755 '{temporary}'; '{temporary}' --version; "
++                f"mv -f '{temporary}' /usr/local/bin/claude",
++                env={"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
++                timeout=60,
++            )
++            if result.exit_code != 0:
++                detail = (result.stderr or result.stdout or "unknown error").strip()[-2000:]
++                raise RuntimeError(f"claude_code: uploaded binary verification failed: {detail}")
++            logger.info("claude_code: uploaded binary ready: %s", result.stdout.strip())
++        finally:
++            try:
++                await sandbox.exec_shell(f"rm -f '{temporary}'", timeout=30)
++            except Exception:
++                logger.warning("claude_code: could not remove temporary upload %s", temporary, exc_info=True)
++
+     def _claude_argv(self, user_prompt: str, *, system_prompt: str | None = None) -> list[str]:
+         cfg: ClaudeCodeConfig = self.config  # type: ignore[assignment]
+         model = cfg.model.model_name
+         if not model:
+             raise ValueError("claude_code: set config.model.model_name (the model claude sends)")
+         argv = [
+-            "claude",
++            str(PurePosixPath(cfg.nfs_mount_path) / cfg.nfs_relative_binary)
++            if cfg.nfs_source
++            else "/usr/local/bin/claude"
++            if cfg.local_binary_path
++            else "claude",
+             "-p",
+             user_prompt,
+             "--model",
+@@ -233,5 +364,12 @@ class ClaudeCodeAgent(Agent):
+         }
+         if cfg.enable_subagents:
+             env["CLAUDE_CODE_SUBAGENT_MODEL"] = model
++        if cfg.local_binary_path or cfg.nfs_source:
++            env["DISABLE_AUTOUPDATER"] = "1"
+         env.update(cfg.extra_env)
++        if cfg.nfs_source:
++            # These paths belong to this episode; the shared binary remains read-only.
++            env["HOME"] = self._private_home
++            env["CLAUDE_CONFIG_DIR"] = self._private_home + "/.claude"
++            env["DISABLE_AUTOUPDATER"] = "1"
+         return env
