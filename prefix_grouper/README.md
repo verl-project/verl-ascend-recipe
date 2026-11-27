@@ -4,11 +4,11 @@
 
 ## 所需 verl 版本
 
-本配方固定使用 `4a9dc911d57062d76988e0fd1f2468b5e7178ce3`。安装步骤见下文的「应用与运行」。[版本声明](REQUIRED_VERL.txt) · [实践报告](../verl_ascend_practice/reports/prefix_grouper/README.md)
+本配方固定使用 `4a9dc911d57062d76988e0fd1f2468b5e7178ce3`。安装步骤见下文的「应用与运行」。[版本声明](REQUIRED_VERL.txt)
 
 ## 训练与性能结果
 
-两次运行使用相同的 Qwen3-8B 初始权重、GSM8K 数据和 8 个 A3 逻辑设备。每条 prompt 采样 2 个回答，prompt 和回答分别最多 512、384 个 token。actor、reference 和 rollout 均使用 TP=2，actor 的 DP=4。每步计时包含采样、旧策略和 reference 打分、actor 更新及权重同步。
+两次运行使用相同的 Qwen3-8B 初始权重和 GSM8K 数据，均在 Atlas A3 的 8 个 Ascend910C 逻辑设备上运行。每条 prompt 采样 2 个回答，prompt 和回答分别最多 512、384 个 token。actor、reference 和 rollout 均使用 TP=2，actor 的 DP=4。每步计时包含采样、旧策略和 reference 打分、actor 更新及权重同步。
 
 | 运行 | 训练步数 | 全局 batch（prompt 数） | 有效 token 总数 | 整步累计时间（秒） | 每逻辑设备 TPS | 8 设备合计 TPS | 核验结果 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -26,9 +26,7 @@
 | GSM8K 答对数（固定 128 题） | 66 | 108 | 110 | 115 | 118 |
 | 准确率 | 51.56% | 84.38% | 85.94% | 89.84% | 92.19% |
 
-共记录 12,800 条 actor 更新的 rank 日志。按日志汇总，打包前为 7,522,024 个 token，节省 1,107,158 个，占 **14.72%**。两个 TP rank 会各自报告同一微批，这两个总数都含重复记录，比例按同一口径计算。
-
-![100 步训练的 reward、固定 GSM8K 子集准确率和每设备吞吐](evidence/training-curve.png)
+共记录 12,800 条 actor 更新的 rank 日志。按日志汇总，打包前为 7,522,024 个 token，节省 1,107,158 个，占 **14.72%**。两个 TP rank 会各自报告同一微批，这两个总数都含重复记录，比例按同一口径计算。[训练曲线与实践报告](../verl_ascend_practice/reports/prefix_grouper/README.md)
 
 ### 复现 10 步吞吐测试
 
@@ -40,7 +38,6 @@ TRAIN_BATCH_SIZE=256 PPO_MINI_BATCH_SIZE=256 \
 ROLLOUT_MAX_NUM_SEQS=128 ROLLOUT_MAX_NUM_BATCHED_TOKENS=8192 \
 TOTAL_TRAINING_STEPS=10 VAL_BEFORE_TRAIN=False TEST_FREQ=-1 SAVE_FREQ=-1 \
 bash "$RECIPE/run_qwen3_8b_megatron_npu.sh"
-python "$RECIPE/verify_metrics.py" "$RUN_DIR" --device A3 --performance-only
 ```
 
 ## 算法与适用范围
@@ -53,7 +50,7 @@ python "$RECIPE/verify_metrics.py" "$RUN_DIR" --device A3 --performance-only
 
 ## 软件与数据
 
-本次使用上游 linux/arm64 镜像 `quay.io/ascend/verl:v0.9.1-cann9.1.0-torch_npu2.10.0.post4-a3-ubuntu22.04-py3.12-vllm`，镜像清单摘要为 `sha256:d93ada97b5db6c0a50db2191a7799496037eadb5309d6fd430d0ad1e0d1dec37`。镜像使用 CANN 9.1.0 和 Python 3.12，容器可见 8 个 `Ascend910_9382` 逻辑设备。下表列出运行时的软件版本。[模型配置、数据与适配代码的 SHA-256](https://github.com/hz-wuqifan/verl-ascend-recipe/blob/beebccc5886562113478d175efb5cce0dd2e16df/prefix_grouper/evidence/provenance.txt)
+本次使用上游 linux/arm64 镜像 `quay.io/ascend/verl:v0.9.1-cann9.1.0-torch_npu2.10.0.post4-a3-ubuntu22.04-py3.12-vllm`，镜像清单摘要为 `sha256:d93ada97b5db6c0a50db2191a7799496037eadb5309d6fd430d0ad1e0d1dec37`。镜像使用 CANN 9.1.0 和 Python 3.12。下表列出运行时的软件版本。[模型配置、数据与适配代码的 SHA-256](https://github.com/hz-wuqifan/verl-ascend-recipe/blob/beebccc5886562113478d175efb5cce0dd2e16df/prefix_grouper/evidence/provenance.txt)
 
 | 组件 | 实测版本 | 组件 | 实测版本 |
 | --- | --- | --- | --- |
@@ -94,7 +91,6 @@ export NPUS_PER_NODE=8
 export RUN_DIR=/experiment/acceptance
 SAVE_FREQ=100 bash "$RECIPE/run_qwen3_8b_megatron_npu.sh" \
     'actor_rollout_ref.actor.checkpoint.save_contents=[model]'
-python "$RECIPE/verify_metrics.py" "$RUN_DIR" --device A3
 ```
 
 ## A3 实测与调优
@@ -103,12 +99,8 @@ python "$RECIPE/verify_metrics.py" "$RUN_DIR" --device A3
 
 使用相同随机权重构造两层真实 Megatron GPTModel，比较共享前缀与逐条 causal 前向，分别回传三个分支及其联合损失，并核对全部 19 个参数张量。每次反传均观察到两层激活重计算。真实训练还暴露了跨 logits 分块共享温度张量引起的原地修改错误。修复为每个分块持有独立温度后，154 个 token、两块 logits 的 TP=2 回归在两个 rank 上均完成反向验证。TP=1 联合损失的最大参数梯度相对 L2 误差为 0.00642，TP=2 两个 rank 上分别为 0.00780 和 0.00611。[TP=1 测试结果](https://github.com/hz-wuqifan/verl-ascend-recipe/blob/beebccc5886562113478d175efb5cce0dd2e16df/prefix_grouper/evidence/megatron-tp1.log) · [TP=2 测试结果](https://github.com/hz-wuqifan/verl-ascend-recipe/blob/beebccc5886562113478d175efb5cce0dd2e16df/prefix_grouper/evidence/megatron-tp2.log)
 
-## 如何核对结果
+## 正确性测试与运行记录
 
 9 项 NPU 单测均通过，其中包含真实融合算子的 BF16 前向和 Q、K、V 梯度对照。测试使用 32 个查询头、8 个 KV 头和 128 维头宽，参考值由逐条回答的 FP32 注意力计算。其余测试覆盖位置映射、不同分支互不可见、分支首 token、损失及参数梯度。[NPU 单测结果](https://github.com/hz-wuqifan/verl-ascend-recipe/blob/beebccc5886562113478d175efb5cce0dd2e16df/prefix_grouper/evidence/npu-unit.log)
 
-公开的控制台日志按原序保留启动器报告的设备型号、每一条 actor 训练微批的行数与 token 计数，以及运行结束标记。训练微批记录省略了进程前缀，测试日志保留逐项结果与最终状态。两次运行的逐步指标均为 verl 写出的原始 JSONL。
-
-训练验收读取同一运行的 `metrics.jsonl` 和 `console.log`。无匹配的 A100 基线时，核对 100 步或 12 小时、reward 上升和 TPS 大于 100。为使口径可复核，脚本报告最初和最后各至多 10 步的平均 reward，以整步耗时对 verl 的每卡 `perf/throughput` 进行加权，同时报告集群 TPS。正式比较使用严格的每卡阈值。每次运行使用独立目录。短程诊断使用 `--smoke`。
-
-A2/A100 对照需使用相同模型权重、数据、训练步数、采样及评测配置，并保存两次独立的日志。配方将平均 reward 误差定义为逐步绝对差均值除以 A100 reward 绝对值均值，下游评测使用同名 GSM8K 单答指标的相对误差。任务书未指定这两个计算公式。[社区任务](https://www.hiascend.com/activities/task-center/details/806155ae38c64881978be705beae6d09) · [任务书](https://github.com/verl-project/verl-ascend-recipe/issues/24)
+公开的控制台日志按原序保留启动器报告的设备型号、每一条 actor 训练微批的行数与 token 计数，以及运行结束标记。训练微批记录省略了进程前缀，测试日志保留逐项结果与最终状态。两次运行的逐步指标均为 verl 写出的原始 JSONL。 [社区任务](https://www.hiascend.com/activities/task-center/details/806155ae38c64881978be705beae6d09) · [任务书](https://github.com/verl-project/verl-ascend-recipe/issues/24)
