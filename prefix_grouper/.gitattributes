@@ -2,5 +2,3 @@
 patches/verl.patch -text -whitespace
 *.py text eol=lf
 *.sh text eol=lf
-*.jsonl text eol=lf
-*.log text eol=lf

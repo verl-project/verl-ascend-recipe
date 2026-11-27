@@ -1,5 +1,0 @@
-rank=0 branches=(0,) parameters=19 max_grad_relative_l2=2.15841e-06 recomputed_layers=2
-rank=0 branches=(1,) parameters=19 max_grad_relative_l2=1.01394e-05 recomputed_layers=2
-rank=0 branches=(2,) parameters=19 max_grad_relative_l2=8.77264e-07 recomputed_layers=2
-rank=0 branches=(0, 1, 2) parameters=19 max_grad_relative_l2=0.00641719 recomputed_layers=2
-PASS actual Megatron GPTModel, backend=te, TP=1, BF16, recompute=True
