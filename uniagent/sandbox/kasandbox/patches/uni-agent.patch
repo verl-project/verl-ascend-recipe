@@ -1,0 +1,1953 @@
+diff --git a/uni_agent/agents/claude_code/agent.py b/uni_agent/agents/claude_code/agent.py
+index 6245be4..2b9fbb5 100644
+--- a/uni_agent/agents/claude_code/agent.py
++++ b/uni_agent/agents/claude_code/agent.py
+@@ -9,12 +9,18 @@ No proxy process.
+ """
+ 
+ from __future__ import annotations
++from uni_agent.timing import phase as timing_phase
+ 
++import asyncio
++import hashlib
+ import logging
++import os
++import shlex
+ import uuid
++from pathlib import Path, PurePosixPath
+ from typing import TYPE_CHECKING, Any
+ 
+-from pydantic import Field
++from pydantic import Field, model_validator
+ 
+ from ..base import Agent, AgentConfig, AgentResult
+ from ..registry import register_agent
+@@ -65,6 +71,42 @@ class ClaudeCodeConfig(AgentConfig):
+     """Black-box launch params for Claude Code (policy endpoint lives on :attr:`AgentConfig.model`)."""
+ 
+     name: str = "claude_code"
++    local_binary_path: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_LOCAL_BINARY") or None,
++        description="Native binary on the worker filesystem; uploaded instead of installing online.",
++    )
++    local_binary_sha256: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_LOCAL_BINARY_SHA256") or None,
++        pattern=r"^[0-9a-fA-F]{64}$",
++        description="Optional expected SHA-256 of the supplied native binary.",
++    )
++    nfs_source: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_NFS_SOURCE") or None,
++        pattern=r"^[A-Za-z0-9_.-]+:/[A-Za-z0-9_./-]+$",
++        description="Read-only guest NFS source; mutually exclusive with worker binary upload.",
++    )
++    nfs_mount_path: str = Field(
++        default_factory=lambda: os.getenv("CLAUDE_CODE_NFS_MOUNT_PATH", "/opt/claude-shared"),
++    )
++    nfs_relative_binary: str = Field(
++        default_factory=lambda: os.getenv("CLAUDE_CODE_NFS_RELATIVE_BINARY", "2.1.220/linux-arm64/claude"),
++    )
++    nfs_binary_sha256: str | None = Field(
++        default_factory=lambda: os.environ.get("CLAUDE_CODE_NFS_BINARY_SHA256") or None,
++        pattern=r"^[0-9a-fA-F]{64}$",
++    )
++
++    @model_validator(mode="after")
++    def validate_binary_source(self):
++        if self.nfs_source and self.local_binary_path:
++            raise ValueError("claude_code: choose either NFS or local binary upload")
++        mount, relative = PurePosixPath(self.nfs_mount_path), PurePosixPath(self.nfs_relative_binary)
++        if not mount.is_absolute() or mount == PurePosixPath("/") or ".." in mount.parts:
++            raise ValueError("claude_code: NFS mount must be a non-root absolute guest path")
++        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
++            raise ValueError("claude_code: NFS binary must be a relative path without '..'")
++        return self
++
+     max_turns: int | None = Field(default=80, description="--max-turns budget; None to omit.")
+     enable_web_tools: bool = Field(
+         default=False,
+@@ -125,16 +167,19 @@ class ClaudeCodeAgent(Agent):
+         ):
+             raise ValueError("claude_code system messages conflict with system prompt overrides in extra_args")
+ 
+-        await self._ensure_claude(sandbox)
+-        # Let the agent's git commands trust the repo even if it's owned by another uid.
+-        await sandbox.exec_shell("git config --system safe.directory '*' || true")
++        with timing_phase("sandbox_prepare"):
++            await self._ensure_claude(sandbox)
++            # Let the agent's git commands trust the repo even if it's owned by another uid.
++            await sandbox.exec_shell("git config --system safe.directory '*' || true")
+ 
+         # Point claude at the Anthropic endpoint (gateway session or vLLM) and run it.
+         endpoint = _strip_v1(base_url)
+         argv = self._claude_argv(user_prompt, system_prompt=system_prompt)
+         env = self._claude_env(endpoint)
+         logger.info("claude_code: launch with user_prompt:\n%s", user_prompt)
+-        proc = await sandbox.exec(argv, env=env, timeout=cfg.run_timeout, workdir=workdir)
++        with timing_phase("agent_execution") as execution:
++            proc = await sandbox.exec(argv, env=env, timeout=cfg.run_timeout, workdir=workdir)
++            execution.update(exit_code=proc.exit_code)
+ 
+         out_tail = (proc.stdout or "").strip()[-2000:]
+         err_tail = (proc.stderr or "").strip()[-2000:]
+@@ -155,6 +200,15 @@ class ClaudeCodeAgent(Agent):
+ 
+     # ----- helpers -----
+     async def _ensure_claude(self, sandbox: Sandbox) -> None:
++        cfg: ClaudeCodeConfig = self.config  # type: ignore[assignment]
++        if cfg.nfs_source:
++            await self._mount_claude(sandbox, cfg)
++            return
++        if cfg.local_binary_path:
++            with timing_phase("claude_upload"):
++                await self._upload_claude(sandbox, cfg)
++            return
++
+         if (await sandbox.exec_shell("command -v claude >/dev/null 2>&1")).exit_code == 0:
+             logger.info("claude_code: found existing claude on PATH; skipping installation")
+             return
+@@ -172,13 +226,93 @@ class ClaudeCodeAgent(Agent):
+             raise RuntimeError("claude_code: installation finished but claude is not available on PATH")
+         logger.info("claude_code: installation completed")
+ 
++    async def _mount_claude(self, sandbox: Sandbox, cfg: ClaudeCodeConfig) -> None:
++        """Use the guest's own host export; never upload or rewrite the shared executable."""
++        mount = shlex.quote(cfg.nfs_mount_path)
++        source = shlex.quote(cfg.nfs_source)
++        binary = shlex.quote(str(PurePosixPath(cfg.nfs_mount_path) / cfg.nfs_relative_binary))
++        script = f"""set -euo pipefail
++sudo -n mkdir -p -- {mount}
++if ! mountpoint -q -- {mount}; then
++  sudo -n timeout 30 mount -t nfs -o ro,vers=3,proto=tcp,nolock,nosuid,nodev {source} {mount}
++fi
++[ "$(findmnt -rn -o SOURCE --mountpoint {mount})" = {source} ]
++case ",$(findmnt -rn -o OPTIONS --mountpoint {mount})," in
++  *,ro,*) ;;
++  *) echo 'Claude NFS mount is not read-only' >&2; exit 1 ;;
++esac
++test -x {binary}
++"""
++        with timing_phase("claude_nfs_mount"):
++            result = await sandbox.exec_shell(script, timeout=45)
++            if result.exit_code != 0:
++                raise RuntimeError("claude_code: read-only NFS mount failed; check guest NFS support and host export")
++        check = f"test -x {binary}; "
++        if cfg.nfs_binary_sha256:
++            check += f"printf '%s  %s\n' {shlex.quote(cfg.nfs_binary_sha256.lower())} {binary} | sha256sum -c -; "
++        check += f"{binary} --version"
++        with timing_phase("claude_binary_check"):
++            result = await sandbox.exec_shell(
++                "set -euo pipefail; " + check, timeout=120,
++                env={"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
++            )
++            if result.exit_code != 0:
++                raise RuntimeError("claude_code: NFS binary checksum/version check failed")
++        self._private_home = f"/tmp/uni-agent-claude-{uuid.uuid4().hex}"
++        result = await sandbox.exec(["mkdir", "-m", "0700", "-p", self._private_home], timeout=30)
++        if result.exit_code != 0:
++            raise RuntimeError("claude_code: cannot create private guest home")
++
++    async def _upload_claude(self, sandbox: Sandbox, cfg: ClaudeCodeConfig) -> None:
++        assert cfg.local_binary_path is not None
++        source = Path(cfg.local_binary_path).expanduser()
++        if not source.is_absolute() or not source.is_file():
++            raise ValueError(
++                f"claude_code: local_binary_path must be an existing absolute file on this worker: {source}"
++            )
++
++        def checksum() -> str:
++            digest = hashlib.sha256()
++            with source.open("rb") as stream:
++                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++                    digest.update(chunk)
++            return digest.hexdigest()
++
++        digest = await asyncio.to_thread(checksum)
++        if cfg.local_binary_sha256 and digest != cfg.local_binary_sha256.lower():
++            raise ValueError(f"claude_code: local binary SHA-256 mismatch: {source}")
++        temporary = f"/usr/local/bin/.claude-upload-{uuid.uuid4().hex}"
++        logger.info("claude_code: uploading %s (sha256=%s)", source, digest)
++        try:
++            result = await sandbox.exec_shell("mkdir -p /usr/local/bin", timeout=30)
++            if result.exit_code != 0:
++                raise RuntimeError(f"claude_code: cannot prepare binary directory: {result.stderr}")
++            await sandbox.upload_file(source, temporary)
++            result = await sandbox.exec_shell(
++                f"set -e; printf '%s  %s\n' '{digest}' '{temporary}' | sha256sum -c -; "
++                f"chmod 0755 '{temporary}'; '{temporary}' --version; "
++                f"mv -f '{temporary}' /usr/local/bin/claude",
++                env={"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
++                timeout=60,
++            )
++            if result.exit_code != 0:
++                detail = (result.stderr or result.stdout or "unknown error").strip()[-2000:]
++                raise RuntimeError(f"claude_code: uploaded binary verification failed: {detail}")
++            logger.info("claude_code: uploaded binary ready: %s", result.stdout.strip())
++        finally:
++            try:
++                await sandbox.exec_shell(f"rm -f '{temporary}'", timeout=30)
++            except Exception:
++                logger.warning("claude_code: could not remove temporary upload %s", temporary, exc_info=True)
++
+     def _claude_argv(self, user_prompt: str, *, system_prompt: str | None = None) -> list[str]:
+         cfg: ClaudeCodeConfig = self.config  # type: ignore[assignment]
+         model = cfg.model.model_name
+         if not model:
+             raise ValueError("claude_code: set config.model.model_name (the model claude sends)")
+         argv = [
+-            "claude",
++            str(PurePosixPath(cfg.nfs_mount_path) / cfg.nfs_relative_binary) if cfg.nfs_source
++            else "/usr/local/bin/claude" if cfg.local_binary_path else "claude",
+             "-p",
+             user_prompt,
+             "--model",
+@@ -233,5 +367,12 @@ class ClaudeCodeAgent(Agent):
+         }
+         if cfg.enable_subagents:
+             env["CLAUDE_CODE_SUBAGENT_MODEL"] = model
++        if cfg.local_binary_path or cfg.nfs_source:
++            env["DISABLE_AUTOUPDATER"] = "1"
+         env.update(cfg.extra_env)
++        if cfg.nfs_source:
++            # These paths belong to this episode; the shared binary remains read-only.
++            env["HOME"] = self._private_home
++            env["CLAUDE_CONFIG_DIR"] = self._private_home + "/.claude"
++            env["DISABLE_AUTOUPDATER"] = "1"
+         return env
+diff --git a/uni_agent/framework/entry.py b/uni_agent/framework/entry.py
+index b94d6a0..800a05b 100644
+--- a/uni_agent/framework/entry.py
++++ b/uni_agent/framework/entry.py
+@@ -52,6 +52,8 @@ def build_gateway_manager(*, config, llm_client) -> GatewayManager:
+     model_config: HFModelConfig = omega_conf_to_dataclass(model_cfg)
+     gateway_actor_config = GatewayActorConfig(
+         tokenizer=model_config.tokenizer,
++        listen_port=af_cfg.get("gateway_listen_port", 0),
++        advertised_base_url=af_cfg.get("gateway_advertised_base_url"),
+         processor=model_config.processor,
+         tool_parser_name=rollout_config.multi_turn.format,
+         rollout_backend=rollout_config.name,
+diff --git a/uni_agent/framework/framework.py b/uni_agent/framework/framework.py
+index 7ec064e..b9471b5 100644
+--- a/uni_agent/framework/framework.py
++++ b/uni_agent/framework/framework.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++from uni_agent.timing import phase as timing_phase
+ 
+ import asyncio
+ import contextlib
+@@ -109,7 +110,7 @@ def _log_scope(log_context: LogContext | None):
+     return sample_logging.from_context(log_context)
+ 
+ 
+-@ray.remote
++@ray.remote(num_cpus=0.25)
+ def _run_agent_runner_ray_task(
+     *,
+     runner_fqn: str,
+@@ -121,16 +122,20 @@ def _run_agent_runner_ray_task(
+     log_context: LogContext | None,
+ ) -> TaskResult | None:
+     """Run only the user runner in Ray; parent owns session lifecycle outputs."""
+-    runner = _materialize_runner(runner_fqn, runner_kwargs)
+-    with _log_scope(log_context):
+-        return asyncio.run(
+-            runner(
+-                raw_prompt=raw_prompt,
+-                session=session,
+-                sample_index=sample_index,
+-                **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
++    with timing_phase(
++        "runner_execution", session_id=session.session_id, episode_id=session.session_id,
++        sample_index=sample_index, step=(tools_kwargs or {}).get("_timing_step"),
++    ):
++        runner = _materialize_runner(runner_fqn, runner_kwargs)
++        with _log_scope(log_context):
++            return asyncio.run(
++                runner(
++                    raw_prompt=raw_prompt,
++                    session=session,
++                    sample_index=sample_index,
++                    **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
++                )
+             )
+-        )
+ 
+ 
+ def _short_failure_reason(error: BaseException) -> str:
+@@ -770,185 +775,190 @@ class GatewayAgentFramework(AgentFramework):
+     ) -> tuple[list[Trajectory], dict[str, object]]:
+         """Run one AgentRunner episode inside a Framework-created Gateway session."""
+         session_id = f"session-sample-{sample_index}-rollout-{session_index}-{uuid4().hex}"
+-        uid = str(sample_fields.get("uid", ""))
+-        session_trace = agent_loop_session(
+-            sample=sample_index,
+-            session=session_index,
+-            uid=uid,
+-            global_steps=global_steps,
+-            session_id=session_id,
+-        )
+-        trace_identity = session_trace.identity
+-        if self._log_dir:
+-            log_root = Path(self._log_dir)
+-            run_dir = (log_root if global_steps is None else log_root / f"step_{int(global_steps)}") / session_id
+-            framework_log = LogContext(session_id, str(run_dir / "framework.log"))
+-            task_log = LogContext(session_id, str(run_dir / "task.log"))
+-            parent_log = framework_log if runner_config.dispatch_mode == "ray_task" else task_log
+-        else:
+-            run_dir = None
+-            framework_log = None
+-            task_log = None
+-            parent_log = None
+-
+-        raw_prompt = sample_fields["raw_prompt"]
+-        tools_kwargs = sample_fields.get("tools_kwargs")
+-        tools_kwargs = dict(tools_kwargs or {})
+-        tools_kwargs["_trace_identity"] = trace_identity
+-        async with _log_scope(parent_log):
+-            session = await self.gateway_manager.create_session(
+-                session_id,
+-                metadata={"_trace_identity": trace_identity},
+-                sampling_params=dict(sampling_params),
+-            )
+-            logger.info(
+-                "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
+-                session_id,
+-                runner_name,
+-                sample_index,
+-                session_index,
+-                global_steps,
++        with timing_phase(
++            "rollout_session", session_id=session_id, episode_id=session_id, sample_index=sample_index,
++            uid=str(sample_fields.get("uid", "")), step=global_steps
++        ):
++            uid = str(sample_fields.get("uid", ""))
++            session_trace = agent_loop_session(
++                sample=sample_index,
++                session=session_index,
++                uid=uid,
++                global_steps=global_steps,
++                session_id=session_id,
+             )
+-            try:
+-                if runner_config.dispatch_mode == "ray_task":
+-                    # Ray workers run only the runner. Gateway token truth,
+-                    # finalization, reward scoring, and TQ writes stay in parent.
+-                    object_ref = _run_agent_runner_ray_task.remote(
+-                        runner_fqn=runner_config.runner_fqn,
+-                        runner_kwargs=runner_config.runner_kwargs,
+-                        raw_prompt=raw_prompt,
+-                        session=session,
+-                        sample_index=sample_index,
+-                        tools_kwargs=tools_kwargs,
+-                        log_context=task_log,
+-                    )
+-                    # Guard against runners that hang without raising (e.g. a
+-                    # remote sandbox that OOM-killed the kernel and never returns).
+-                    # Without this cap a single stuck session would hold its
+-                    # concurrency slot forever and stall the whole training batch.
+-                    # wait_for only bounds the parent's await; the Ray task must
+-                    # be cancelled explicitly or it (and its sandbox) would keep
+-                    # running. Graceful cancel first so the runner's asyncio.run
+-                    # unwinds and its sandbox context manager tears down cleanly;
+-                    # force-kill only if it ignores the cancel.
+-                    try:
+-                        task_result = await asyncio.wait_for(
+-                            object_ref,
+-                            timeout=runner_config.session_timeout_seconds,
+-                        )
+-                    except (asyncio.TimeoutError, asyncio.CancelledError):
+-                        await self._cancel_runner_task(object_ref, session_id)
+-                        raise
+-                else:
+-                    runner = self._inline_runners[runner_name]
+-                    task_result = await runner(
+-                        raw_prompt=raw_prompt,
+-                        session=session,
+-                        sample_index=sample_index,
+-                        **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
+-                    )
+-                if task_result is None:
+-                    task_result = TaskResult()
+-                elif not isinstance(task_result, TaskResult):
+-                    raise TypeError(
+-                        f"Agent runner {runner_name!r} must return TaskResult or None, got {type(task_result).__name__}"
+-                    )
+-                session_trajectories = await self.gateway_manager.finalize_session(session_id)
+-                session_trajectories = _select_session_trajectories(
++            trace_identity = session_trace.identity
++            if self._log_dir:
++                log_root = Path(self._log_dir)
++                run_dir = (log_root if global_steps is None else log_root / f"step_{int(global_steps)}") / session_id
++                framework_log = LogContext(session_id, str(run_dir / "framework.log"))
++                task_log = LogContext(session_id, str(run_dir / "task.log"))
++                parent_log = framework_log if runner_config.dispatch_mode == "ray_task" else task_log
++            else:
++                run_dir = None
++                framework_log = None
++                task_log = None
++                parent_log = None
++
++            raw_prompt = sample_fields["raw_prompt"]
++            tools_kwargs = sample_fields.get("tools_kwargs")
++            tools_kwargs = dict(tools_kwargs or {})
++            tools_kwargs["_trace_identity"] = trace_identity
++            tools_kwargs["_timing_step"] = global_steps
++            async with _log_scope(parent_log):
++                session = await self.gateway_manager.create_session(
++                    session_id,
++                    metadata={"_trace_identity": trace_identity, "timing_step": global_steps},
++                    sampling_params=dict(sampling_params),
++                )
++                logger.info(
++                    "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
+                     session_id,
+-                    session_trajectories,
+-                    runner_config.trajectory_selection,
++                    runner_name,
++                    sample_index,
++                    session_index,
++                    global_steps,
+                 )
+-            except asyncio.CancelledError:
+-                # Parent shutdown/cancellation must not leave the Gateway route
+-                # and actor-owned session live after the runner task is gone.
+                 try:
+-                    await asyncio.shield(self.gateway_manager.abort_session(session_id))
++                    if runner_config.dispatch_mode == "ray_task":
++                        # Ray workers run only the runner. Gateway token truth,
++                        # finalization, reward scoring, and TQ writes stay in parent.
++                        object_ref = _run_agent_runner_ray_task.remote(
++                            runner_fqn=runner_config.runner_fqn,
++                            runner_kwargs=runner_config.runner_kwargs,
++                            raw_prompt=raw_prompt,
++                            session=session,
++                            sample_index=sample_index,
++                            tools_kwargs=tools_kwargs,
++                            log_context=task_log,
++                        )
++                        # Guard against runners that hang without raising (e.g. a
++                        # remote sandbox that OOM-killed the kernel and never returns).
++                        # Without this cap a single stuck session would hold its
++                        # concurrency slot forever and stall the whole training batch.
++                        # wait_for only bounds the parent's await; the Ray task must
++                        # be cancelled explicitly or it (and its sandbox) would keep
++                        # running. Graceful cancel first so the runner's asyncio.run
++                        # unwinds and its sandbox context manager tears down cleanly;
++                        # force-kill only if it ignores the cancel.
++                        try:
++                            task_result = await asyncio.wait_for(
++                                object_ref,
++                                timeout=runner_config.session_timeout_seconds,
++                            )
++                        except (asyncio.TimeoutError, asyncio.CancelledError):
++                            await self._cancel_runner_task(object_ref, session_id)
++                            raise
++                    else:
++                        runner = self._inline_runners[runner_name]
++                        task_result = await runner(
++                            raw_prompt=raw_prompt,
++                            session=session,
++                            sample_index=sample_index,
++                            **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
++                        )
++                    if task_result is None:
++                        task_result = TaskResult()
++                    elif not isinstance(task_result, TaskResult):
++                        raise TypeError(
++                            f"Agent runner {runner_name!r} must return TaskResult or None, got {type(task_result).__name__}"
++                        )
++                    session_trajectories = await self.gateway_manager.finalize_session(session_id)
++                    session_trajectories = _select_session_trajectories(
++                        session_id,
++                        session_trajectories,
++                        runner_config.trajectory_selection,
++                    )
++                except asyncio.CancelledError:
++                    # Parent shutdown/cancellation must not leave the Gateway route
++                    # and actor-owned session live after the runner task is gone.
++                    try:
++                        await asyncio.shield(self.gateway_manager.abort_session(session_id))
++                    except Exception:
++                        logger.exception("session %s: Gateway abort failed during parent cancellation", session_id)
++                    raise
+                 except Exception:
+-                    logger.exception("session %s: Gateway abort failed during parent cancellation", session_id)
+-                raise
+-            except Exception:
+-                logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
+-                await self.gateway_manager.abort_session(session_id)
+-                session_trace.finish(
+-                    runner_name=runner_name,
+-                    status="failure",
+-                    trajectories=[],
+-                )
+-                raise
+-
+-            # Make the Runner's canonical result visible to postprocessors before
+-            # they filter or reorder trajectories.  These fields are the
+-            # Framework-owned trajectory representation of the session result;
+-            # scorer metadata remains a separate Worker output channel.
+-            task_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
+-            if session_trajectories:
+-                session_trajectories = [
+-                    replace(
+-                        trajectory,
+-                        finished=task_result.finished,
+-                        reward_score=task_result.reward,
+-                        reward_metrics=dict(task_metrics),
++                    logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
++                    await self.gateway_manager.abort_session(session_id)
++                    session_trace.finish(
++                        runner_name=runner_name,
++                        status="failure",
++                        trajectories=[],
+                     )
+-                    for trajectory in session_trajectories
+-                ]
+-
+-            if self._trajectory_postprocessor is not None:
+-                session_trajectories = await self._apply_trajectory_postprocessor(session_trajectories, task_result)
++                    raise
++
++                # Make the Runner's canonical result visible to postprocessors before
++                # they filter or reorder trajectories.  These fields are the
++                # Framework-owned trajectory representation of the session result;
++                # scorer metadata remains a separate Worker output channel.
++                task_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
++                if session_trajectories:
++                    session_trajectories = [
++                        replace(
++                            trajectory,
++                            finished=task_result.finished,
++                            reward_score=task_result.reward,
++                            reward_metrics=dict(task_metrics),
++                        )
++                        for trajectory in session_trajectories
++                    ]
+ 
+-            if not session_trajectories:
+-                session_trace.finish(
+-                    runner_name=runner_name,
+-                    status="empty",
+-                    trajectories=[],
+-                )
+-                return session_trajectories, sample_fields
++                if self._trajectory_postprocessor is not None:
++                    session_trajectories = await self._apply_trajectory_postprocessor(session_trajectories, task_result)
+ 
+-            if self.reward_loop_worker_handles and self._custom_reward_function_configured:
+-                annotations = await self._score_trajectories(
+-                    session_trajectories,
+-                    sample_fields,
+-                    task_result,
+-                )
+-                reward_source = "reward_loop_worker"
+-            elif task_result.reward is not None:
+-                annotations = [(float(task_result.reward), {}) for _ in session_trajectories]
+-                reward_source = "agent_runner"
+-            elif self.reward_loop_worker_handles:
+-                annotations = await self._score_trajectories(session_trajectories, sample_fields, task_result)
+-                reward_source = "reward_loop_worker"
+-            else:
+-                annotations = None
+-                reward_source = None
++                if not session_trajectories:
++                    session_trace.finish(
++                        runner_name=runner_name,
++                        status="empty",
++                        trajectories=[],
++                    )
++                    return session_trajectories, sample_fields
+ 
+-            if annotations is None:
+-                logger.info("session %s: Framework produced no reward; rm_scores remain zero", session_id)
+-                result_trajectories = session_trajectories
+-            else:
+-                logger.info("session %s: scored via %s", session_id, reward_source)
+-                result_trajectories = [
+-                    replace(
+-                        traj,
+-                        finished=task_result.finished,
+-                        reward_score=score,
+-                        reward_metrics=extra if reward_source == "reward_loop_worker" else dict(task_metrics),
++                if self.reward_loop_worker_handles and self._custom_reward_function_configured:
++                    annotations = await self._score_trajectories(
++                        session_trajectories,
++                        sample_fields,
++                        task_result,
+                     )
+-                    for traj, (score, extra) in zip(session_trajectories, annotations, strict=True)
+-                ]
++                    reward_source = "reward_loop_worker"
++                elif task_result.reward is not None:
++                    annotations = [(float(task_result.reward), {}) for _ in session_trajectories]
++                    reward_source = "agent_runner"
++                elif self.reward_loop_worker_handles:
++                    annotations = await self._score_trajectories(session_trajectories, sample_fields, task_result)
++                    reward_source = "reward_loop_worker"
++                else:
++                    annotations = None
++                    reward_source = None
++
++                if annotations is None:
++                    logger.info("session %s: Framework produced no reward; rm_scores remain zero", session_id)
++                    result_trajectories = session_trajectories
++                else:
++                    logger.info("session %s: scored via %s", session_id, reward_source)
++                    result_trajectories = [
++                        replace(
++                            traj,
++                            finished=task_result.finished,
++                            reward_score=score,
++                            reward_metrics=extra if reward_source == "reward_loop_worker" else dict(task_metrics),
++                        )
++                        for traj, (score, extra) in zip(session_trajectories, annotations, strict=True)
++                    ]
+ 
+-            result_trajectories = _attach_runner_reward_info(result_trajectories, task_result)
++                result_trajectories = _attach_runner_reward_info(result_trajectories, task_result)
+ 
+-            self._log_trajectory_summary(session_id, result_trajectories)
+-            if run_dir is not None:
+-                await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
+-            session_trace.finish(
+-                runner_name=runner_name,
+-                status="success",
+-                trajectories=result_trajectories,
+-                reward_source=reward_source,
+-                finished=result_trajectories[0].finished if result_trajectories else None,
+-            )
+-            return result_trajectories, sample_fields
++                self._log_trajectory_summary(session_id, result_trajectories)
++                if run_dir is not None:
++                    await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
++                session_trace.finish(
++                    runner_name=runner_name,
++                    status="success",
++                    trajectories=result_trajectories,
++                    reward_source=reward_source,
++                    finished=result_trajectories[0].finished if result_trajectories else None,
++                )
++                return result_trajectories, sample_fields
+ 
+     async def _cancel_runner_task(self, object_ref, session_id: str) -> None:
+         """Cancel a dispatched runner Ray task after its session timed out.
+diff --git a/uni_agent/framework/task_runner.py b/uni_agent/framework/task_runner.py
+index c2b0e59..0c25fbb 100644
+--- a/uni_agent/framework/task_runner.py
++++ b/uni_agent/framework/task_runner.py
+@@ -7,6 +7,7 @@ import logging
+ from typing import TYPE_CHECKING, Any
+ from urllib.parse import urlparse
+ 
++from uni_agent.timing import phase as timing_phase
+ from uni_agent.rl_insight.adapter import task_span
+ from uni_agent.tasks import TaskConfigResolver, TaskResult, get_task
+ from uni_agent.tasks.config import _deep_merge
+@@ -148,7 +149,10 @@ async def run_task(
+     logger.info("run_task start: task=%s sample_index=%s", task_name, sample_index)
+ 
+     prompt = task.get("prompt", [])
+-    with task_span(tools_kwargs, task_name=task_name, prompt=prompt) as span:
++    with timing_phase(
++        "task_execution", session_id=session.session_id, episode_id=session.session_id,
++        sample_index=sample_index, step=(tools_kwargs or {}).get("_timing_step"),
++    ), task_span(tools_kwargs, task_name=task_name, prompt=prompt) as span:
+         task_instance = get_task(task)
+         result = await task_instance.run()
+         span.record_result(result, reward_posted=False)
+diff --git a/uni_agent/gateway/__init__.py b/uni_agent/gateway/__init__.py
+index 291123a..6108f8c 100644
+--- a/uni_agent/gateway/__init__.py
++++ b/uni_agent/gateway/__init__.py
+@@ -1,7 +1,13 @@
+-from .gateway import GatewayActor
+-from .manager import GatewayManager
++"""Gateway exports, loaded lazily so relay supervision stays stdlib-only."""
++from importlib import import_module
+ 
+-__all__ = [
+-    "GatewayActor",
+-    "GatewayManager",
+-]
++__all__ = ["GatewayActor", "GatewayManager"]
++
++
++def __getattr__(name):
++    modules = {"GatewayActor": ".gateway", "GatewayManager": ".manager"}
++    if name not in modules:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    value = getattr(import_module(modules[name], __name__), name)
++    globals()[name] = value
++    return value
+diff --git a/uni_agent/gateway/callback_tunnel.py b/uni_agent/gateway/callback_tunnel.py
+new file mode 100644
+index 0000000..71cdd6e
+--- /dev/null
++++ b/uni_agent/gateway/callback_tunnel.py
+@@ -0,0 +1,226 @@
++"""Per-gateway SSH callback relays, supervised through a parent-owned pipe.
++
++The supervisor has no Ray/torch dependencies. EOF on its stdin releases only
++its own SSH masters, including when the training driver is killed.
++"""
++from __future__ import annotations
++
++import atexit
++import ipaddress
++import json
++import logging
++import os
++import re
++import selectors
++import signal
++import subprocess
++import sys
++import tempfile
++from dataclasses import dataclass
++from pathlib import Path
++from urllib.parse import urlsplit, urlunsplit
++
++logger = logging.getLogger(__name__)
++
++
++def port(value: int) -> int:
++    if type(value) is not int or not 1 <= value <= 65535:
++        raise ValueError("Callback ports must be integers in 1..65535")
++    return value
++
++
++@dataclass(frozen=True)
++class CallbackRelayConfig:
++    ssh_target: str
++    ssh_port: int
++    relay_port: int
++    advertised_base_url: str
++
++    def __post_init__(self):
++        if not self.ssh_target or self.ssh_target.startswith("-") or any(c.isspace() for c in self.ssh_target):
++            raise ValueError("Invalid callback SSH target")
++        port(self.ssh_port)
++        port(self.relay_port)
++        url = urlsplit(self.advertised_base_url)
++        if (url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password
++                or url.path not in {"", "/"} or url.query or url.fragment):
++            raise ValueError("Callback advertised URL must be an HTTP(S) origin")
++        port(url.port if url.port is not None else (443 if url.scheme == "https" else 80))
++
++    @classmethod
++    def from_environment(cls):
++        enabled = os.environ.get("CALLBACK_TUNNEL_ENABLED", "false")
++        if enabled not in {"true", "false"}:
++            raise ValueError("CALLBACK_TUNNEL_ENABLED must be true or false")
++        if enabled == "false":
++            return None
++        return cls(
++            ssh_target=os.environ["CALLBACK_RELAY_SSH_TARGET"],
++            ssh_port=int(os.environ.get("CALLBACK_RELAY_SSH_PORT", "22222")),
++            relay_port=int(os.environ["CALLBACK_RELAY_PORT"]),
++            advertised_base_url=os.environ["CALLBACK_ADVERTISED_BASE_URL"],
++        )
++
++    def routes(self, count: int) -> list[dict]:
++        if type(count) is not int or count <= 0:
++            raise ValueError("gateway_count must be a positive integer")
++        url = urlsplit(self.advertised_base_url)
++        first_port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
++        port(first_port + count - 1)
++        port(self.relay_port + count - 1)
++        host = f"[{url.hostname}]" if ":" in url.hostname else url.hostname
++        return [
++            {"index": i, "relay_port": self.relay_port + i,
++             "advertised_base_url": urlunsplit((url.scheme, f"{host}:{first_port + i}", "", "", ""))}
++            for i in range(count)
++        ]
++
++
++def _forwarding_host(host: str) -> str:
++    """Format a literal IP or validated DNS name; SSH resolves names on the training client."""
++    if not isinstance(host, str) or not host or not host.isascii() or any(c.isspace() for c in host):
++        raise ValueError("Callback host must be an IP address or valid ASCII DNS hostname")
++    try:
++        address = ipaddress.ip_address(host)
++    except ValueError:
++        # Ray may return a platform FQDN. Preserve it, including an optional DNS root dot.
++        name = host[:-1] if host.endswith(".") else host
++        if not name or len(name) > 253 or any(
++            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
++            for label in name.split(".")
++        ):
++            raise ValueError("Callback host must be an IP address or valid ASCII DNS hostname") from None
++        return host
++    scope = getattr(address, "scope_id", None)
++    if scope is not None and re.fullmatch(r"[A-Za-z0-9_.-]+", scope) is None:
++        raise ValueError("Invalid callback IPv6 scope identifier")
++    return f"[{address}]" if address.version == 6 else str(address)
++
++
++def forwarding_spec(route: dict) -> str:
++    host = _forwarding_host(route["host"])
++    return f"127.0.0.1:{port(route['relay_port'])}:{host}:{port(route['port'])}"
++
++
++class CallbackTunnelPool:
++    """Own a supervisor; completion of start() is the relay readiness barrier."""
++
++    def __init__(self, config: CallbackRelayConfig, routes: list[dict]):
++        self.config = config
++        self.routes = routes
++        self.process = None
++
++    def start(self):
++        for route in self.routes:
++            forwarding_spec(route)
++        self.process = subprocess.Popen(
++            [sys.executable, "-m", "uni_agent.gateway.callback_tunnel", "--supervise"],
++            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
++            start_new_session=True,
++        )
++        atexit.register(self.close)
++        try:
++            payload = {"ssh_target": self.config.ssh_target, "ssh_port": self.config.ssh_port,
++                       "routes": self.routes}
++            self.process.stdin.write(json.dumps(payload) + "\n")
++            self.process.stdin.flush()
++            with selectors.DefaultSelector() as selector:
++                selector.register(self.process.stdout, selectors.EVENT_READ)
++                if not selector.select(timeout=45 * len(self.routes) + 10):
++                    raise RuntimeError("Timed out starting gateway callback relays")
++            if self.process.stdout.readline().strip() != "ready":
++                raise RuntimeError("Gateway callback relay startup failed; inspect SSH stderr")
++            self.check()
++            for route in self.routes:
++                logger.info("Callback gateway %s: %s -> relay 127.0.0.1:%s -> %s:%s",
++                            route["index"], route["advertised_base_url"], route["relay_port"],
++                            route["host"], route["port"])
++        except BaseException:
++            self.close()
++            raise
++
++    def check(self):
++        if self.process is None or self.process.poll() is not None:
++            raise RuntimeError("Gateway callback relay supervisor is not running")
++
++    def close(self):
++        process, self.process = self.process, None
++        if process is None:
++            return
++        atexit.unregister(self.close)
++        try:
++            process.stdin.close()
++            process.wait(timeout=10 + 6 * len(self.routes))
++        except (OSError, subprocess.TimeoutExpired):
++            process.terminate()
++            try:
++                process.wait(timeout=10 + 6 * len(self.routes))
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait()
++        finally:
++            process.stdout.close()
++
++
++def _supervise():
++    def interrupted(signum, frame):
++        raise SystemExit(128 + signum)
++
++    signal.signal(signal.SIGTERM, interrupted)
++    signal.signal(signal.SIGINT, interrupted)
++    payload = json.loads(sys.stdin.readline())
++    target = payload["ssh_target"]
++    ssh_port = port(payload["ssh_port"])
++    controls = []
++    # A short path avoids AF_UNIX's socket-name limit, and stays in the user mount.
++    user_root = Path(os.environ.get("CALLBACK_CONTROL_ROOT", str(Path.home()))).resolve()
++    with tempfile.TemporaryDirectory(prefix=".cb-", dir=user_root) as directory:
++        try:
++            for i, route in enumerate(payload["routes"]):
++                control = str(Path(directory) / str(i))
++                if len(control.encode()) >= 100:
++                    raise ValueError("Callback SSH control path is too long")
++                controls.append(control)
++                env = os.environ.copy()
++                password = env.pop("CALLBACK_SSH_PASSWORD", "")
++                auth = ["sshpass", "-e"] if password else []
++                if password:
++                    env["SSHPASS"] = password
++                subprocess.run(
++                    [*auth, "ssh", "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes",
++                     "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
++                     "-o", "ConnectTimeout=15", "-o", "ControlPersist=no",
++                     "-M", "-S", control, "-f", "-N", "-T", "-p", str(ssh_port),
++                     "-R", forwarding_spec(route), target],
++                    env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True, timeout=40,
++                )
++                subprocess.run(["ssh", "-S", control, "-O", "check", target],
++                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True, timeout=5)
++            print("ready", flush=True)
++            # select() checks the pipe without buffering away EOF. Periodically
++            # detect dead masters so subsequent session creation fails promptly.
++            with selectors.DefaultSelector() as selector:
++                selector.register(sys.stdin, selectors.EVENT_READ)
++                while not selector.select(timeout=10):
++                    for control in controls:
++                        subprocess.run(["ssh", "-S", control, "-O", "check", target],
++                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                                       stderr=subprocess.DEVNULL, check=True, timeout=5)
++        finally:
++            for control in reversed(controls):
++                try:
++                    subprocess.run(["ssh", "-S", control, "-O", "exit", target],
++                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                                   stderr=subprocess.DEVNULL, timeout=5, check=False)
++                except (OSError, subprocess.TimeoutExpired):
++                    logger.warning("Could not close callback control socket %s", control)
++
++
++if __name__ == "__main__":
++    if sys.argv[1:] != ["--supervise"]:
++        raise SystemExit("This module is started by GatewayManager; do not launch fixed callback tunnels")
++    try:
++        _supervise()
++    except (OSError, ValueError, subprocess.SubprocessError) as exc:
++        print(f"Callback relay supervisor failed: {type(exc).__name__}", file=sys.stderr)
++        raise SystemExit(1) from None
+diff --git a/uni_agent/gateway/config.py b/uni_agent/gateway/config.py
+index b82faeb..ed28e91 100644
+--- a/uni_agent/gateway/config.py
++++ b/uni_agent/gateway/config.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from typing import Any
++from urllib.parse import urlsplit
+ 
+ 
+ @dataclass(frozen=True)
+@@ -18,6 +19,8 @@ class GatewayActorConfig:
+ 
+     Attributes:
+         tokenizer: Tokenizer used by the message codec.
++        listen_port: HTTP bind port; zero keeps automatic allocation.
++        advertised_base_url: External HTTP origin; session paths are appended at runtime.
+         processor: Optional multimodal processor used for vision requests.
+         tool_parser_name: Optional tool parser name for decoding tool calls.
+         rollout_backend: Inference backend name used to select the matching
+@@ -61,8 +64,19 @@ class GatewayActorConfig:
+     response_length: int | None = None
+     enable_last_assistant_rollback: bool = True
+     coalesce_reserved_exact_requests: bool = True
++    listen_port: int = 0
++    advertised_base_url: str | None = None
+ 
+     def __post_init__(self) -> None:
++        if type(self.listen_port) is not int or not 0 <= self.listen_port <= 65535:
++            raise ValueError("listen_port must be an integer between 0 and 65535")
++        if self.advertised_base_url is not None:
++            url = urlsplit(self.advertised_base_url)
++            if (url.scheme not in {"http", "https"} or not url.hostname
++                    or url.username or url.password or url.query or url.fragment
++                    or url.path not in {"", "/"}):
++                raise ValueError("advertised_base_url must be an HTTP(S) origin without a path or credentials")
++            _ = url.port  # Validate port syntax and range.
+         if type(self.enable_tool_parser_cache) is not bool:
+             raise ValueError(
+                 f"enable_tool_parser_cache must be a bool, got {type(self.enable_tool_parser_cache).__name__}"
+diff --git a/uni_agent/gateway/gateway.py b/uni_agent/gateway/gateway.py
+index 5c0c107..701770c 100644
+--- a/uni_agent/gateway/gateway.py
++++ b/uni_agent/gateway/gateway.py
+@@ -29,6 +29,7 @@ from uni_agent.gateway.adapters.openai import (
+ )
+ from uni_agent.gateway.adapters.types import AnthropicRequest, MalformedRequestError, OpenAIChatCompletionRequest
+ from uni_agent.gateway.config import GatewayActorConfig
++from uni_agent.gateway.http_server import run_fixed_port_server
+ from uni_agent.gateway.session import (
+     GatewaySession,
+     MessageCodec,
+@@ -63,6 +64,8 @@ class _GatewayActor:
+     def __init__(self, config: GatewayActorConfig, backend):
+         """Create an actor with model codec configuration and backend client."""
+         self._server_address = ray.util.get_node_ip_address().strip("[]")
++        self._listen_port = config.listen_port
++        self._advertised_base_url = config.advertised_base_url
+         self._backend = backend
+         self._codec = MessageCodec(
+             tokenizer=config.tokenizer,
+@@ -232,9 +235,24 @@ class _GatewayActor:
+         """Start the FastAPI server backing this gateway actor."""
+         if self._server_task is not None:
+             return
+-        self._server_port, self._server_task = await run_uvicorn(self._app, None, self._server_address)
++        if self._listen_port:
++            self._server_port, self._server_task = await run_fixed_port_server(
++                self._app, self._server_address, self._listen_port
++            )
++        else:
++            self._server_port, self._server_task = await run_uvicorn(self._app, None, self._server_address)
+         host = f"[{self._server_address}]" if is_valid_ipv6_address(self._server_address) else self._server_address
+-        self._server_base_url = f"http://{host}:{self._server_port}"
++        self._server_base_url = (
++            self._advertised_base_url.rstrip("/")
++            if self._advertised_base_url else f"http://{host}:{self._server_port}"
++        )
++        logger.info("Gateway listening on %s:%s; advertised origin %s",
++                    self._server_address, self._server_port, self._server_base_url)
++
++    async def get_listener_address(self) -> dict[str, str | int]:
++        """Return the actual internal listener, independent of advertised URLs."""
++        self._require_started()
++        return {"host": self._server_address, "port": self._server_port}
+ 
+     async def shutdown(self) -> None:
+         """Stop the FastAPI server backing this gateway actor."""
+diff --git a/uni_agent/gateway/http_server.py b/uni_agent/gateway/http_server.py
+new file mode 100644
+index 0000000..cc483cd
+--- /dev/null
++++ b/uni_agent/gateway/http_server.py
+@@ -0,0 +1,43 @@
++"""HTTP listener for a gateway exposed through a fixed-port SSH tunnel."""
++from __future__ import annotations
++
++import asyncio
++import socket
++
++import uvicorn
++
++
++async def run_fixed_port_server(app, address: str, port: int) -> tuple[int, asyncio.Task]:
++    # Bind before spawning uvicorn so a port conflict raises OSError here instead
++    # of SystemExit in an asynchronous server task.
++    family = socket.AF_INET6 if ":" in address else socket.AF_INET
++    sock = socket.create_server((address, port), family=family)
++    sock.setblocking(False)
++    server = uvicorn.Server(uvicorn.Config(
++        app, host=address, port=port, log_level="warning", timeout_graceful_shutdown=5
++    ))
++
++    async def serve():
++        try:
++            await server.serve(sockets=[sock])
++        except asyncio.CancelledError:
++            if server.started:
++                await server.shutdown(sockets=[sock])
++            raise
++        finally:
++            sock.close()
++
++    task = asyncio.create_task(serve())
++    try:
++        async with asyncio.timeout(30):
++            while not server.started:
++                if task.done():
++                    await task
++                    raise RuntimeError("Gateway HTTP server exited before startup")
++                await asyncio.sleep(0.01)
++    except BaseException:
++        task.cancel()
++        await asyncio.gather(task, return_exceptions=True)
++        sock.close()
++        raise
++    return port, task
+diff --git a/uni_agent/gateway/manager.py b/uni_agent/gateway/manager.py
+index b96f722..9352c79 100644
+--- a/uni_agent/gateway/manager.py
++++ b/uni_agent/gateway/manager.py
+@@ -8,9 +8,11 @@ forward to the right actor through Ray remote methods.
+ from __future__ import annotations
+ 
+ import asyncio
++from dataclasses import replace
+ 
+ import ray
+ 
++from uni_agent.gateway.callback_tunnel import CallbackRelayConfig, CallbackTunnelPool
+ from uni_agent.gateway.config import GatewayActorConfig
+ from verl.workers.rollout.llm_server import LLMServerClient
+ 
+@@ -34,6 +36,16 @@ class GatewayManager:
+         if gateway_actor_config is None:
+             raise ValueError("gateway_actor_config is required when gateway_count > 0")
+ 
++        relay_config = CallbackRelayConfig.from_environment()
++        relay_routes = relay_config.routes(gateway_count) if relay_config else None
++        if not relay_config and gateway_actor_config.advertised_base_url and gateway_count != 1:
++            raise ValueError("Multiple advertised gateway URLs require callback relay mode")
++        if relay_routes:
++            actor_configs = [replace(gateway_actor_config, listen_port=0,
++                                     advertised_base_url=route["advertised_base_url"]) for route in relay_routes]
++        else:
++            actor_configs = [gateway_actor_config] * gateway_count
++
+         from uni_agent.gateway.gateway import GatewayActor
+ 
+         # Round-robin across alive CPU nodes so gateway actors do not all pack onto
+@@ -43,20 +55,41 @@ class GatewayManager:
+         if not node_ids:
+             raise RuntimeError("No alive CPU nodes available for GatewayActor placement")
+ 
+-        self.gateways = [
+-            GatewayActor.options(
+-                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+-                    node_id=node_ids[i % len(node_ids)],
+-                    soft=True,
+-                ),
+-            ).remote(gateway_actor_config, backend=llm_client)
+-            for i in range(gateway_count)
+-        ]
+-        ray.get([gateway.start.remote() for gateway in self.gateways])
++        self.gateways = []
++        self._callback_tunnels = None
++        try:
++            for i, actor_config in enumerate(actor_configs):
++                self.gateways.append(GatewayActor.options(
++                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
++                        node_id=node_ids[i % len(node_ids)], soft=True,
++                    ),
++                ).remote(actor_config, backend=llm_client))
++            ray.get([gateway.start.remote() for gateway in self.gateways])
++            if relay_routes:
++                endpoints = ray.get([gateway.get_listener_address.remote() for gateway in self.gateways])
++                routes = [{**route, **endpoint} for route, endpoint in zip(relay_routes, endpoints, strict=True)]
++                self._callback_tunnels = CallbackTunnelPool(relay_config, routes)
++                self._callback_tunnels.start()
++        except BaseException:
++            if self._callback_tunnels is not None:
++                self._callback_tunnels.close()
++            for gateway in self.gateways:
++                try:
++                    ray.kill(gateway, no_restart=True)
++                except Exception:
++                    pass
++            raise
+         self.gateway_count = len(self.gateways)
+         self.active_sessions_per_gateway = [0 for _ in self.gateways]
+         self._session_to_gateway_index: dict[str, int] = {}
+ 
++    def __getstate__(self):
++        # AgentFrameworkWorker receives a copy through Ray. SSH ownership stays
++        # in the training driver; Popen handles must never cross that boundary.
++        state = self.__dict__.copy()
++        state["_callback_tunnels"] = None
++        return state
++
+     def _select_gateway_index(self) -> int:
+         if not self.gateways:
+             raise RuntimeError("No gateway actors configured")
+@@ -74,6 +107,9 @@ class GatewayManager:
+ 
+     async def create_session(self, session_id: str, **kwargs):
+         """Create a session on the least-loaded actor, record the route, and return its handle."""
++        tunnels = getattr(self, "_callback_tunnels", None)
++        if tunnels is not None:
++            tunnels.check()
+         gateway_index = self._select_gateway_index()
+         gateway = self.gateways[gateway_index]
+         # Reserve the slot synchronously, before the await. Sessions are created
+@@ -108,9 +144,16 @@ class GatewayManager:
+ 
+     async def shutdown(self) -> None:
+         """Stop owned gateway actors and clear routing state."""
+-        if self.gateways:
+-            await asyncio.gather(*(gateway.shutdown.remote() for gateway in self.gateways))
+-        self.gateways = []
+-        self.gateway_count = 0
+-        self.active_sessions_per_gateway = []
+-        self._session_to_gateway_index = {}
++        try:
++            if self.gateways:
++                await asyncio.gather(*(gateway.shutdown.remote() for gateway in self.gateways))
++        finally:
++            tunnels = getattr(self, "_callback_tunnels", None)
++            if tunnels is not None:
++                tunnels.close()
++            for gateway in self.gateways:
++                ray.kill(gateway, no_restart=True)
++            self.gateways = []
++            self.gateway_count = 0
++            self.active_sessions_per_gateway = []
++            self._session_to_gateway_index = {}
+diff --git a/uni_agent/gateway/session/session.py b/uni_agent/gateway/session/session.py
+index bd9e1a4..b5cad6e 100644
+--- a/uni_agent/gateway/session/session.py
++++ b/uni_agent/gateway/session/session.py
+@@ -1,12 +1,14 @@
+ """Per-session gateway state, generation envelope, and lifecycle handling."""
+ 
+ from __future__ import annotations
++from uni_agent.timing import phase as timing_phase
+ 
+ import asyncio
+ import hashlib
+ import json
+ import logging
+ import time
++import uuid
+ from dataclasses import dataclass, field, replace
+ from enum import Enum
+ from typing import Any
+@@ -343,14 +345,18 @@ class GatewaySession:
+                 raise RuntimeError("generation input preparation did not produce a request")
+ 
+             try:
+-                output = await backend.generate(
+-                    request_id=self.handle.session_id,
+-                    prompt_ids=encoded.context_ids,
+-                    sampling_params=encoded.sampling_params,
+-                    image_data=encoded.image_data,
+-                    video_data=encoded.video_data,
+-                    mm_processor_kwargs=encoded.mm_processor_kwargs,
+-                )
++                with timing_phase(
++                    "llm_service", session_id=self.handle.session_id, episode_id=self.handle.session_id,
++                    request_id=uuid.uuid4().hex, step=self._metadata.get("timing_step"),
++                ):
++                    output = await backend.generate(
++                        request_id=self.handle.session_id,
++                        prompt_ids=encoded.context_ids,
++                        sampling_params=encoded.sampling_params,
++                        image_data=encoded.image_data,
++                        video_data=encoded.video_data,
++                        mm_processor_kwargs=encoded.mm_processor_kwargs,
++                    )
+             except ValueError as e:
+                 raise HTTPException(status_code=400, detail=str(e)) from e
+             except Exception as e:
+diff --git a/uni_agent/sandbox/base.py b/uni_agent/sandbox/base.py
+index 6984c59..982e5c0 100644
+--- a/uni_agent/sandbox/base.py
++++ b/uni_agent/sandbox/base.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++from uni_agent.timing import phase as timing_phase
+ 
+ import abc
+ import asyncio
+@@ -284,8 +285,12 @@ async def _startup_slot() -> AsyncIterator[None]:
+     if entry is None or entry[0] != limit:  # (re)build on first use or when the env-driven limit changes
+         entry = (limit, asyncio.Semaphore(limit))
+         _startup_semaphores[loop] = entry
+-    async with entry[1]:
++    with timing_phase("sandbox_startup_wait"):
++        await entry[1].acquire()
++    try:
+         yield
++    finally:
++        entry[1].release()
+ 
+ 
+ async def _stop_after_failed_start(sandbox: Sandbox) -> None:
+@@ -412,6 +417,14 @@ class Sandbox(abc.ABC):
+             if same_file.exit_code != 0:
+                 raise RuntimeError(f"executable {name!r} resolves to {actual!r}, not configured source {source!r}")
+ 
++    @property
++    def timing_metadata(self) -> dict[str, Any]:
++        return {
++            "provider": self.provider,
++            "sandbox_attempt_id": getattr(self, "_timing_attempt_id", None),
++            "attempt": getattr(self, "_timing_attempt", None),
++        }
++
+     async def _run_start(self) -> None:
+         """Run :meth:`start`, bounding it by the ``SANDBOX_STARTUP_TIMEOUT`` env cap (``<=0`` disables)."""
+         timeout = _env_number("SANDBOX_STARTUP_TIMEOUT", _DEFAULT_STARTUP_TIMEOUT)
+@@ -429,32 +442,40 @@ class Sandbox(abc.ABC):
+         ``CancelledError`` is a ``BaseException`` on Python 3.10+, and a cancelled
+         enter must still ``stop()`` or the partial sandbox leaks.
+         """
+-        retry = max(1, retry)
+-        last_exc: BaseException | None = None
+-        for attempt in range(1, retry + 1):
+-            try:
+-                async with _startup_slot():
+-                    await self._run_start()
+-                return self
+-            except Exception as exc:
+-                last_exc = exc
+-                await _stop_after_failed_start_shielded(self)
+-            except BaseException:
+-                # Not retried. async with skips __aexit__ when enter itself
+-                # is cancelled, so stop() here is what releases a container
+-                # start() already created. Shield it so a second cancel
+-                # cannot abandon that teardown.
+-                await _stop_after_failed_start_shielded(self)
+-                raise
+-            logger.warning("sandbox failed to start (attempt %d/%d): %r", attempt, retry, last_exc)
+-            if attempt < retry:
+-                await asyncio.sleep(2 * attempt)
+-        assert last_exc is not None
+-        logger.error("sandbox failed to start after %d attempts: %r", retry, last_exc)
+-        raise last_exc
++        with timing_phase("sandbox_create", provider=self.provider):
++            retry = max(1, retry)
++            last_exc: BaseException | None = None
++            for attempt in range(1, retry + 1):
++                self._timing_attempt_id = uuid.uuid4().hex
++                self._timing_attempt = attempt
++                try:
++                    with timing_phase("sandbox_start_attempt", **self.timing_metadata):
++                        async with _startup_slot():
++                            await self._run_start()
++                    return self
++                except Exception as exc:
++                    last_exc = exc
++                    await _stop_after_failed_start_shielded(self)
++                except BaseException:
++                    # Not retried. async with skips __aexit__ when enter itself
++                    # is cancelled, so stop() here is what releases a container
++                    # start() already created. Shield it so a second cancel
++                    # cannot abandon that teardown.
++                    await _stop_after_failed_start_shielded(self)
++                    raise
++                logger.warning("sandbox failed to start (attempt %d/%d): %r", attempt, retry, last_exc)
++                if attempt < retry:
++                    with timing_phase("sandbox_retry_backoff", **self.timing_metadata):
++                        await asyncio.sleep(2 * attempt)
++            assert last_exc is not None
++            logger.error("sandbox failed to start after %d attempts: %r", retry, last_exc)
++            raise last_exc
+ 
+     async def __aexit__(self, *exc) -> None:
+-        await self.stop()
++        # E2B records cleanup at the actual delete operation, including early aborts.
++        name = "sandbox_exit" if self.provider == "e2b" else "sandbox_cleanup"
++        with timing_phase(name, **self.timing_metadata):
++            await self.stop()
+ 
+     @asynccontextmanager
+     async def entered(self, **start_kwargs: Any) -> AsyncIterator[Sandbox]:
+@@ -486,14 +507,15 @@ class Sandbox(abc.ABC):
+         env: dict[str, str] | None = None,
+     ) -> ExecResult:
+         """Run ``argv`` once and return its captured result (no implicit shell)."""
+-        try:
+-            return await self._exec(argv, timeout=timeout, workdir=workdir, env=env)
+-        except Exception as exc:
+-            if self._is_timeout_error(exc):
+-                return ExecResult(exit_code=-1, stdout="", stderr=f"exec timed out after {timeout}s: {exc}")
+-            if not await self.is_alive():
+-                raise
+-            return ExecResult(exit_code=127, stdout="", stderr=str(exc))
++        with timing_phase("sandbox_command", provider=self.provider):
++            try:
++                return await self._exec(argv, timeout=timeout, workdir=workdir, env=env)
++            except Exception as exc:
++                if self._is_timeout_error(exc):
++                    return ExecResult(exit_code=-1, stdout="", stderr=f"exec timed out after {timeout}s: {exc}")
++                if not await self.is_alive():
++                    raise
++                return ExecResult(exit_code=127, stdout="", stderr=str(exc))
+ 
+     def _is_timeout_error(self, exc: BaseException) -> bool:
+         """Whether ``exc`` from :meth:`_exec` represents a command timeout.
+diff --git a/uni_agent/sandbox/e2b.py b/uni_agent/sandbox/e2b.py
+new file mode 100644
+index 0000000..84980cc
+--- /dev/null
++++ b/uni_agent/sandbox/e2b.py
+@@ -0,0 +1,327 @@
++from __future__ import annotations
++
++import asyncio
++import logging
++import math
++import os
++import shlex
++from pathlib import Path
++from typing import TYPE_CHECKING
++from urllib.parse import urlsplit
++
++from uni_agent.timing import phase as timing_phase
++
++from .base import ExecResult, Sandbox
++from .registry import register_sandbox
++
++if TYPE_CHECKING:
++    from e2b import AsyncSandbox
++
++    from .base import SandboxConfig
++
++logger = logging.getLogger(__name__)
++
++
++async def _finish_cleanup(coro) -> None:
++    """Finish bounded cleanup through repeated cancellation, then propagate it."""
++    task = asyncio.create_task(coro)
++    cancelled = False
++    while not task.done():
++        try:
++            await asyncio.shield(task)
++        except asyncio.CancelledError:
++            cancelled = True
++        except Exception:
++            break
++    if cancelled:
++        if not task.cancelled() and (error := task.exception()) is not None:
++            logger.error("E2B cleanup failed during cancellation (%s); ownership retained", type(error).__name__)
++        raise asyncio.CancelledError()
++    task.result()
++
++
++class _TransportTimeout(RuntimeError):
++    """SDK/request timeout, distinct from exhaustion of the agent command budget."""
++
++
++@register_sandbox("e2b")
++class E2BSandbox(Sandbox):
++    """Own one sandbox created from an existing KASandbox template.
++
++    SDK imports are deferred until use. Command timeout/cancellation destroys
++    the entire sandbox because process handles do not guarantee child cleanup.
++    """
++
++    def __init__(
++        self,
++        *,
++        template: str = "",
++        expected_instance_id: str | None = None,
++        runtime_timeout: float = 3600.0,
++        api_url: str | None = None,
++        domain: str | None = None,
++        sandbox_url: str | None = None,
++        api_key: str | None = None,
++        user: str | None = None,
++        request_timeout: float = 60.0,
++        upload_timeout: float = 600.0,
++        health_timeout: float = 10.0,
++        cleanup_timeout: float = 30.0,
++    ) -> None:
++        if not isinstance(template, str) or not template.strip():
++            raise ValueError("E2BSandbox requires a nonempty sandbox_kwargs.template (existing ID or alias)")
++        for name, value in (
++            ("runtime_timeout", runtime_timeout),
++            ("request_timeout", request_timeout),
++            ("upload_timeout", upload_timeout),
++            ("health_timeout", health_timeout),
++            ("cleanup_timeout", cleanup_timeout),
++        ):
++            if not math.isfinite(value) or value <= 0:
++                raise ValueError(f"{name} must be finite and positive")
++        for name, value in (
++            ("api_url", api_url),
++            ("domain", domain),
++            ("sandbox_url", sandbox_url),
++            ("api_key", api_key),
++            ("user", user),
++        ):
++            if value is not None and (not isinstance(value, str) or not value.strip()):
++                raise ValueError(f"{name} must be a nonempty string when supplied")
++        for name, value in (("api_url", api_url), ("sandbox_url", sandbox_url)):
++            if value is not None:
++                parsed = urlsplit(value)
++                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
++                    raise ValueError(f"{name} must be an absolute HTTP(S) URL")
++        self.expected_instance_id = expected_instance_id
++        self.command_budget_exhausted = False
++        self.template = template.strip()
++        self.runtime_timeout = math.ceil(runtime_timeout)
++        self.request_timeout = request_timeout
++        self.upload_timeout = upload_timeout
++        self.health_timeout = health_timeout
++        self.cleanup_timeout = cleanup_timeout
++        self.user = user
++        self._connection_options = {
++            key: value
++            for key, value in dict(api_url=api_url, domain=domain, sandbox_url=sandbox_url, api_key=api_key).items()
++            if value is not None
++        }
++        self._sandbox: AsyncSandbox | None = None
++        self._ready = False
++        self._lifecycle_lock = asyncio.Lock()
++
++    @classmethod
++    def from_config(cls, config: SandboxConfig) -> E2BSandbox:
++        if config.image_mounts or config.executable_paths:
++            raise ValueError("E2BSandbox does not support image_mounts or executable_paths; prepare the template first")
++        if "proxy_port" in config.sandbox_kwargs:
++            raise ValueError("E2BSandbox does not support proxy_port or gateway reverse tunnels")
++        return cls(runtime_timeout=config.runtime_timeout, **config.sandbox_kwargs)
++
++    @property
++    def timing_metadata(self):
++        owned = getattr(self, "_timing_owned_metadata", {}) if self._sandbox is not None else {}
++        return {**super().timing_metadata, **owned, "sandbox_id": getattr(self._sandbox, "sandbox_id", None)}
++
++    async def _allocate(self) -> None:
++        from e2b import AsyncSandbox
++
++        allocation_metadata = self.timing_metadata
++        with timing_phase("sandbox_create_request", **allocation_metadata) as span:
++            # Retain ownership before any readiness probe or other await.
++            self._sandbox = await asyncio.wait_for(
++                AsyncSandbox.create(
++                    template=self.template,
++                    timeout=self.runtime_timeout,
++                    request_timeout=self.request_timeout,
++                    **self._connection_options,
++                ),
++                timeout=self.request_timeout,
++            )
++            self._timing_owned_metadata = allocation_metadata
++            span.update(**self.timing_metadata)
++
++    async def start(self) -> None:
++        async with self._lifecycle_lock:
++            if self._sandbox is not None:
++                if self._ready:
++                    return
++                raise RuntimeError("E2BSandbox has unfinished cleanup; call stop() before restarting")
++            # The reference SDK's debug mode skips both allocation and deletion;
++            # it cannot provide the episode ownership guarantees of this provider.
++            if os.getenv("E2B_DEBUG", "false").lower() == "true":
++                raise ValueError("E2BSandbox requires E2B_DEBUG to be disabled")
++            allocation = asyncio.create_task(self._allocate())
++            try:
++                await asyncio.shield(allocation)
++                with timing_phase("sandbox_readiness", **self.timing_metadata):
++                    if not await self._probe():
++                        raise RuntimeError("E2BSandbox failed its readiness probe")
++                self._ready = True
++            except asyncio.CancelledError:
++                try:
++                    await _finish_cleanup(self._reconcile_allocation(allocation))
++                except Exception as exc:
++                    logger.error("E2B startup cleanup failed (%s); ownership retained", type(exc).__name__)
++                raise
++
++    async def _reconcile_allocation(self, allocation: asyncio.Task) -> None:
++        try:
++            await allocation
++        except Exception:
++            # A failed create may not return an ID. Its finite TTL is the final
++            # bound in that case; a lost response cannot be reconciled locally.
++            pass
++        await self._delete_owned()
++
++    async def _delete_owned(self) -> None:
++        if self._sandbox is None:
++            return
++        from e2b.exceptions import SandboxNotFoundException
++
++        with timing_phase("sandbox_cleanup", **self.timing_metadata):
++            self._ready = False
++            try:
++                await asyncio.wait_for(
++                    self._sandbox.kill(request_timeout=self.cleanup_timeout), timeout=self.cleanup_timeout
++                )
++            except SandboxNotFoundException:
++                pass
++            # kill() also returns False for an already-deleted sandbox. Unexpected
++            # failures leave the handle intact, allowing a later stop() to retry.
++            self._sandbox = None
++            # The reference SDK shares its transport across the event loop and has
++            # no public close method. Closing private clients would disrupt peers.
++
++    async def stop(self) -> None:
++        async with self._lifecycle_lock:
++            await _finish_cleanup(self._delete_owned())
++
++    async def _probe(self) -> bool:
++        if self._sandbox is None:
++            return False
++        try:
++            return await asyncio.wait_for(
++                self._sandbox.is_running(request_timeout=self.health_timeout), timeout=self.health_timeout
++            )
++        except Exception:
++            return False
++
++    async def is_alive(self) -> bool:
++        return self._ready and await self._probe()
++
++    def _require_sandbox(self) -> AsyncSandbox:
++        if self._sandbox is None or not self._ready:
++            raise RuntimeError("E2BSandbox is not ready; call start() first (or retry pending stop())")
++        return self._sandbox
++
++    def _is_timeout_error(self, exc: BaseException) -> bool:
++        from e2b.exceptions import TimeoutException
++        from httpcore import TimeoutException as CoreTimeoutException
++        from httpx import TimeoutException as HTTPTimeoutException
++
++        return isinstance(exc, _TransportTimeout) or super()._is_timeout_error(exc) or isinstance(
++            exc, TimeoutException | CoreTimeoutException | HTTPTimeoutException
++        )
++
++    async def _abort_command(self, sandbox: AsyncSandbox) -> None:
++        async with self._lifecycle_lock:
++            if self._sandbox is sandbox:
++                await self._delete_owned()
++
++    async def _exec(
++        self,
++        argv: list[str],
++        *,
++        timeout: float | None = None,
++        workdir: str | None = None,
++        env: dict[str, str] | None = None,
++    ) -> ExecResult:
++        from e2b.sandbox.commands.command_handle import CommandExitException
++
++        sandbox = self._require_sandbox()
++        handle = None
++
++        async def run_command() -> ExecResult:
++            nonlocal handle
++            handle = await asyncio.wait_for(
++                sandbox.commands.run(
++                    shlex.join(argv),
++                    background=True,
++                    cwd=workdir,
++                    envs=env,
++                    user=self.user,
++                    timeout=0,
++                    request_timeout=self.request_timeout,
++                ),
++                timeout=self.request_timeout,
++            )
++            try:
++                result = await handle.wait()
++            except CommandExitException as exc:
++                result = exc
++            return ExecResult(exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr)
++
++        async def run() -> ExecResult:
++            try:
++                return await run_command()
++            except Exception as exc:
++                if self._is_timeout_error(exc):
++                    raise _TransportTimeout("E2B command transport timed out") from exc
++                raise
++
++        self.command_budget_exhausted = False
++        try:
++            # timeout=None explicitly has no command deadline, including no SDK
++            # default 60-second connection limit. Lifetime still bounds the VM.
++            return await asyncio.wait_for(run(), timeout=timeout)
++        except asyncio.CancelledError:
++            try:
++                await _finish_cleanup(self._abort_command(sandbox))
++            except Exception as exc:
++                logger.error("E2B command cancellation cleanup failed (%s); retry stop()", type(exc).__name__)
++            raise
++        except Exception as exc:
++            if not self._is_timeout_error(exc):
++                raise
++            self.command_budget_exhausted = isinstance(exc, asyncio.TimeoutError)
++            try:
++                await _finish_cleanup(self._abort_command(sandbox))
++            except Exception as cleanup_error:
++                raise TimeoutError(
++                    "Command timed out; sandbox deletion failed "
++                    f"({type(cleanup_error).__name__}); ownership retained, retry stop()"
++                ) from exc
++            raise
++        finally:
++            if handle is not None:
++                await handle.disconnect()
++
++    async def read_file(self, path: str) -> bytes:
++        if not path.startswith("/"):
++            return await super().read_file(path)
++        from e2b.exceptions import FileNotFoundException
++
++        try:
++            data = await self._require_sandbox().files.read(
++                path, format="bytes", user=self.user, request_timeout=self.request_timeout
++            )
++        except FileNotFoundException as exc:
++            raise RuntimeError(f"read_file {path!r} failed: file not found") from exc
++        return bytes(data)
++
++    async def write_file(self, path: str, content: bytes | str) -> None:
++        if not path.startswith("/"):
++            return await super().write_file(path, content)
++        data = content.encode("utf-8") if isinstance(content, str) else content
++        await self._require_sandbox().files.write(path, data, user=self.user, request_timeout=self.request_timeout)
++
++    async def upload_file(self, local_file: Path | str, remote_file: str) -> None:
++        """Upload binary files through the SDK with a separate transfer timeout."""
++        if not remote_file.startswith("/"):
++            return await super().upload_file(local_file, remote_file)
++        with Path(local_file).open("rb") as stream:
++            await self._require_sandbox().files.write(
++                remote_file, stream, user=self.user, request_timeout=self.upload_timeout
++            )
+diff --git a/uni_agent/sandbox/registry.py b/uni_agent/sandbox/registry.py
+index 140e2dc..43107a9 100644
+--- a/uni_agent/sandbox/registry.py
++++ b/uni_agent/sandbox/registry.py
+@@ -18,6 +18,7 @@ SANDBOX_REGISTRY: dict[str, type[Sandbox]] = {}
+ SANDBOX_MODULES: dict[str, str] = {
+     "local": "uni_agent.sandbox.local",
+     "docker": "uni_agent.sandbox.docker",
++    "e2b": "uni_agent.sandbox.e2b",
+     "modal": "uni_agent.sandbox.modal",
+     "vefaas": "uni_agent.sandbox.vefaas",
+     "openyuanrong": "uni_agent.sandbox.openyuanrong",
+diff --git a/uni_agent/tasks/swe_bench/task.py b/uni_agent/tasks/swe_bench/task.py
+index c07fda6..f17912d 100644
+--- a/uni_agent/tasks/swe_bench/task.py
++++ b/uni_agent/tasks/swe_bench/task.py
+@@ -1,6 +1,7 @@
+ """SWE-bench task: one problem family, solved by whichever agent you configure."""
+ 
+ from __future__ import annotations
++from uni_agent.timing import phase as timing_phase
+ 
+ import json
+ import logging
+@@ -19,6 +20,10 @@ class SWEBenchTaskConfig(TaskConfig):
+         default=False,
+         description="Oracle mode: skip the agent and score the dataset's gold patch directly.",
+     )
++    score_agent_timeout: bool = Field(
++        default=False,
++        description="Score an E2B agent wall-time budget exhaustion as zero without evaluating a deleted sandbox.",
++    )
+     eval_timeout: float = Field(
+         default=600.0,
+         description="Per-sample reward-eval timeout (s) inside the sandbox.",
+@@ -31,6 +36,15 @@ class SWEBenchTask(Task):
+     config_model = SWEBenchTaskConfig
+ 
+     async def run(self) -> TaskResult:
++        sample = self.config.metadata
++        instance_id = sample.get("instance_id", "?") if isinstance(sample, dict) else "?"
++        # The framework binds episode_id to the session; a direct task run gets its own ID.
++        with timing_phase("episode", instance_id=instance_id) as episode:
++            result = await self._run_episode(episode)
++            episode.update(finished=result.finished)
++            return result
++
++    async def _run_episode(self, episode) -> TaskResult:
+         cfg: SWEBenchTaskConfig = self.config  # type: ignore[assignment]
+         sample = cfg.metadata  # the dataset sample is carried on the task config
+ 
+@@ -40,12 +54,52 @@ class SWEBenchTask(Task):
+             f"starting swe_bench task (instance_id={instance_id}, run_oracle_solution={cfg.run_oracle_solution})\n"
+             f"task config: {json.dumps(task_config_dump, indent=2)}"
+         )
+-        async with self.build_sandbox() as sandbox:
++        sandbox_instance = self.build_sandbox()
++        if sandbox_instance.provider == "e2b":
++            expected = getattr(sandbox_instance, "expected_instance_id", None)
++            if expected != instance_id:
++                raise ValueError(f"E2B template binding mismatch: expected {expected!r}, sample {instance_id!r}")
++        async with sandbox_instance as sandbox:
++            episode.update(**sandbox.timing_metadata)
++            with timing_phase("sandbox_prepare"):
++                if sandbox.provider == "e2b":
++                    base_commit = sample.get("base_commit")
++                    if not isinstance(base_commit, str) or not base_commit.strip():
++                        raise ValueError("E2B SWE task requires base_commit")
++                    # Preserve the template's setup commits while discarding changes
++                    # left in its working tree. Keep ignored build/dependency files.
++                    for argv in (
++                        ["git", "config", "--global", "--add", "safe.directory", "/testbed"],
++                        # Imported templates may contain root-owned nested directories.
++                        ["sh", "-c", 'sudo -n chown -R -- "$(id -u):$(id -g)" /testbed'],
++                        ["git", "reset", "--hard", "HEAD"],
++                        ["git", "clean", "-fd"],
++                    ):
++                        result = await sandbox.exec(argv, workdir="/testbed", timeout=30)
++                        if result.exit_code != 0:
++                            raise RuntimeError(
++                                f"Template repository preparation failed ({' '.join(argv)}): "
++                                f"exit_code={result.exit_code}, stderr={result.stderr.strip()!r}"
++                            )
++                    clean = await sandbox.exec(
++                        ["git", "status", "--porcelain", "--untracked-files=all"],
++                        workdir="/testbed", timeout=30,
++                    )
++                    if clean.exit_code != 0 or clean.stdout.strip():
++                        raise RuntimeError(
++                            "Template repository cleanup failed: "
++                            f"exit_code={clean.exit_code}, stdout={clean.stdout.strip()!r}, "
++                            f"stderr={clean.stderr.strip()!r}"
++                        )
+             agent_error = None
+             if cfg.run_oracle_solution:
+                 logger.info("applying gold patch to /testbed")
+                 await sandbox.write_file("/tmp/gold_patch.patch", sample["patch"])
+-                await sandbox.exec(["git", "apply", "--whitespace=fix", "/tmp/gold_patch.patch"], workdir="/testbed")
++                applied = await sandbox.exec(
++                    ["git", "apply", "--whitespace=fix", "/tmp/gold_patch.patch"], workdir="/testbed",
++                )
++                if applied.exit_code != 0:
++                    raise RuntimeError("Oracle patch failed to apply")
+                 finished = True
+             else:
+                 agent = self.build_agent()
+@@ -58,10 +112,20 @@ class SWEBenchTask(Task):
+                 )
+                 finished = agent_result.finished
+                 agent_error = agent_result.info.get("error")
++                if (
++                    cfg.score_agent_timeout
++                    and not finished
++                    and getattr(sandbox, "command_budget_exhausted", False)
++                ):
++                    return TaskResult(
++                        reward=0.0, accuracy=0.0, finished=False,
++                        extra_info={"agent_budget_exhausted": True, "eval_completed": False},
++                    )
+ 
+             from .reward import compute_reward
+ 
+-            result = await compute_reward(sample, sandbox, eval_timeout=cfg.eval_timeout)
++            with timing_phase("sandbox_evaluation"):
++                result = await compute_reward(sample, sandbox, eval_timeout=cfg.eval_timeout)
+             if isinstance(agent_error, str) and agent_error.strip():
+                 result = {**result, "agent_error": agent_error}
+ 
+diff --git a/uni_agent/timing.py b/uni_agent/timing.py
+new file mode 100644
+index 0000000..38c8db5
+--- /dev/null
++++ b/uni_agent/timing.py
+@@ -0,0 +1,141 @@
++"""Opt-in, stdlib-only wall-clock spans; never record commands, prompts or credentials."""
++from __future__ import annotations
++
++import argparse
++import contextvars
++import json
++import os
++import socket
++import sys
++import threading
++import time
++import uuid
++from pathlib import Path
++
++_context = contextvars.ContextVar("training_timing_context", default={})
++_parent = contextvars.ContextVar("training_timing_parent", default=None)
++_lock = threading.Lock()
++_warned = False
++_writer_key = None
++_writer_path = None
++_ALLOWED = {
++    "session_id", "episode_id", "instance_id", "sample_index", "sandbox_id", "sandbox_attempt_id", "attempt",
++    "request_id", "uid", "step", "partition", "role", "provider", "node_index", "exit_code", "finished",
++}
++
++
++def _metadata(values):
++    return {key: value for key, value in values.items()
++            if key in _ALLOWED and isinstance(value, (str, int, float, bool, type(None)))}
++
++
++def emit(record):
++    """Append one small event to a file owned by this process. Fail open on I/O errors."""
++    global _warned, _writer_key, _writer_path
++    directory = os.environ.get("TRAINING_TIMING_DIR")
++    if not directory:
++        return
++    try:
++        host, pid = socket.gethostname(), os.getpid()
++        key = (directory, host, pid)
++        with _lock:
++            if key != _writer_key:
++                Path(directory).mkdir(parents=True, exist_ok=True)
++                _writer_path = Path(directory) / f"events.{host}.{pid}.{uuid.uuid4().hex}.jsonl"
++                _writer_key = key
++            event = {
++                "schema": 1, "run_id": os.getenv("TRAINING_TIMING_RUN_ID", ""),
++                "host": host, "pid": pid, "rank": os.getenv("RANK", os.getenv("LOCAL_RANK", "")),
++                **record,
++            }
++            data = (json.dumps(event, ensure_ascii=True, allow_nan=False) + "\n").encode()
++            fd = os.open(_writer_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
++            try:
++                offset = 0
++                while offset < len(data):
++                    offset += os.write(fd, data[offset:])
++            finally:
++                os.close(fd)
++    except (OSError, ValueError, TypeError):
++        if not _warned:
++            _warned = True
++            print("training timing: event write failed; timing data may be incomplete", file=sys.stderr)
++
++
++class phase:
++    """Context manager for sync/async code; durations use a local monotonic clock."""
++
++    def __init__(self, name, **metadata):
++        self.name = name
++        self.metadata = metadata
++        self.active = False
++
++    def __enter__(self):
++        self.active = bool(os.environ.get("TRAINING_TIMING_DIR"))
++        if not self.active:
++            return self
++        self.span_id = uuid.uuid4().hex
++        self.start_ns = time.time_ns()
++        self.mono_ns = time.monotonic_ns()
++        self.values = _metadata({**_context.get(), **self.metadata})
++        if self.name == "episode":
++            self.values.setdefault("episode_id", self.values.get("session_id") or uuid.uuid4().hex)
++        self.record = {
++            "event": "begin", "span_id": self.span_id, "parent_id": _parent.get(),
++            "phase": self.name, "wall_ns": self.start_ns, "monotonic_ns": self.mono_ns,
++            "metadata": self.values,
++        }
++        emit(self.record)
++        self.context_token = _context.set(self.values)
++        self.parent_token = _parent.set(self.span_id)
++        return self
++
++    def update(self, **metadata):
++        """Attach identifiers learned after begin (for example the allocated sandbox ID)."""
++        if self.active:
++            self.values.update(_metadata(metadata))
++
++    def __exit__(self, exc_type, exc, tb):
++        if self.active:
++            duration = time.monotonic_ns() - self.mono_ns
++            emit({
++                **self.record, "event": "end", "wall_ns": time.time_ns(),
++                "duration_ns": duration,
++                "status": "ok" if exc_type is None and self.values.get("exit_code", 0) == 0 else "error",
++                "error_type": None if exc_type is None else exc_type.__name__,
++            })
++            _parent.reset(self.parent_token)
++            _context.reset(self.context_token)
++        return False
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("action", choices=("job-start", "job-end"))
++    parser.add_argument("--exit-code", type=int, default=0)
++    args = parser.parse_args()
++    directory = Path(os.environ["TRAINING_TIMING_DIR"])
++    state = directory / "job-state.json"
++    if args.action == "job-start":
++        directory.mkdir(parents=True, exist_ok=True)
++        record = {
++            "event": "begin", "span_id": uuid.uuid4().hex, "parent_id": None,
++            "phase": "job", "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
++            "metadata": {"node_index": 0},
++        }
++        with state.open("x", encoding="utf-8") as stream:
++            json.dump(record, stream)
++        state.chmod(0o600)
++        emit(record)
++    else:
++        record = json.loads(state.read_text())
++        emit({
++            **record, "event": "end", "wall_ns": time.time_ns(),
++            "duration_ns": time.monotonic_ns() - record["monotonic_ns"],
++            "status": "ok" if args.exit_code == 0 else "error",
++            "metadata": {**record["metadata"], "exit_code": args.exit_code},
++        })
++
++
++if __name__ == "__main__":
++    main()

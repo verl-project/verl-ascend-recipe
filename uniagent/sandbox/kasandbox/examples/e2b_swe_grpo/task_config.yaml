@@ -1,0 +1,23 @@
+- name: swe_bench
+  sandbox:
+    provider: e2b
+    runtime_timeout: 7200
+    sandbox_kwargs:
+      request_timeout: 60
+      cleanup_timeout: 30
+  agent:
+    name: claude_code
+    max_turns: 200
+    run_timeout: 6000
+    extra_env:
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "32000"
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "90112" # 136000
+  eval_timeout: 1200
+  score_agent_timeout: true
+  prompt_template:
+    - role: user
+      content: |-
+        Resolve the following issue in the current repository:
+        {problem_statement}
+
+        Make the minimal correct changes and verify them. Do not modify tests or commit.
