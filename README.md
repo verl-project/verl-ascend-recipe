@@ -51,6 +51,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 
 | Recipe | `REQUIRED_VERL.txt` |
 | --- | --- |
+| [Qwen3-8B PrefixGrouper on Ascend Megatron](prefix_grouper/README.md) | [Required verl revision](prefix_grouper/REQUIRED_VERL.txt) |
 | [AdaptiveSpec usage and features](adaptive_spec/README.md) | [Required verl revision](adaptive_spec/REQUIRED_VERL.txt) |
 | [Qwen3.8 Flash Next](Qwen3.8-Flash-Next/readme.md) | [`Qwen3.8-Flash-Next/REQUIRED_VERL.txt`](Qwen3.8-Flash-Next/REQUIRED_VERL.txt) |
 | opd | [`opd/REQUIRED_VERL.txt`](opd/REQUIRED_VERL.txt) |

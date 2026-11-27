@@ -1,0 +1,5 @@
+# Apply the recipe patch to the checkout before launching training.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=4a9dc911d57062d76988e0fd1f2468b5e7178ce3
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@4a9dc911d57062d76988e0fd1f2468b5e7178ce3

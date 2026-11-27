@@ -1,0 +1,237 @@
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -179,7 +179,10 @@
+     """
+ 
+     # sequence_parallel is not listed as a frozen field for auto-correction purpose
+-    _mutable_fields = EngineConfig._mutable_fields | {"sequence_parallel", "_liger_flsce_capacity"}
++    _mutable_fields = EngineConfig._mutable_fields | {
++        "sequence_parallel", "_liger_flsce_capacity", "use_prefix_grouper"
++    }
++    use_prefix_grouper: bool = False
+     # Runtime-only reservation shared by colocated engines, not a user-facing knob.
+     _liger_flsce_capacity: Optional[tuple[int, int]] = field(default=None, init=False, repr=False)
+     # mcore parallelism
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -622,6 +622,7 @@
+             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+             if isinstance(ref_training_config.engine_config, McoreEngineConfig):
+                 ref_training_config.engine_config._liger_flsce_capacity = liger_capacity
++                ref_training_config.engine_config.use_prefix_grouper = self.config.actor.use_prefix_grouper
+ 
+             self.ref = self.ref_worker_cls(config=ref_training_config)
+             self.ref.reset()
+@@ -669,6 +670,7 @@
+             actor_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+             if isinstance(actor_training_config.engine_config, McoreEngineConfig):
+                 actor_training_config.engine_config._liger_flsce_capacity = liger_capacity
++                actor_training_config.engine_config.use_prefix_grouper = self.config.actor.use_prefix_grouper
+ 
+             if self.config.actor.use_dynamic_bsz:
+                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -1213,6 +1213,26 @@
+             else None
+         )
+ 
++        if self.engine_config.use_prefix_grouper:
++            from verl.models.mcore.prefix_grouper_forward import grouped_forward
++
++            if distillation_use_topk or distillation_only or use_fused_kernels:
++                raise ValueError("Megatron PrefixGrouper expects ordinary unfused GRPO token logits")
++            logits_processor = partial(
++                self._lm_head_logits_processor,
++                calculate_sum_pi_squared=calculate_sum_pi_squared,
++                calculate_entropy=calculate_entropy,
++                distillation_use_topk=False,
++                distillation_only=False,
++                logits_processor_func=logits_processor_func,
++                batch=batch,
++                data_format="bshd",
++            )
++            output = grouped_forward(
++                self, model, unwrap_model(model), batch, logits_processor, forward_only=not torch.is_grad_enabled()
++            )
++            return output, partial(postprocess_micro_batch_func, data=batch, local_cp_size=None)
++
+         if pad_to_length_bucket is not None and distillation_use_topk:
+             raise RuntimeError("pad_to_length is not supported with top-K distillation")
+         if pad_to_length_bucket is not None and self.enable_routing_replay:
+diff --git a/verl/models/mcore/prefix_grouper_forward.py b/verl/models/mcore/prefix_grouper_forward.py
+new file mode 100644
+--- /dev/null
++++ b/verl/models/mcore/prefix_grouper_forward.py
+@@ -0,0 +1,168 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Qwen3 shared-prompt training on the Ascend Megatron backend with replicated token layouts and sharded heads."""
++
++from collections import defaultdict
++from functools import partial
++
++import torch
++
++from verl.models.mcore.megatron_prefix_grouper import pack_shared_prefix
++from verl.utils import tensordict_utils as tu
++
++
++def _masked_core_attention(
++    query, key, value, attention_mask, attn_mask_type=None, attention_bias=None, packed_seq_params=None
++):
++    # MCore calls core_attention after Q/K normalization and RoPE with [S, B, N, D].
++    # The standard causal FA fast path can ignore an extra mask. Explicit all-mask
++    # mode preserves arbitrary forbidden edges, including during checkpoint recompute.
++    import torch_npu
++
++    if attention_bias is not None or packed_seq_params is not None:
++        raise ValueError("PrefixGrouper requires plain Qwen3 self-attention without bias or THD packing")
++    if query.ndim != 4 or query.shape[1] != 1 or attention_mask is None:
++        raise ValueError("PrefixGrouper requires one packed sequence and its branch attention mask")
++    length = query.shape[0]
++    if attention_mask.dtype != torch.bool or attention_mask.shape != (1, 1, length, length):
++        raise ValueError("Expected the complete boolean [1, 1, T, T] branch mask")
++    q, k, v = (x.permute(1, 2, 0, 3).contiguous() for x in (query, key, value))
++    attention = torch_npu.npu_fusion_attention(
++        q, k, v, q.shape[1], "BNSD",
++        atten_mask=attention_mask, scale=q.shape[-1] ** -0.5, keep_prob=1.0, sparse_mode=1,
++    )[0]
++    return attention.permute(2, 0, 1, 3).contiguous().flatten(2)
++
++
++def _counted_core_attention(state, query, key, value, attention_mask, *args, **kwargs):
++    expected = state["mask"]
++    if expected is not None and attention_mask is not expected:
++        if attention_mask is None or not torch.equal(attention_mask, expected):
++            raise RuntimeError("Megatron replaced the PrefixGrouper branch mask")
++    result = _masked_core_attention(query, key, value, attention_mask, *args, **kwargs)
++    state["calls"] += 1
++    return result
++
++
++def _check_model(engine, gpt):
++    cfg = engine.engine_config
++    tp = cfg.tensor_model_parallel_size
++    if tp not in (1, 2) or (cfg.pipeline_model_parallel_size, cfg.context_parallel_size) != (1, 1):
++        raise ValueError("Megatron PrefixGrouper requires TP=1 or 2, PP=CP=1")
++    if tp == 2:
++        from megatron.core import parallel_state
++
++        if parallel_state.get_tensor_model_parallel_world_size() != tp or not gpt.parallel_output:
++            raise ValueError("PrefixGrouper TP=2 requires two active TP ranks and a vocabulary-parallel LM head")
++        if gpt.config.num_attention_heads % tp or gpt.config.num_query_groups % tp:
++            raise ValueError("Qwen3 query and KV head counts must both be divisible by the tensor-parallel size")
++    if cfg.sequence_parallel or cfg.dynamic_context_parallel or cfg.use_dynamic_bsz or cfg.use_remove_padding:
++        raise ValueError("Megatron PrefixGrouper requires fixed microbatches, BSHD and sequence parallelism disabled")
++    if engine.model_config.hf_config.model_type != "qwen3" or gpt.position_embedding_type != "rope":
++        raise ValueError("Megatron PrefixGrouper supports dense Qwen3 with ordinary RoPE")
++    if cfg.use_fused_kernels or engine.model_config.mtp.enable or engine.enable_routing_replay:
++        raise ValueError("Megatron PrefixGrouper is incompatible with fused LM-head kernels, MTP and router replay")
++    if gpt.config.attention_dropout or gpt.config.hidden_dropout or gpt.config.fp8 or getattr(gpt.config, "fp4", None):
++        raise ValueError("Megatron PrefixGrouper requires zero dropout and unquantized Qwen3 weights")
++    if getattr(gpt.config, "softmax_scale", None) not in (None, gpt.config.kv_channels**-0.5):
++        raise ValueError("Megatron PrefixGrouper expects the Qwen3 attention scale")
++
++    # Keep this replacement on the dedicated actor/ref model: layer recomputation
++    # happens after model.forward returns and must still use this attention path.
++    if not hasattr(gpt, "_prefix_grouper_attention"):
++        state = {"calls": 0, "mask": None}
++        for layer in gpt.decoder.layers:
++            layer.self_attention.core_attention.forward = partial(_counted_core_attention, state)
++        gpt._prefix_grouper_attention = state
++
++
++def _grouped_logits(model, gpt, packed):
++    # GPTModel._preprocess ignores position_ids for ordinary RoPE and creates a
++    # table at physical token offsets. Re-index the actual table used by all
++    # decoder layers. The selected table is also passed to Megatron recomputation.
++    positions = packed.position_ids[0]
++    rope_called = False
++
++    def select_positions(module, inputs, table):
++        nonlocal rope_called
++        rope_called = True
++        return table.index_select(0, positions)
++
++    handle = gpt.rotary_pos_emb.register_forward_hook(select_positions)
++    state = gpt._prefix_grouper_attention
++    previous_calls = state["calls"]
++    state["mask"] = packed.attention_mask
++    try:
++        logits = model(
++            input_ids=packed.input_ids,
++            attention_mask=packed.attention_mask,
++            position_ids=packed.position_ids,
++        )
++    finally:
++        state["mask"] = None
++        handle.remove()
++    if state["calls"] - previous_calls != len(gpt.decoder.layers):
++        raise RuntimeError("A Qwen3 decoder layer bypassed the explicit masked attention kernel")
++    if not rope_called:
++        raise RuntimeError("Qwen3 bypassed its rotary embedding module; cannot apply branch-relative positions")
++    return logits
++
++
++def grouped_forward(engine, model, gpt, batch, logits_processor, forward_only):
++    _check_model(engine, gpt)
++    inputs = batch["input_ids"]
++    positions = batch["position_ids"]
++    mask = batch.get("attention_mask")
++    uids = tu.get(batch, "uid")
++    responses = batch["responses"]
++    if mask is None or mask.is_nested or responses.is_nested or uids is None:
++        raise ValueError("Use trainer.use_v1=False to retain dense attention masks, response widths and per-sample UIDs")
++    if not inputs.is_nested or not positions.is_nested or positions.values().ndim != 1:
++        raise ValueError("Expected verl's unpadded text input IDs and one-dimensional position IDs")
++    mask = mask.bool()
++    ids = inputs.values().new_zeros(mask.shape).masked_scatter_(mask, inputs.values())
++    pos = positions.values().new_zeros(mask.shape).masked_scatter_(mask, positions.values())
++    packed = pack_shared_prefix(ids, mask, pos, responses.shape[1], uids)
++    logits = _grouped_logits(model, gpt, packed)
++    if logits.shape[:2] != packed.input_ids.shape:
++        raise RuntimeError("Megatron must return a [1, packed_tokens, vocabulary] logits tensor")
++
++    # Score each trajectory's own next token, including different first-response
++    # labels at the same final prompt position. index_select backward accumulates
++    # these branches. Reuse verl's original cross-entropy/entropy kernels and
++    # restore the original jagged layout for the PPO and old-log-prob consumers.
++    lengths = inputs.offsets().diff().tolist()
++    max_len = tu.get_non_tensor_data(batch, key="forced_max_seqlen", default=None) or max(lengths)
++    labels = []
++    for row in inputs.unbind():
++        # Match the normal BSHD path's left shift across the padded width.
++        tail = row[:1] if row.numel() == max_len else row.new_zeros(1)
++        labels.append(torch.cat((row[1:], tail)))
++    targets = torch.cat(labels)
++    temperature = torch.as_tensor(batch["temperature"], dtype=torch.float32, device=logits.device).reshape(-1)
++    if temperature.numel() == 1:
++        temperature = temperature.expand(len(lengths))
++    if temperature.numel() != len(lengths):
++        raise ValueError("Expected a scalar temperature or one temperature per trajectory")
++    temperatures = temperature[:, None].expand_as(mask)[mask]
++    original_indices = packed.restore_indices[mask]
++    parts = defaultdict(list)
++    # Bounded gathers avoid expanding all shared prompt rows into a [B, S, V] tensor.
++    for start in range(0, original_indices.numel(), 128):
++        span = slice(start, start + 128)
++        scores = logits_processor(
++            logits.index_select(1, original_indices[span]), targets[span][None], temperatures[span][None].clone(),
++        )
++        for name, tensor in scores.items():
++            parts[name].append(tensor[0])
++    output = {
++        name: torch.nested.nested_tensor_from_jagged(torch.cat(values), offsets=inputs.offsets())
++        for name, values in parts.items()
++    }
++    packed_count = packed.input_ids.numel()
++    print(
++        f"prefix_grouper phase={'infer' if forward_only else 'train'} rows={len(lengths)} "
++        f"original_tokens={packed.original_token_count} packed_tokens={packed_count} "
++        f"saved_tokens={packed.original_token_count - packed_count}",
++        flush=True,
++    )
++    return output
