@@ -1,6 +1,6 @@
 # Qwen3-8B 在昇腾 A2 上的 FSDP 监督微调
 
-单机 8 张 Ascend 910B4 上，Qwen3-8B 开启 LoRA 和两路 Ulysses 序列并行，从初始模型连续训练 100 步。首末各 10 步的平均训练 loss 从 **1.0664 降至 0.3276**；第 11–90 步八卡合计吞吐约 **1,318 tokens/s**，折合 **164.7 tokens/s/卡**。在相同的 SP=2 和全局 batch 32 下，全参数作业也完成了 100 步，第 11–90 步八卡合计 **483.2 tokens/s**。两次长跑均通过最终验证，保存检查点并以状态码 0 退出。[社区任务 #74](https://github.com/verl-project/verl-ascend-recipe/issues/74)
+单机 8 张 Ascend 910B 上，Qwen3-8B 开启 LoRA 和两路 Ulysses 序列并行，从初始模型连续训练 100 步。首末各 10 步的平均训练 loss 从 **1.0664 降至 0.3276**；第 11–90 步八卡合计吞吐约 **1,318 tokens/s**，折合 **164.7 tokens/s/卡**。在相同的 SP=2 和全局 batch 32 下，全参数作业也完成了 100 步，第 11–90 步八卡合计 **483.2 tokens/s**。两次长跑均通过最终验证，保存检查点并以状态码 0 退出。[社区任务 #74](https://github.com/verl-project/verl-ascend-recipe/issues/74)
 
 ## 算法与适配
 
