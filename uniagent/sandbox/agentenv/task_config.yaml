@@ -1,0 +1,26 @@
+- name: agentenv_swe_v2
+  sandbox:
+    provider: e2b
+    runtime_timeout: 7200
+    sandbox_kwargs:
+      envs:
+        PATH: /tmp/uniagent:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/go/bin
+  agent:
+    name: agentenv_claude
+    max_turns: 200
+    run_timeout: 6000
+    extra_env:
+      HOME: /tmp/uniagent
+      TMPDIR: /tmp/uniagent
+      CLAUDE_CONFIG_DIR: /tmp/uniagent/.claude
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000'
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: '90112'
+      MAVEN_OPTS: '-Duser.home=/tmp/uniagent -Dmaven.repo.local=/tmp/uniagent/.m2/repository'
+  eval_timeout: 1200
+  prompt_template:
+    - role: user
+      content: |-
+        Resolve the following issue in the current repository:
+        {problem_statement}
+
+        Make minimal correct changes and verify them. Do not modify tests or commit.

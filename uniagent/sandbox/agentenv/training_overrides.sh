@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Hardware-specific settings from the reference configuration, not its agent code.
+TRAINING_OVERRIDES=(
+    trainer.device=npu
+    trainer.v1.colocate_async.num_warmup_batches=1
+    actor_rollout_ref.hybrid_engine=True
+    actor_rollout_ref.model.use_remove_padding=True
+    +actor_rollout_ref.model.override_config.model_config.max_position_embeddings=139072
+    data.truncation=error
+    data.gen_batch_size=32
+    ++actor_rollout_ref.rollout.enable_sleep_mode=True
+    actor_rollout_ref.rollout.free_cache_engine=True
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=false
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.rl_config.enabled=true
+    algorithm.filter_groups.enable=False
+    algorithm.filter_groups.metric=acc
+    algorithm.rollout_correction.rollout_is=null
+    algorithm.rollout_correction.rollout_is_threshold=2.0
+    algorithm.rollout_correction.rollout_is_batch_normalize=False
+    algorithm.rollout_correction.rollout_rs=null
+    algorithm.rollout_correction.rollout_rs_threshold=null
+    algorithm.rollout_correction.loss_type=ppo_clip
+    ++actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode=True
+    ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is=null
+    ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is_threshold=2.0
+    ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is_batch_normalize=False
+    ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=null
+    ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=null
+    ++actor_rollout_ref.actor.policy_loss.rollout_correction.loss_type=ppo_clip
+    actor_rollout_ref.actor.optim.use_precision_aware_optimizer=True
+    actor_rollout_ref.actor.optim.main_grads_dtype=bf16
+    +actor_rollout_ref.actor.megatron.override_ddp_config.overlap_grad_reduce=true
+    +actor_rollout_ref.actor.megatron.override_ddp_config.bucket_size=50000000
+    actor_rollout_ref.actor.megatron.use_dist_checkpointing=False
+    actor_rollout_ref.actor.megatron.use_remove_padding=True
+    actor_rollout_ref.actor.megatron.pad_bshd_to_minibatch_max=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_ascend_gdn=True
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.ref.megatron.use_remove_padding=True
+    +actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection=longest
+    trainer.resume_mode=auto
+    trainer.log_val_generations=10
+    "trainer.rollout_data_dir=$ROOT/artifacts/rollouts/$EXPERIMENT_NAME"
+    "hydra.run.dir=$ROOT/artifacts/hydra/$EXPERIMENT_NAME"
+)
