@@ -583,3 +583,7 @@ bash examples/quickstart/training/train_npu_qwen3p5_9b_claude_code_swe_megatron.
 
 - [Uni-Agent Sandbox 配置与自定义 provider](https://uni-agent.readthedocs.io/en/latest/concepts/sandbox.html)
 - [Ray runtime 环境与 Jobs API](https://docs.ray.io/en/latest/ray-core/handling-dependencies.html)
+
+## 可运行的沙箱启动脚本
+
+[AgentENV 与 KASandbox 双节点训练配方](sandbox/README.md)提供固定版本的 Uni-Agent 补丁、环境配置模板、PC 中转隧道、数据准备与启动检查。默认使用两节点、每节点 16 张 NPU；机器地址、路径和凭据均由部署配置传入。
