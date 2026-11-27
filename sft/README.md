@@ -61,7 +61,7 @@ env vars at the top of the script and can also be overridden directly.
 
 ### Eight-card A2 verification (2026-11-12)
 
-See the [validation report and both training logs](../verl_ascend_practice/reports/qwen3_8b_sft/README.md).
+See the [validation report](../verl_ascend_practice/reports/qwen3_8b_sft/README.md).
 
 Both runs used eight 910B4 NPUs with 32 GiB each, Qwen3-8B, and the
 7,473 training records from GSM8K. Each sample contained a user question and

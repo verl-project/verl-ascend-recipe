@@ -103,7 +103,7 @@ USE_PEFT=0 SP_SIZE=2 TRAIN_BATCH_SIZE=32 SAVE_PATH="$PWD/checkpoints_full_100" \
 
 ## 实测结果与证据
 
-| 观测项 | [LoRA 完整训练日志](logs/lora_sp2_100steps.log) | [全参数完整训练日志](logs/full.log) |
+| 观测项 | LoRA 长跑 | 全参数长跑 |
 | --- | ---: | ---: |
 | 连续更新步数 | 100 | 100 |
 | 第一步 → 最后一步训练 loss | 1.4982 → 0.2753 | 1.4982 → 0.4211 |
